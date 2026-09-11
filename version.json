@@ -1,10 +1,13 @@
 {
-    "version":  "1.2.5",
-    "url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.5/BloggerSpot.zip",
-    "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.5/BloggerSpot.zip",
-    "notes":  "자동 업데이트, 여러 블로그 선택, 설정 완료/미완료 호버, 최신 생성순 정렬",
-    "download_urls":  [
-                          "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.5/BloggerSpot.zip",
-                          "https://github.com/lee3215-ko/blogspot-app/releases/latest/download/BloggerSpot.zip"
-                      ]
+  "version": "1.2.5",
+  "url": "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/556261684",
+  "download_url": "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.5/BloggerSpot.zip",
+  "notes": "자동 업데이트, 여러 블로그 선택, 설정 완료/미완료 호버, 최신 생성순 정렬",
+  "api_download_url": "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/556261684",
+  "asset_id": 556261684,
+  "download_urls": [
+    "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/556261684",
+    "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.5/BloggerSpot.zip",
+    "https://github.com/lee3215-ko/blogspot-app/releases/latest/download/BloggerSpot.zip"
+  ]
 }

@@ -187,11 +187,12 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "[4/4] GitHub Release..."
+$repo = "$($cfg.github_owner)/$($cfg.github_repo)"
 if (Test-GhRelease $tag) {
-    Invoke-Gh release upload $tag $zipPath --clobber
-    Invoke-Gh release edit $tag --notes $Notes --title $newVersion
+    Invoke-Gh release upload $tag $zipPath --repo $repo --clobber
+    Invoke-Gh release edit $tag --repo $repo --notes $Notes --title $newVersion
 } else {
-    Invoke-Gh release create $tag $zipPath --title $newVersion --notes $Notes --latest
+    Invoke-Gh release create $tag $zipPath --repo $repo --title $newVersion --notes $Notes --latest
 }
 
 Write-VersionJson $cfg $newVersion $Notes
