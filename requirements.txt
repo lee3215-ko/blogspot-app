@@ -1,0 +1,6 @@
+customtkinter
+selenium
+webdriver-manager
+pillow
+certifi
+pyinstaller

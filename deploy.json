@@ -1,0 +1,34 @@
+{
+  "github_owner": "lee3215-ko",
+  "github_repo": "blogspot-app",
+  "release_asset": "BloggerSpot.zip",
+  "default_bump": "patch",
+  "app_display_name": "BloggerSpot",
+  "version": {
+    "file": "paths.py",
+    "variable": "APP_VERSION"
+  },
+  "build": {
+    "script": "build.bat",
+    "dist_dir": "release/BloggerSpot"
+  },
+  "git_add": [
+    ".gitignore",
+    "paths.py",
+    "app.py",
+    "run.py",
+    "blogger_session.py",
+    "naver_advisor_session.py",
+    "ui_theme.py",
+    "make_icon.py",
+    "build.bat",
+    "build.spec",
+    "requirements.txt",
+    "updater.py",
+    "update_ui.py",
+    "deploy.json",
+    "assets",
+    "README.md",
+    "_write_launcher.py"
+  ]
+}
