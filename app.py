@@ -800,7 +800,7 @@ class BloggerApp:
         self.post_image_folder_btn.pack(side=tk.LEFT, padx=(8, 0))
         label(
             write_inner,
-            "이미지는 이 폴더에서 글을 쓸 때마다 하나를 골라 본문 앞에 넣습니다. 글 작성 버튼은 아래 작업 줄에 있습니다.",
+            "이미지는 이 폴더에서 글을 쓸 때마다 하나를 골라 본문 앞에 넣습니다. 폴더를 비워 두면 원고만 넣습니다. 글 작성 버튼은 아래 작업 줄에 있습니다.",
             "body",
             COLORS["text_muted"],
             wraplength=720,
@@ -3188,8 +3188,9 @@ class BloggerApp:
             messagebox.showwarning("글 작성", "글쓰기 탭에서 원고 폴더를 선택해 주세요.")
             self._show_main_tab("글쓰기")
             return
-        if not image_folder or not os.path.isdir(image_folder):
-            messagebox.showwarning("글 작성", "글쓰기 탭에서 이미지 폴더를 선택해 주세요.")
+        use_images = bool(image_folder and os.path.isdir(image_folder))
+        if image_folder and not use_images:
+            messagebox.showwarning("글 작성", "이미지 폴더를 찾지 못했습니다. 폴더를 다시 고르거나 비워 두면 원고만 씁니다.")
             self._show_main_tab("글쓰기")
             return
         files = self._manuscript_files(manuscript_folder)
@@ -3209,11 +3210,14 @@ class BloggerApp:
             )
             self._show_main_tab("글쓰기")
             return
-        try:
-            self._pick_random_image(image_folder)
-        except RuntimeError as exc:
-            messagebox.showwarning("글 작성", str(exc))
-            return
+        if use_images:
+            try:
+                self._pick_random_image(image_folder)
+            except RuntimeError as exc:
+                messagebox.showwarning("글 작성", str(exc))
+                return
+        else:
+            image_folder = ""
         self._save_local_settings()
         chosen_blogs = [blogs[index % len(blogs)] for index in range(count)]
         jobs = list(zip(chosen_blogs, files[:count]))
@@ -3237,10 +3241,11 @@ class BloggerApp:
                 self._run_control.checkpoint()
                 title = os.path.splitext(os.path.basename(path))[0].strip() or "제목 없음"
                 body = self._manuscript_html(self._read_manuscript(path))
-                image_path = self._pick_random_image(image_folder)
+                image_path = self._pick_random_image(image_folder) if image_folder else ""
                 name = blog.name or blog.id
                 self.root.after(0, lambda i=index, t=total, n=name: self._set_progress(i - 1, t, f"글 작성: {n}"))
-                self.log(f"글 작성 {index}/{total}: [{name}] {title} · 이미지 {os.path.basename(image_path)}")
+                image_note = os.path.basename(image_path) if image_path else "없음"
+                self.log(f"글 작성 {index}/{total}: [{name}] {title} · 이미지 {image_note}")
                 post_url = self.session.publish_manuscript(blog.id, title, body, image_path)
                 if not post_url:
                     raise RuntimeError(f"{name}: 게시는 시도했지만 글 주소를 찾지 못했습니다. 원고는 그대로 둡니다.")

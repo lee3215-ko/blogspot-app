@@ -1171,7 +1171,8 @@ class BloggerSession:
         self.click_new_post()
         self._wait_compose_editor()
         self._switch_post_html_view()
-        self._upload_post_image(image_path)
+        if (image_path or "").strip():
+            self._upload_post_image(image_path)
         if (html_body or "").strip():
             self._append_post_html(html_body)
         self._set_post_title(title)
