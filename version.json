@@ -1,9 +1,12 @@
 {
     "version":  "1.2.10",
-    "url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.10/BloggerSpot.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/599998379",
     "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.10/BloggerSpot.zip",
     "notes":  "HTML 편집 코드를 여러 개 저장하고 선택한 코드로 넣습니다.",
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/599998379",
+    "asset_id":  599998379,
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/599998379",
                           "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.10/BloggerSpot.zip",
                           "https://github.com/lee3215-ko/blogspot-app/releases/latest/download/BloggerSpot.zip"
                       ]
