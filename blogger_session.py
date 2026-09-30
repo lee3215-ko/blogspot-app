@@ -635,6 +635,67 @@ function findThemeCM() {
 """
 
 
+_OPEN_BLOG_DELETE_JS = """
+const norm = (el) => (el.innerText || el.textContent || el.getAttribute("aria-label") || "").replace(/\\s+/g, " ").trim();
+const scroller = document.querySelector("[role='main']") || document.scrollingElement || document.body;
+if (scroller) scroller.scrollTop = scroller.scrollHeight;
+window.scrollTo(0, document.body.scrollHeight || 0);
+const nodes = [...document.querySelectorAll("button, a, [role='button'], span, div, h1, h2, h3")];
+const hits = [];
+for (const el of nodes) {
+  if (el.children && el.children.length > 4) continue;
+  const text = norm(el);
+  if (!text || text.length > 60) continue;
+  if (
+    text === "내 블로그 삭제" ||
+    text === "블로그 삭제" ||
+    text === "이 블로그 삭제" ||
+    /^블로그\\s*삭제/.test(text) ||
+    /delete blog/i.test(text)
+  ) {
+    hits.push(el);
+  }
+}
+hits.sort((a, b) => norm(a).length - norm(b).length);
+const hit = hits[0];
+if (!hit) {
+  const sample = [];
+  for (const el of nodes) {
+    if (el.children && el.children.length > 2) continue;
+    const text = norm(el);
+    if (text && text.length < 40 && /삭제|delete/i.test(text) && sample.length < 8) sample.push(text);
+  }
+  return {ok: false, sample};
+}
+const target = hit.closest("button, a, [role='button']") || hit;
+target.scrollIntoView({block: "center"});
+target.click();
+return {ok: true, text: norm(target)};
+"""
+
+
+_CONFIRM_BLOG_DELETE_JS = """
+const norm = (el) => (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
+const visible = (el) => {
+  const rect = el.getBoundingClientRect();
+  const style = window.getComputedStyle(el);
+  return rect.width > 2 && rect.height > 2 && style.visibility !== "hidden" && style.display !== "none";
+};
+const spans = [...document.querySelectorAll("span.RveJvd.snByac, span.RveJvd, span.snByac")];
+let span = spans.find((el) => visible(el) && norm(el) === "영구적으로 삭제");
+if (!span) {
+  span = [...document.querySelectorAll("span, button, [role='button']")].find(
+    (el) => visible(el) && norm(el) === "영구적으로 삭제"
+  );
+}
+if (!span) return false;
+const target = span.closest("button, [role='button']") || span;
+target.scrollIntoView({block: "center"});
+target.click();
+return true;
+"""
+
+
 @dataclass
 class BlogInfo:
     id: str
@@ -680,6 +741,7 @@ class BloggerSession:
         self._on_item_done = None
         self._chrome_proc: subprocess.Popen | None = None
         self._chrome_user_dir: str | None = None
+        self._gone_ids: set[str] = set()
 
     def profile_dir(self) -> str:
         path = os.path.join(get_data_dir(), "chrome-blogger-session")
@@ -821,6 +883,7 @@ class BloggerSession:
             except RuntimeError:
                 pass
         previous = {blog.id: blog for blog in self.state.blogs}
+        gone = getattr(self, "_gone_ids", None) or set()
         blogs = []
         seen = set()
         for item in (raw or {}).get("blogs") or []:
@@ -829,6 +892,8 @@ class BloggerSession:
             if not _BLOG_ID_RE.match(blog_id) or blog_id in seen:
                 continue
             if not name or name.startswith("새 블로그"):
+                continue
+            if blog_id in gone:
                 continue
             seen.add(blog_id)
             old = previous.get(blog_id)
@@ -859,7 +924,7 @@ class BloggerSession:
                 )
             )
         if not blogs and previous:
-            blogs = list(previous.values())
+            blogs = [blog for blog in previous.values() if blog.id not in gone]
         state = SessionState(
             account=str((raw or {}).get("account") or ""),
             blogs=blogs,
@@ -890,6 +955,26 @@ class BloggerSession:
         self._wait_posts_list()
         self.detect()
         self.read_published_post(blog_id)
+
+    def posts_page_url(self, blog_id: str) -> str:
+        url = self._blogger_page("posts", blog_id)
+        if "/u/" not in url:
+            url = f"https://www.blogger.com/u/1/blog/posts/{blog_id}"
+        if "hl=" not in url:
+            url += "?hl=ko"
+        return url
+
+    def open_posts_in_new_tab(self, blog_id: str) -> str:
+        if not self.is_alive():
+            raise RuntimeError("블로그스팟 Chrome이 연결되어 있지 않습니다. 먼저 로그인해 주세요.")
+        url = self.posts_page_url(blog_id)
+        with self._lock:
+            self._focus_open_window()
+            try:
+                self.driver.execute_cdp_cmd("Target.createTarget", {"url": url})
+            except Exception:
+                self.driver.execute_script("window.open(arguments[0], '_blank');", url)
+        return url
 
     def click_new_post(self) -> None:
         if not self.is_alive():
@@ -1611,6 +1696,47 @@ class BloggerSession:
             raise RuntimeError(f"설정 페이지를 열지 못했습니다. 현재 주소: {here or '알 수 없음'}") from exc
         self._tick()
         self.detect()
+
+    def delete_blog(self, blog_id: str, name: str = "") -> None:
+        if not self.is_alive():
+            raise RuntimeError("블로그스팟 Chrome이 연결되어 있지 않습니다.")
+        self.control.checkpoint()
+        self.open_settings(blog_id)
+        self.control.checkpoint()
+        opened = False
+        sample = ""
+        for _ in range(6):
+            result = self.driver.execute_script(_OPEN_BLOG_DELETE_JS) or {}
+            opened = bool(result.get("ok"))
+            if opened:
+                self.log(f"블로그 삭제를 눌렀습니다: {result.get('text') or '삭제'}")
+                break
+            found = result.get("sample") or []
+            if found:
+                sample = ", ".join(str(item) for item in found[:8])
+            self._tick(0.45)
+        if not opened:
+            extra = f" 화면에 보인 문구: {sample}" if sample else ""
+            raise RuntimeError(f"설정 화면에서 블로그 삭제를 찾지 못했습니다.{extra}")
+        self.log("블로그 삭제 확인 창에서 영구적으로 삭제를 기다립니다.")
+        confirmed = False
+        for _ in range(16):
+            self.control.checkpoint()
+            confirmed = bool(self.driver.execute_script(_CONFIRM_BLOG_DELETE_JS))
+            if confirmed:
+                self.log("영구적으로 삭제를 눌렀습니다.")
+                break
+            self._tick(0.4)
+        if not confirmed:
+            raise RuntimeError("삭제 확인 창에서 영구적으로 삭제를 누르지 못했습니다.")
+        self._tick(1.0)
+        gone = getattr(self, "_gone_ids", None)
+        if gone is None:
+            self._gone_ids = set()
+            gone = self._gone_ids
+        gone.add(str(blog_id))
+        self.state.blogs = [blog for blog in self.state.blogs if blog.id != blog_id]
+        self.log(f"블로그 삭제를 눌렀습니다: {name or blog_id}")
 
     def read_blog_address(self) -> str:
         try:

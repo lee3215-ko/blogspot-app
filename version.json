@@ -1,13 +1,10 @@
 {
-    "version":  "1.2.11",
-    "url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/600078902",
-    "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.11/BloggerSpot.zip",
-    "notes":  "이미지 폴더를 비우면 원고만 게시합니다.",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/600078902",
-    "asset_id":  600078902,
+    "version":  "1.2.12",
+    "url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.12/BloggerSpot.zip",
+    "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.12/BloggerSpot.zip",
+    "notes":  "수집할 때 등록된 네이버 아이디만 색인으로 표시합니다. 계정 메모, 블로그 삭제, 생성 폴더 글작성, 검색을 반영했습니다.",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/600078902",
-                          "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.11/BloggerSpot.zip",
+                          "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.12/BloggerSpot.zip",
                           "https://github.com/lee3215-ko/blogspot-app/releases/latest/download/BloggerSpot.zip"
                       ]
 }

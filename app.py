@@ -107,6 +107,9 @@ class BloggerApp:
         self._text_save_job = None
         self._html_codes: list[dict] = [{"name": "A코드", "html": ""}]
         self._html_code_index = 0
+        self.memo_var = tk.StringVar(value="")
+        self._memo_parts = ["", "", "", ""]
+        self._index_labels: list = []
 
         self._build()
         self._load_local_settings()
@@ -148,14 +151,46 @@ class BloggerApp:
     def _build(self):
         self._ensure_write_folders()
         shell = frame(self.root, COLORS["bg"])
-        shell.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
+        shell.pack(fill=tk.BOTH, expand=True, padx=20, pady=16)
         self._outer = shell
 
         header = frame(shell, COLORS["bg"])
-        header.pack(fill=tk.X, pady=(0, 8))
+        header.pack(fill=tk.X, pady=(0, 10))
         title_wrap = frame(header, COLORS["bg"])
         title_wrap.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        label(title_wrap, "블로그스팟", "title").pack(anchor="w")
+        title_row = frame(title_wrap, COLORS["bg"])
+        title_row.pack(fill=tk.X)
+        label(title_row, "블로그스팟", "title").pack(side=tk.LEFT, padx=(0, 14))
+        label(title_row, "계정 메모", "small", COLORS["text_muted"]).pack(side=tk.LEFT, padx=(0, 6))
+        if ctk:
+            self.memo_entry = ctk.CTkEntry(
+                title_row,
+                textvariable=self.memo_var,
+                height=34,
+                font=FONTS["body"],
+                fg_color=COLORS["input_bg"],
+                border_color=COLORS["border"],
+                text_color=COLORS["text"],
+                placeholder_text="이메일    네이버아이디    비밀번호    이름",
+            )
+        else:
+            self.memo_entry = tk.Entry(title_row, textvariable=self.memo_var, font=FONTS["body"])
+        self.memo_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.memo_copy_row = frame(title_row, COLORS["bg"])
+        self.memo_copy_row.pack(side=tk.LEFT)
+        self._memo_copy_btns = []
+        for index, title in enumerate(("이메일", "아이디", "비번", "이름")):
+            btn = button(
+                self.memo_copy_row,
+                title,
+                variant="ghost",
+                width=78,
+                height=32,
+                command=lambda pick=index: self._copy_memo_index(pick),
+            )
+            btn.pack(side=tk.LEFT, padx=(0, 4))
+            self._memo_copy_btns.append(btn)
+        self.memo_var.trace_add("write", lambda *_: self._schedule_memo_refresh())
         self.status_label = label(title_wrap, "로그인 전", "body_bold", COLORS["text"])
         self.status_label.pack(anchor="w", pady=(2, 0))
         self.account_label = label(title_wrap, "계정: -", "body", COLORS["text_muted"])
@@ -200,11 +235,9 @@ class BloggerApp:
             pass
         self._dock_buttons = [
             button(self.action_host, "설정 적용", variant="warning", width=130, height=40, command=self.on_apply_settings),
-            button(self.action_host, "네이버 최초 HTML 코드 넣기", variant="primary", width=220, height=40, command=self.on_naver_html_insert),
-            button(self.action_host, "네이버 최초 수집", variant="success", width=160, height=40, command=self.on_naver_first_setup),
-            button(self.action_host, "블로그 수집요청", variant="ghost", width=150, height=40, command=self.on_naver_blog_crawl),
-            button(self.action_host, "글페이지 수집요청", variant="ghost", width=160, height=40, command=self.on_naver_post_crawl),
-            button(self.action_host, "글 작성", variant="success", width=120, height=40, command=self.on_write_post),
+            button(self.action_host, "최초코드", variant="primary", width=110, height=40, command=self.on_naver_html_insert),
+            button(self.action_host, "글작성", variant="success", width=100, height=40, command=self.on_write_post),
+            button(self.action_host, "최초 수집", variant="success", width=120, height=40, command=self.on_naver_first_setup),
             button(self.action_host, "블로그 생성", variant="primary", width=130, height=40, command=self.on_create_blogs),
             button(self.action_host, "일시정지", variant="ghost", width=100, height=40, command=self.on_toggle_pause),
             button(self.action_host, "정지", variant="danger", width=80, height=40, command=self.on_stop_settings),
@@ -212,10 +245,8 @@ class BloggerApp:
         (
             self.settings_btn,
             self.naver_html_btn,
-            self.naver_first_btn,
-            self.naver_blog_btn,
-            self.naver_post_btn,
             self.post_btn,
+            self.naver_first_btn,
             self.create_blogs_btn,
             self.pause_btn,
             self.stop_btn,
@@ -250,7 +281,6 @@ class BloggerApp:
             ("블로그", 110),
             ("만들기", 110),
             ("HTML 편집", 130),
-            ("글쓰기", 100),
             ("로그", 90),
         ):
             btn = button(
@@ -279,22 +309,23 @@ class BloggerApp:
         blog_card = card(body)
         blog_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         blog_inner = frame(blog_card, COLORS["card"])
-        blog_inner.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        blog_inner.pack(fill=tk.BOTH, expand=True, padx=16, pady=14)
         self.blog_heading = label(blog_inner, "블로그", "heading", COLORS["text"])
-        self.blog_heading.pack(anchor="w")
-        self.blog_summary = frame(blog_inner, COLORS["card"])
-        self.blog_summary.pack(fill=tk.X, pady=(6, 0))
-
+        head_row = frame(blog_inner, COLORS["card"])
+        head_row.pack(fill=tk.X)
+        self.blog_heading.pack(in_=head_row, side=tk.LEFT)
+        self.blog_summary = frame(head_row, COLORS["card"])
+        self.blog_summary.pack(side=tk.LEFT, padx=(10, 0))
         if ctk:
             self.blog_search = ctk.CTkEntry(
                 blog_inner,
                 textvariable=self.blog_query,
-                height=36,
+                height=32,
                 font=FONTS["body"],
                 fg_color=COLORS["input_bg"],
                 border_color=COLORS["border"],
                 text_color=COLORS["text"],
-                placeholder_text="이름·주소 검색",
+                placeholder_text="블로그 찾기 · 이름, 주소, 코드",
             )
         else:
             self.blog_search = tk.Entry(blog_inner, textvariable=self.blog_query, font=FONTS["body"])
@@ -303,46 +334,58 @@ class BloggerApp:
 
         filter_wrap = frame(blog_inner, COLORS["card"])
         filter_wrap.pack(fill=tk.X, pady=(8, 0))
+        filter_sizes = {
+            "all": 58,
+            "blog_pending": 102,
+            "post_pending": 84,
+            "setup_pending": 92,
+        }
         for key, title in BLOG_FILTERS:
             btn = button(
                 filter_wrap,
                 title,
                 variant="ghost",
-                width=108,
-                height=32,
+                width=filter_sizes.get(key, 80),
+                height=28,
                 command=lambda k=key: self._set_blog_filter(k),
             )
-            btn.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 4))
+            btn.pack(side=tk.LEFT, padx=(0, 4), pady=(0, 4))
             self._blog_filter_btns[key] = btn
         self._paint_filter_btns()
-
-        sel_row = frame(blog_inner, COLORS["card"])
-        sel_row.pack(fill=tk.X, pady=(4, 6))
-        self.sel_count_label = label(sel_row, "0개 선택", "body_bold", COLORS["accent"])
-        self.sel_count_label.pack(side=tk.LEFT)
+        tool_wrap = frame(blog_inner, COLORS["card"])
+        tool_wrap.pack(fill=tk.X, pady=(0, 6))
+        self.sel_count_label = label(tool_wrap, "0개 선택", "small", COLORS["accent"])
+        self.sel_count_label.pack(side=tk.LEFT, padx=(0, 8))
         self.select_all_btn = button(
-            sel_row, "전체 선택", variant="ghost", width=100, height=32,
+            tool_wrap, "전체 선택", variant="ghost", width=76, height=28,
             command=lambda: self._set_visible_checks(True),
         )
-        self.select_all_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.select_all_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.select_none_btn = button(
-            sel_row, "선택 해제", variant="ghost", width=100, height=32,
+            tool_wrap, "선택 해제", variant="ghost", width=76, height=28,
             command=lambda: self._set_visible_checks(False),
         )
-        self.select_none_btn.pack(side=tk.LEFT, padx=(6, 0))
-        recrawl_row = frame(blog_inner, COLORS["card"])
-        recrawl_row.pack(fill=tk.X, pady=(0, 6))
+        self.select_none_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.blog_recrawl_btn = button(
-            recrawl_row,
+            tool_wrap,
             "블로그 재수집",
             variant="primary",
-            width=130,
-            height=32,
+            width=100,
+            height=28,
             command=self.on_naver_blog_recrawl,
         )
-        self.blog_recrawl_btn.pack(side=tk.LEFT)
+        self.blog_recrawl_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.blog_delete_btn = button(
+            tool_wrap,
+            "블로그 삭제",
+            variant="danger",
+            width=92,
+            height=28,
+            command=self.on_delete_blogs,
+        )
+        self.blog_delete_btn.pack(side=tk.LEFT)
 
-        self.blog_list = scrollable(blog_inner, height=280, bg=COLORS["card"])
+        self.blog_list = scrollable(blog_inner, height=420, bg=COLORS["card"])
         self.blog_list.pack(fill=tk.BOTH, expand=True)
         for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.blog_list.bind(event, lambda _e: self._hover.hide(), add="+")
@@ -353,15 +396,15 @@ class BloggerApp:
         right_card = card(body)
         right_card.grid(row=0, column=1, sticky="nsew")
         right = frame(right_card, COLORS["card"])
-        right.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        right.pack(fill=tk.BOTH, expand=True, padx=16, pady=14)
         self.posts_heading = label(right, "글", "heading", COLORS["text"])
         self.posts_heading.pack(anchor="w")
         self.posts_meta = label(
             right,
-            "목록을 누르면 이 블로그 글만 봅니다. 아이디나 체크박스로 고른 뒤 글쓰기 탭에서 원고를 정해 글 작성을 누릅니다.",
-            "body",
+            "블로그를 누르면 글을 봅니다. 더블클릭하면 로그인된 크롬의 새 탭에서 글 목록이 열립니다.",
+            "small",
             COLORS["text_muted"],
-            wraplength=520,
+            wraplength=640,
             justify="left",
         )
         self.posts_meta.pack(anchor="w", pady=(4, 0))
@@ -381,7 +424,7 @@ class BloggerApp:
         self.post_search.pack(fill=tk.X, pady=(8, 0))
         self.post_query.trace_add("write", self._on_post_query_changed)
 
-        self.posts_list = scrollable(right, height=220, bg=COLORS["card"])
+        self.posts_list = scrollable(right, height=420, bg=COLORS["card"])
         self.posts_list.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         posts_host = getattr(self.posts_list, "inner", self.posts_list)
         self.blog_detail_wrap = frame(posts_host, COLORS["card"])
@@ -567,96 +610,33 @@ class BloggerApp:
             return
         hover = getattr(self, "_hover", None)
         if hover is not None:
-            hover.suppress(0.35)
+            hover.suppress(1.2)
 
     def _install_drag_hook(self) -> None:
-        if getattr(self, "_drag_hooked", False):
+        self._remove_drag_hook()
+
+    def _remove_drag_hook(self) -> None:
+        old = getattr(self, "_drag_old_proc", None)
+        if not getattr(self, "_drag_hooked", False) or not old:
+            self._drag_hooked = False
             return
         try:
             import ctypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.GetParent.argtypes = [ctypes.c_void_p]
+            user32.GetParent.restype = ctypes.c_void_p
+            client = int(self.root.winfo_id() or 0)
+            frame_hwnd = int(user32.GetParent(client) or 0) or client
+            set_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+            set_long.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+            set_long.restype = ctypes.c_void_p
+            set_long(frame_hwnd, -4, old)
         except Exception:
-            return
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        user32.GetParent.argtypes = [ctypes.c_void_p]
-        user32.GetParent.restype = ctypes.c_void_p
-        client = int(self.root.winfo_id() or 0)
-        if not client:
-            self.root.after(200, self._install_drag_hook)
-            return
-        frame = int(user32.GetParent(client) or 0) or client
-        WM_ENTERSIZEMOVE = 0x0231
-        WM_EXITSIZEMOVE = 0x0232
-        WM_SETREDRAW = 0x000B
-        RDW_INVALIDATE = 0x0001
-        RDW_ERASE = 0x0004
-        RDW_ALLCHILDREN = 0x0080
-        RDW_UPDATENOW = 0x0100
-        RDW_FRAME = 0x0400
-        redraw_flags = RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME
-
-        user32.CallWindowProcW.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_uint,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        ]
-        user32.CallWindowProcW.restype = ctypes.c_ssize_t
-        user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
-        user32.SendMessageW.restype = ctypes.c_ssize_t
-        user32.RedrawWindow.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
-        user32.RedrawWindow.restype = ctypes.c_int
-        set_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
-        get_long = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
-        set_long.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
-        set_long.restype = ctypes.c_void_p
-        get_long.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        get_long.restype = ctypes.c_void_p
-
-        targets = []
-        for hwnd in (frame, client):
-            if hwnd and hwnd not in targets:
-                targets.append(hwnd)
-
-        def set_redraw(enabled: bool) -> None:
-            flag = ctypes.c_void_p(1 if enabled else 0)
-            for hwnd in targets:
-                user32.SendMessageW(hwnd, WM_SETREDRAW, flag, None)
-            if enabled:
-                for hwnd in targets:
-                    user32.RedrawWindow(hwnd, None, None, redraw_flags)
-
-        old = get_long(frame, -4)
-        if not old:
-            return
-
-        def proc(hwnd, msg, wparam, lparam):
-            try:
-                if msg == WM_ENTERSIZEMOVE:
-                    hover = getattr(self, "_hover", None)
-                    if hover is not None:
-                        hover.suppress(0.5)
-                    set_redraw(False)
-                elif msg == WM_EXITSIZEMOVE:
-                    set_redraw(True)
-            except Exception:
-                pass
-            return user32.CallWindowProcW(old, hwnd, msg, wparam, lparam)
-
-        WNDPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_ssize_t,
-            ctypes.c_void_p,
-            ctypes.c_uint,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        )
-        callback = WNDPROC(proc)
-        previous = set_long(frame, -4, ctypes.cast(callback, ctypes.c_void_p))
-        if not previous:
-            return
-        self._drag_proc = callback
-        self._drag_old_proc = previous
-        self._drag_hooked = True
+            pass
+        self._drag_hooked = False
+        self._drag_proc = None
+        self._drag_old_proc = None
 
     def _layout_dock(self, _event=None) -> None:
         host = getattr(self, "action_host", None)
@@ -665,7 +645,7 @@ class BloggerApp:
         width = host.winfo_width()
         if width < 80:
             return
-        if width == getattr(self, "_dock_width", None):
+        if abs(width - int(getattr(self, "_dock_width", 0) or 0)) < 12:
             return
         self._dock_width = width
         x = 0
@@ -695,7 +675,7 @@ class BloggerApp:
         width = host.winfo_width()
         if width < 80:
             return
-        if width == getattr(self, "_tab_width", None):
+        if abs(width - int(getattr(self, "_tab_width", 0) or 0)) < 12:
             return
         self._tab_width = width
         x = 0
@@ -1040,6 +1020,8 @@ class BloggerApp:
                 data.get("html_code_index"),
                 fallback_html=str(data.get("theme_html") or ""),
             )
+        if hasattr(self, "memo_var"):
+            self.memo_var.set(str(data.get("account_memo") or ""))
 
     def _load_progress(self) -> None:
         path = data_path(PROGRESS_FILE)
@@ -1094,6 +1076,7 @@ class BloggerApp:
                     "last_post_crawl": str(item.get("last_post_crawl") or ""),
                     "last_activity": str(item.get("last_activity") or ""),
                     "folder": str(item.get("folder") or ""),
+                    "html_code": str(item.get("html_code") or ""),
                     "post_crawls": item.get("post_crawls") if isinstance(item.get("post_crawls"), dict) else {},
                 }
             self._fill_missing_post_crawls()
@@ -1156,6 +1139,7 @@ class BloggerApp:
             "html_codes": self._export_html_codes(),
             "html_code_index": int(getattr(self, "_html_code_index", 0) or 0),
             "theme_html": self._selected_html_template(),
+            "account_memo": self.memo_var.get() if hasattr(self, "memo_var") else "",
         }
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(data, handle, ensure_ascii=False, indent=2)
@@ -1245,6 +1229,133 @@ class BloggerApp:
             self.log(f"폴더 주소를 복사하지 못했습니다: {exc}")
             return
         self.log(f"폴더 주소를 복사했습니다: {text}")
+
+    def _schedule_memo_refresh(self) -> None:
+        job = getattr(self, "_memo_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._memo_job = self.root.after(180, self._apply_memo_parts)
+
+    def _apply_memo_parts(self) -> None:
+        self._memo_job = None
+        parts = self._parse_memo(self.memo_var.get() if hasattr(self, "memo_var") else "")
+        self._memo_parts = parts
+        titles = ("이메일", "아이디", "비번", "이름")
+        for btn, title, value in zip(getattr(self, "_memo_copy_btns", []), titles, parts):
+            shown = title if not value else f"{title} {value}"
+            if len(shown) > 16:
+                shown = shown[:15] + "…"
+            try:
+                btn.configure(text=shown)
+            except Exception:
+                pass
+        self._schedule_text_save()
+
+    def _memo_naver_id(self) -> str:
+        parts = getattr(self, "_memo_parts", None) or ["", "", "", ""]
+        if not any(str(part or "").strip() for part in parts) and hasattr(self, "memo_var"):
+            parts = self._parse_memo(self.memo_var.get())
+            self._memo_parts = parts
+        return str(parts[1] if len(parts) > 1 else "").strip()
+
+    def _index_caption(self) -> str:
+        naver_id = self._memo_naver_id()
+        if not naver_id:
+            return ""
+        return f"색인 {naver_id}"
+
+    def _blog_heading_text(self, count: int) -> str:
+        account = self._naver_logged_account()
+        if count and account:
+            return f"블로그 {count} · 생성순 · 서치 {account}"
+        if count:
+            return f"블로그 {count} · 생성순"
+        if account:
+            return f"블로그 · 서치 {account}"
+        return "블로그"
+
+    def _sync_index_labels(self) -> None:
+        for widget in list(getattr(self, "_index_labels", []) or []):
+            try:
+                if not widget.winfo_exists():
+                    continue
+            except Exception:
+                continue
+            indexed = str(getattr(widget, "_fallback_index", "") or "").strip()
+            caption = f"색인 {indexed}" if indexed else ""
+            try:
+                widget.configure(text=caption, text_color=COLORS["success"] if indexed else COLORS["text_muted"])
+            except Exception:
+                try:
+                    widget.configure(text=caption)
+                except Exception:
+                    pass
+            try:
+                if caption:
+                    widget.pack(side=tk.LEFT, padx=(8, 0))
+                else:
+                    widget.pack_forget()
+            except Exception:
+                pass
+        heading = getattr(self, "blog_heading", None)
+        listed = list(getattr(self, "_listed_blogs", None) or [])
+        if heading is not None:
+            try:
+                heading.configure(text=self._blog_heading_text(len(listed)))
+            except Exception:
+                pass
+        if not listed:
+            return
+        for blog in listed:
+            blog._search_text = self._blog_search_text(blog)
+        self._vis_key = None
+        self._apply_blog_visibility()
+
+    def _parse_memo(self, text: str) -> list[str]:
+        line = ""
+        for raw in (text or "").replace("\r", "\n").splitlines():
+            if raw.strip():
+                line = raw.strip()
+                break
+        if not line:
+            return ["", "", "", ""]
+        if "\t" in line:
+            parts = [part.strip() for part in line.split("\t")]
+        else:
+            parts = [part for part in re.split(r"\s+", line) if part]
+        while len(parts) < 4:
+            parts.append("")
+        return parts[:4]
+
+    def _copy_memo_index(self, index: int) -> None:
+        titles = ("이메일", "네이버아이디", "비밀번호", "이름")
+        parts = self._parse_memo(self.memo_var.get() if hasattr(self, "memo_var") else "")
+        self._memo_parts = parts
+        if index < 0 or index >= len(titles):
+            return
+        self._copy_memo_part(titles[index], parts[index] if index < len(parts) else "")
+
+    def _copy_memo_part(self, title: str, value: str) -> None:
+        text = (value or "").strip()
+        if not text:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+        except Exception:
+            self.log(f"{title} 항목을 복사하지 못했습니다.")
+            return
+        self.log(f"{title} 항목을 복사했습니다.")
+
+    def _naver_logged_account(self) -> str:
+        state = getattr(self.naver, "state", None)
+        if state is None or not getattr(state, "logged_in", False):
+            return ""
+        return str(getattr(state, "account", "") or "").strip()
 
     def on_pick_manuscript_folder(self):
         folder = filedialog.askdirectory(title="원고 폴더 선택")
@@ -1399,14 +1510,14 @@ class BloggerApp:
                 self.root.after_cancel(self._query_after)
             except Exception:
                 pass
-        self._query_after = self.root.after(200, self._refresh_dashboard)
+        self._query_after = self.root.after(30, self._apply_blog_visibility)
 
     def _set_blog_filter(self, key: str) -> None:
         if self._blog_filter == key:
             return
         self._blog_filter = key
         self._paint_filter_btns()
-        self._refresh_dashboard()
+        self._apply_blog_visibility()
 
     def _paint_filter_btns(self) -> None:
         for key, btn in self._blog_filter_btns.items():
@@ -1445,7 +1556,7 @@ class BloggerApp:
     def _blog_created_sort_key(self, blog: BlogInfo) -> tuple:
         blog_id = str(blog.id or "").strip()
         if blog_id.isdigit():
-            return (0, -int(blog_id))
+            return (0, int(blog_id))
         return (1, (blog.name or blog.address or blog_id).lower())
 
     def _blog_times(self, blog_id: str) -> dict:
@@ -1515,7 +1626,15 @@ class BloggerApp:
         query = (self.blog_query.get() or "").strip().lower()
         out = []
         for blog in blogs:
-            hay = " ".join([blog.name, blog.address, blog.id, self._naver_id_of(blog.id)]).lower()
+            hay = " ".join(
+                [
+                    blog.name,
+                    blog.address,
+                    blog.id,
+                    self._naver_id_of(blog.id),
+                    self._html_code_of(blog.id),
+                ]
+            ).lower()
             if query and query not in hay:
                 continue
             setup_pending = any(key not in blog.done for key in SETUP_KEYS)
@@ -1528,17 +1647,33 @@ class BloggerApp:
             out.append(blog)
         return out
 
+    def _html_code_of(self, blog_id: str) -> str:
+        return str((self._blog_meta.get(blog_id) or {}).get("html_code") or "").strip()
+
+    def _remember_html_code(self, blog_id: str, name: str) -> None:
+        name = (name or "").strip()
+        if not blog_id or not name:
+            return
+        cur = self._blog_meta.setdefault(blog_id, {})
+        if str(cur.get("html_code") or "").strip() == name:
+            return
+        cur["html_code"] = name
+        try:
+            self._save_blog_meta()
+        except Exception:
+            pass
+
     def _naver_id_of(self, blog_id: str) -> str:
         return str((self._blog_meta.get(blog_id) or {}).get("naver_id") or "").strip()
 
     def _remember_naver_id(self, blog_id: str, account: str = "") -> None:
-        account = (account or getattr(self.naver.state, "account", "") or "").strip()
-        if not blog_id or not account:
+        registered = (account or self._memo_naver_id()).strip()
+        if not blog_id or not registered:
             return
         cur = self._blog_meta.setdefault(blog_id, {})
-        if str(cur.get("naver_id") or "").strip():
+        if str(cur.get("naver_id") or "").strip() == registered:
             return
-        cur["naver_id"] = account
+        cur["naver_id"] = registered
         try:
             self._save_blog_meta()
         except Exception:
@@ -1547,7 +1682,6 @@ class BloggerApp:
     def _dashboard_fingerprint(self, blogs: list[BlogInfo], visible: list[BlogInfo]) -> tuple:
         return (
             self._blog_filter,
-            (self.blog_query.get() or "").strip().lower(),
             tuple(
                 (
                     blog.id,
@@ -1557,7 +1691,9 @@ class BloggerApp:
                     tuple(sorted(blog.done)),
                     self._last_recrawl(blog.id),
                     self._naver_id_of(blog.id),
+                    self._html_code_of(blog.id),
                     self._blog_folder_of(blog.id),
+                    self._naver_logged_account(),
                 )
                 for blog in blogs
             ),
@@ -1577,7 +1713,7 @@ class BloggerApp:
         self._refreshing = True
         try:
             self._render_blog_summary(blogs)
-            self._render_blogs(visible, all_blogs=blogs)
+            self._render_blogs(blogs, all_blogs=blogs)
         finally:
             self._refreshing = False
 
@@ -1612,6 +1748,7 @@ class BloggerApp:
             child.destroy()
         self._blog_buttons.clear()
         self._blog_row_frames.clear()
+        self._index_labels = []
         source = all_blogs if all_blogs is not None else blogs
         self._shown_blog_keys = [
             (
@@ -1627,10 +1764,11 @@ class BloggerApp:
         for blog_id in list(self._blog_check_vars):
             if blog_id not in live_ids:
                 self._blog_check_vars.pop(blog_id, None)
-        self.blog_heading.configure(
-            text=f"블로그 {len(source)} · 최신순" if source else "블로그"
-        )
+        account_line = self._blog_heading_text(len(source))
+        self.blog_heading.configure(text=account_line)
         if not blogs:
+            self._listed_blogs = []
+            self._vis_key = None
             empty = (
                 "조건에 맞는 블로그가 없습니다."
                 if source
@@ -1643,16 +1781,83 @@ class BloggerApp:
             self._render_blog_detail()
             return
 
-        known = {blog.id for blog in blogs}
-        if self.blog_var.get() not in known:
-            selected = next((blog.id for blog in blogs if blog.selected), blogs[0].id)
+        known = {blog.id for blog in source}
+        if source and self.blog_var.get() not in known:
+            selected = next((blog.id for blog in source if blog.selected), source[0].id)
             self.blog_var.set(selected)
 
-        for blog in blogs:
+        self._listed_blogs = list(source)
+        self._vis_key = None
+        for blog in source:
+            blog._search_text = self._blog_search_text(blog)
             self._render_blog_row(parent, blog)
         self._paint_blog_rows()
         self._update_sel_count()
         self._render_blog_detail()
+        self._apply_blog_visibility()
+        if getattr(self, "_scroll_blog_id", ""):
+            self._scroll_blog_id = ""
+            self.root.after(80, self._scroll_blog_list_to_end)
+
+    def _blog_search_text(self, blog: BlogInfo) -> str:
+        return " ".join(
+            (
+                blog.name or "",
+                blog.address or "",
+                blog.id or "",
+                self._naver_id_of(blog.id),
+                self._html_code_of(blog.id),
+            )
+        ).casefold()
+
+    def _blog_row_matches(self, blog: BlogInfo, query: str) -> bool:
+        if query and query not in getattr(blog, "_search_text", ""):
+            return False
+        if self._blog_filter == "blog_pending" and "collect" in blog.done:
+            return False
+        if self._blog_filter == "post_pending" and "collect_post" in blog.done:
+            return False
+        if self._blog_filter == "setup_pending" and not any(key not in blog.done for key in SETUP_KEYS):
+            return False
+        return True
+
+    def _apply_blog_visibility(self) -> None:
+        self._query_after = None
+        rows = getattr(self, "_blog_row_frames", None)
+        listed = getattr(self, "_listed_blogs", None)
+        if not rows or not listed:
+            return
+        query = (self.blog_query.get() or "").strip().casefold()
+        key = (query, self._blog_filter)
+        if key == getattr(self, "_vis_key", None):
+            return
+        self._vis_key = key
+        shown = 0
+        for blog in listed:
+            blog._search_text = getattr(blog, "_search_text", None) or self._blog_search_text(blog)
+            row = rows.get(blog.id)
+            if row is None:
+                continue
+            if self._blog_row_matches(blog, query):
+                row.pack(fill=tk.X, pady=4, padx=2)
+                shown += 1
+            else:
+                row.pack_forget()
+        empty = getattr(self, "_blog_filter_empty", None)
+        if shown:
+            if empty is not None:
+                try:
+                    empty.pack_forget()
+                except Exception:
+                    pass
+            return
+        parent = getattr(self, "_blog_list_inner", None)
+        if parent is None:
+            return
+        if empty is None or not self._widget_alive(empty):
+            self._blog_filter_empty = label(parent, "조건에 맞는 블로그가 없습니다.", "body", COLORS["text_muted"])
+            empty = self._blog_filter_empty
+        empty.pack(anchor="w", pady=8)
 
     def _ensure_check(self, blog_id: str) -> tk.BooleanVar:
         var = self._blog_check_vars.get(blog_id)
@@ -1711,10 +1916,103 @@ class BloggerApp:
 
     def _bind_row_focus(self, widget, blog_id: str) -> None:
         widget.bind("<Button-1>", lambda e, bid=blog_id: self._on_row_click(e, bid))
+        widget.bind("<Double-Button-1>", lambda _e, bid=blog_id: self._open_blog_address(bid))
         try:
             widget.configure(cursor="hand2")
         except Exception:
             pass
+
+    def _open_blog_address(self, blog_id: str):
+        if not self.session.is_alive() or not self.session.state.logged_in:
+            self.log("블로그스팟에 로그인된 크롬이 없어 글 목록을 열지 못했습니다.")
+            return "break"
+        threading.Thread(target=self._open_blog_tab_worker, args=(blog_id,), daemon=True).start()
+        return "break"
+
+    def _open_blog_tab_worker(self, blog_id: str) -> None:
+        try:
+            url = self.session.open_posts_in_new_tab(blog_id)
+            self.log(f"로그인된 크롬 새 탭에서 열었습니다: {url}")
+        except Exception as exc:
+            self.log(f"블로그 글 목록을 열지 못했습니다: {_exc_text(exc)}")
+
+    def on_delete_blogs(self) -> None:
+        blogs = self._selected_blogs("블로그 삭제", require_naver=False, require_address=False)
+        if not blogs:
+            return
+        lines = "\n".join(f"· {blog.name or blog.id}" for blog in blogs[:12])
+        extra = f"\n외 {len(blogs) - 12}개" if len(blogs) > 12 else ""
+        if not messagebox.askyesno(
+            "블로그 삭제",
+            f"선택한 블로그 {len(blogs)}개를 블로그스팟에서 삭제합니다.\n글도 함께 지워지며 되돌릴 수 없습니다.\n\n{lines}{extra}",
+        ):
+            return
+        self._settings_busy = True
+        self._paused = False
+        self._run_control.reset()
+        self.settings_btn.configure(state="disabled")
+        self.post_btn.configure(state="disabled")
+        self._set_naver_buttons(False)
+        self._set_run_controls(True)
+        self._set_progress(0, len(blogs), "블로그 삭제")
+        payload = [(blog.id, blog.name or blog.id) for blog in blogs]
+        threading.Thread(target=self._delete_blogs_worker, args=(payload,), daemon=True).start()
+
+    def _delete_blogs_worker(self, blogs: list[tuple[str, str]]) -> None:
+        failed: list[str] = []
+        total = len(blogs)
+        try:
+            self.session.control = self._run_control
+            for index, (blog_id, name) in enumerate(blogs, 1):
+                self._run_control.checkpoint()
+                self.root.after(0, lambda i=index, t=total, n=name: self._set_progress(i - 1, t, f"블로그 삭제: {n}"))
+                self.log(f"블로그 삭제 {index}/{total}: {name}")
+                try:
+                    self.session.delete_blog(blog_id, name)
+                    self._drop_deleted_blog(blog_id)
+                    self.log(f"블로그를 삭제했습니다: {name}")
+                except StopRequested:
+                    raise
+                except Exception as exc:
+                    detail = _exc_text(exc)
+                    failed.append(f"{name}: {detail}")
+                    self.log(f"블로그 삭제 실패: {name} · {detail}")
+            self.root.after(0, lambda: self._apply_state(self.session.state))
+            self.root.after(0, lambda: self._set_progress(total, total, "블로그 삭제 완료"))
+            if failed:
+                text = "\n".join(failed[:8])
+                self.root.after(0, lambda m=text: messagebox.showwarning("블로그 삭제", m))
+        except StopRequested:
+            self.log("블로그 삭제를 중지했습니다.")
+            self.root.after(0, lambda: self._set_progress(0, total, "중지됨"))
+            self.root.after(0, lambda: self._apply_state(self.session.state))
+        except Exception as exc:
+            detail = _exc_text(exc)
+            self.log(f"블로그 삭제 오류: {detail}")
+            self.root.after(0, lambda m=detail: messagebox.showerror("블로그 삭제", m))
+        finally:
+            self.root.after(0, self._delete_blogs_done)
+
+    def _drop_deleted_blog(self, blog_id: str) -> None:
+        self.session.state.blogs = [blog for blog in self.session.state.blogs if blog.id != blog_id]
+        self._blog_meta.pop(blog_id, None)
+        self._progress_map.pop(blog_id, None)
+        self._blog_check_vars.pop(blog_id, None)
+        if self.blog_var.get() == blog_id:
+            self.blog_var.set("")
+        try:
+            self._save_blog_meta()
+            self._save_progress()
+        except Exception:
+            pass
+
+    def _delete_blogs_done(self) -> None:
+        self._settings_busy = False
+        self._paused = False
+        self.settings_btn.configure(state="normal")
+        self.post_btn.configure(state="normal")
+        self._set_naver_buttons(True)
+        self._set_run_controls(False)
 
     def _mark_check_hit(self, widget) -> None:
         widget._blog_check_hit = True
@@ -1813,6 +2111,11 @@ class BloggerApp:
         name_lbl = label(top, name, "body_bold")
         name_lbl.pack(side=tk.LEFT, padx=(6, 0))
         self._bind_row_focus(name_lbl, blog.id)
+        code_name = self._html_code_of(blog.id)
+        if code_name:
+            code_pill = pill(top, code_name, "info")
+            code_pill.pack(side=tk.LEFT, padx=(6, 0))
+            self._bind_row_focus(code_pill, blog.id)
 
         host = re.sub(r"^https?://", "", blog.address or "", flags=re.I).rstrip("/")
         bottom = frame(row, bg)
@@ -1822,6 +2125,16 @@ class BloggerApp:
         addr_lbl = label(bottom, addr, "small", COLORS["accent"] if host else COLORS["text_light"])
         addr_lbl.pack(side=tk.LEFT)
         self._bind_row_focus(addr_lbl, blog.id)
+        stored = self._naver_id_of(blog.id)
+        collected = "collect" in blog.done or "collect_post" in blog.done
+        indexed = stored if collected and stored else ""
+        caption = f"색인 {indexed}" if indexed else ""
+        naver_lbl = label(bottom, caption, "small", COLORS["success"] if indexed else COLORS["text_muted"])
+        naver_lbl._fallback_index = indexed
+        self._bind_row_focus(naver_lbl, blog.id)
+        if caption:
+            naver_lbl.pack(side=tk.LEFT, padx=(8, 0))
+        self._index_labels.append(naver_lbl)
         post_count = len(blog.posts)
         if "collect_post" in blog.done:
             post_text, post_tone = f"글 {post_count}", "ok"
@@ -2019,6 +2332,14 @@ class BloggerApp:
             cur_h = self.root.winfo_height()
             self.root.minsize(min(1100, max_w), min(760, max_h))
             self.root.maxsize(max_w, max_h)
+            if not getattr(self, "_window_fitted", False):
+                self._window_fitted = True
+                if cur_w < 400 or cur_h < 400:
+                    cur_w, cur_h = 1280, 900
+                target_w = min(max_w, max(cur_w, int(screen_w * 0.82)))
+                target_h = min(max_h, max(cur_h, int(screen_h * 0.84)))
+                self.root.geometry(f"{target_w}x{target_h}")
+                return
             if cur_w > max_w or cur_h > max_h:
                 self.root.geometry(f"{min(cur_w, max_w)}x{min(cur_h, max_h)}")
         except Exception:
@@ -2103,6 +2424,9 @@ class BloggerApp:
             self._set_naver_status(text, COLORS["success"])
         else:
             self._set_naver_status("서치어드바이저: 로그인 전", COLORS["text_muted"])
+        self._dashboard_fp = None
+        if hasattr(self, "_blog_list_inner"):
+            self._refresh_dashboard()
 
     def _set_naver_login_button(self, text: str, enabled: bool):
         self.naver_login_btn.configure(text=text, state="normal" if enabled else "disabled")
@@ -2186,11 +2510,10 @@ class BloggerApp:
         for btn in (
             self.naver_html_btn,
             self.naver_first_btn,
-            self.naver_blog_btn,
-            self.naver_post_btn,
             self.select_all_btn,
             self.select_none_btn,
             self.blog_recrawl_btn,
+            self.blog_delete_btn,
             self.create_blogs_btn,
             self.create_side_btn,
         ):
@@ -2386,6 +2709,7 @@ class BloggerApp:
             self._naver_html_worker,
             jobs,
             template,
+            code_name,
         )
 
     def on_naver_first_setup(self):
@@ -2512,7 +2836,7 @@ class BloggerApp:
         except Exception:
             pass
 
-    def _naver_html_worker(self, jobs: list[tuple[str, str]], template: str):
+    def _naver_html_worker(self, jobs: list[tuple[str, str]], template: str, code_name: str = ""):
         warnings: list[str] = []
         grand = 2 * len(jobs)
         try:
@@ -2523,7 +2847,6 @@ class BloggerApp:
                 prefix = f"{index}/{len(jobs)} · " if len(jobs) > 1 else ""
                 self.log(f"네이버 최초 HTML 코드 넣기: {name} · {address}")
                 self.naver.read_account()
-                self._remember_naver_id(blog_id)
                 self.session.control = self._run_control
 
                 def inject_theme(snippet: str, target=blog_id, base=template):
@@ -2540,7 +2863,8 @@ class BloggerApp:
                         on_progress=self._offset_progress((index - 1) * 2, grand, prefix),
                         on_item_done=self._on_item_done,
                     )
-                    self.log(f"편집 코드 전체를 테마에 붙여 넣었습니다: {name}")
+                    self.log(f"편집 코드 전체를 테마에 붙여 넣었습니다: {name} · {code_name or '코드'}")
+                    self._remember_html_code(blog_id, code_name)
                 except StopRequested:
                     raise
                 except Exception as exc:
@@ -2962,7 +3286,7 @@ class BloggerApp:
             cur["last_blog_crawl"] = now
         elif key == "collect_post":
             cur["last_post_crawl"] = now
-        if key in {"theme_head", "naver_verify", "collect", "collect_post", "crawl_fast"}:
+        if key in {"collect", "collect_post"}:
             self._remember_naver_id(blog_id)
         try:
             self._save_blog_meta()
@@ -3074,7 +3398,16 @@ class BloggerApp:
                 name = item.get("title") or "?"
                 warnings.append(f"{name}: 생성 결과를 확인하지 못했습니다.")
                 self.log(f"블로그 생성 확인 실패: {name}")
-            self.root.after(0, lambda: self._apply_state(self.session.state))
+            created_ids = [str(item.get("id") or "") for item in made if item.get("id")]
+            created_titles = [
+                str(item.get("title") or "")
+                for item in made
+                if not item.get("id") and item.get("title")
+            ]
+            self.root.after(
+                0,
+                lambda ids=list(created_ids), titles=list(created_titles): self._select_created_blogs(ids, titles),
+            )
             if warnings:
                 text = "\n".join(warnings[:8])
                 self.root.after(0, lambda m=text: messagebox.showwarning("블로그 생성", m))
@@ -3088,6 +3421,55 @@ class BloggerApp:
             self.root.after(0, lambda m=detail: messagebox.showerror("블로그 생성", m))
         finally:
             self.root.after(0, self._create_blogs_done)
+
+    def _select_created_blogs(self, ids: list[str], titles: list[str] | None = None) -> None:
+        self._apply_state(self.session.state)
+        picked: list[str] = []
+        seen: set[str] = set()
+        for raw in ids:
+            blog_id = str(raw or "").strip()
+            if blog_id and blog_id not in seen:
+                seen.add(blog_id)
+                picked.append(blog_id)
+        by_name: dict[str, list[str]] = {}
+        for blog in self.session.state.blogs:
+            by_name.setdefault(blog.name or "", []).append(blog.id)
+        for raw_title in titles or []:
+            matches = by_name.get(str(raw_title or "").strip()) or []
+            if not matches:
+                continue
+            numeric = [item for item in matches if str(item).isdigit()]
+            blog_id = max(numeric, key=int) if numeric else matches[-1]
+            if blog_id not in seen:
+                seen.add(blog_id)
+                picked.append(blog_id)
+        if not picked:
+            return
+        live = {blog.id for blog in self.session.state.blogs}
+        if live:
+            picked = [blog_id for blog_id in picked if blog_id in live] or picked
+        chosen = set(picked)
+        for blog_id, var in list(self._blog_check_vars.items()):
+            var.set(blog_id in chosen)
+        for blog_id in picked:
+            self._ensure_check(blog_id).set(True)
+        self.blog_var.set(picked[-1])
+        self._scroll_blog_id = picked[-1]
+        self._update_sel_count()
+        self._show_main_tab("블로그")
+        self._dashboard_fp = None
+        self._schedule_dashboard()
+
+    def _scroll_blog_list_to_end(self) -> None:
+        widget = getattr(self, "blog_list", None)
+        canvas = getattr(widget, "_parent_canvas", None)
+        if canvas is None:
+            return
+        try:
+            canvas.update_idletasks()
+            canvas.yview_moveto(1.0)
+        except Exception:
+            pass
 
     def _create_blogs_done(self):
         self._create_busy = False
@@ -3172,6 +3554,78 @@ class BloggerApp:
         except Exception:
             pass
 
+    def _ask_write_count(self, plans: list[tuple]) -> int | None:
+        counts = [len(files) for _blog, _folder, files in plans]
+        same = len(set(counts)) == 1
+        default = str(counts[0]) if same else ""
+        outcome: dict[str, int | None] = {"value": None}
+        win = ctk.CTkToplevel(self.root) if ctk else tk.Toplevel(self.root)
+        win.title("글 작성")
+        win.transient(self.root)
+        win.resizable(False, False)
+        if ctk:
+            win.configure(fg_color=COLORS["card"])
+        else:
+            win.configure(bg=COLORS["card"])
+        body = frame(win, COLORS["card"])
+        body.pack(fill=tk.BOTH, expand=True, padx=18, pady=16)
+        label(body, "폴더의 txt", "heading", COLORS["text"]).pack(anchor="w")
+        lines = []
+        for blog, _folder, files in plans:
+            lines.append(f"{blog.name or blog.id} · txt {len(files)}개")
+        label(body, "\n".join(lines), "body", COLORS["text"], justify="left").pack(anchor="w", pady=(8, 6))
+        if same:
+            hint = "기본값은 폴더 안 txt 전부입니다. 숫자를 줄이면 그만큼만 씁니다."
+        else:
+            hint = "비워 두면 블로그마다 폴더의 txt를 모두 씁니다. 숫자를 적으면 블로그마다 그 개수만 씁니다."
+        label(body, hint, "small", COLORS["text_muted"], wraplength=440, justify="left").pack(anchor="w", pady=(0, 10))
+        row = frame(body, COLORS["card"])
+        row.pack(fill=tk.X)
+        label(row, "작성할 글 개수", "body_bold", COLORS["text"]).pack(side=tk.LEFT)
+        var = tk.StringVar(value=default)
+        if ctk:
+            entry = ctk.CTkEntry(
+                row, textvariable=var, width=88, height=34, font=FONTS["body"],
+                fg_color=COLORS["input_bg"], border_color=COLORS["border"], text_color=COLORS["text"],
+            )
+        else:
+            entry = tk.Entry(row, textvariable=var, width=8, font=FONTS["body"])
+        entry.pack(side=tk.LEFT, padx=(8, 0))
+        actions = frame(body, COLORS["card"])
+        actions.pack(fill=tk.X, pady=(14, 0))
+
+        def close(value: int | None) -> None:
+            outcome["value"] = value
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+
+        def confirm() -> None:
+            raw = var.get().strip()
+            if not raw:
+                close(0)
+                return
+            if not raw.isdigit() or int(raw) < 1:
+                messagebox.showwarning("글 작성", "1 이상의 개수를 적거나, 비워 두면 폴더의 txt를 모두 씁니다.", parent=win)
+                return
+            close(int(raw))
+
+        button(actions, "취소", variant="ghost", width=88, height=34, command=lambda: close(None)).pack(side=tk.RIGHT)
+        button(actions, "글 작성", variant="success", width=100, height=34, command=confirm).pack(side=tk.RIGHT, padx=(0, 8))
+        win.protocol("WM_DELETE_WINDOW", lambda: close(None))
+        win.bind("<Return>", lambda _event: confirm())
+        win.bind("<Escape>", lambda _event: close(None))
+        win.update_idletasks()
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        entry.focus_set()
+        self.root.wait_window(win)
+        return outcome["value"]
+
     def on_write_post(self):
         if self._any_busy():
             return
@@ -3182,33 +3636,40 @@ class BloggerApp:
         if not blogs:
             messagebox.showwarning("글 작성", "글을 쓸 블로그를 체크하거나 목록에서 눌러 주세요.")
             return
-        manuscript_folder = self.manuscript_var.get().strip()
-        image_folder = self.post_image_var.get().strip()
-        if not manuscript_folder or not os.path.isdir(manuscript_folder):
-            messagebox.showwarning("글 작성", "글쓰기 탭에서 원고 폴더를 선택해 주세요.")
-            self._show_main_tab("글쓰기")
+        missing_folder = []
+        empty_folder = []
+        plans = []
+        for blog in blogs:
+            folder = self._blog_folder_of(blog.id)
+            if not folder or not os.path.isdir(folder):
+                missing_folder.append(blog.name or blog.id)
+                continue
+            files = self._manuscript_files(folder)
+            if not files:
+                empty_folder.append(blog.name or blog.id)
+                continue
+            plans.append((blog, folder, files))
+        if missing_folder:
+            names = ", ".join(missing_folder[:4])
+            messagebox.showwarning("글 작성", f"블로그를 만들 때 생긴 폴더가 없습니다: {names}")
             return
+        if empty_folder:
+            names = ", ".join(empty_folder[:4])
+            messagebox.showwarning("글 작성", f"폴더에 txt 파일이 없습니다: {names}\n성공 폴더 안의 파일은 다시 쓰지 않습니다.")
+            return
+        count = self._ask_write_count(plans)
+        if count is None:
+            return
+        if count:
+            short = [blog.name or blog.id for blog, _folder, files in plans if len(files) < count]
+            if short:
+                names = ", ".join(short[:4])
+                messagebox.showwarning("글 작성", f"txt가 {count}개보다 적습니다: {names}")
+                return
+        image_folder = self.post_image_var.get().strip() if hasattr(self, "post_image_var") else ""
         use_images = bool(image_folder and os.path.isdir(image_folder))
         if image_folder and not use_images:
             messagebox.showwarning("글 작성", "이미지 폴더를 찾지 못했습니다. 폴더를 다시 고르거나 비워 두면 원고만 씁니다.")
-            self._show_main_tab("글쓰기")
-            return
-        files = self._manuscript_files(manuscript_folder)
-        if not files:
-            messagebox.showwarning("글 작성", "원고 폴더에 txt 파일이 없습니다. 성공 폴더 안의 파일은 다시 쓰지 않습니다.")
-            return
-        raw_count = self.write_count_var.get().strip() if hasattr(self, "write_count_var") else ""
-        if not raw_count.isdigit() or int(raw_count) < 1:
-            messagebox.showwarning("글 작성", "글쓰기 탭에서 작성할 글 개수를 1 이상으로 적어 주세요.")
-            self._show_main_tab("글쓰기")
-            return
-        count = int(raw_count)
-        if len(files) < count:
-            messagebox.showwarning(
-                "글 작성",
-                f"원고가 {len(files)}개인데 {count}개를 쓰려고 합니다. 원고를 더 넣거나 개수를 줄여 주세요.",
-            )
-            self._show_main_tab("글쓰기")
             return
         if use_images:
             try:
@@ -3218,9 +3679,10 @@ class BloggerApp:
                 return
         else:
             image_folder = ""
-        self._save_local_settings()
-        chosen_blogs = [blogs[index % len(blogs)] for index in range(count)]
-        jobs = list(zip(chosen_blogs, files[:count]))
+        jobs = []
+        for blog, folder, files in plans:
+            chosen = files if not count else files[:count]
+            jobs.extend((blog, path, folder) for path in chosen)
         self.log(f"작성할 글 {len(jobs)}개")
         self._post_busy = True
         self._paused = False
@@ -3230,14 +3692,14 @@ class BloggerApp:
         self._set_naver_buttons(False)
         self._set_run_controls(True)
         self._set_progress(0, len(jobs), f"작성할 글 {len(jobs)}개")
-        threading.Thread(target=self._write_worker, args=(jobs, manuscript_folder, image_folder), daemon=True).start()
+        threading.Thread(target=self._write_worker, args=(jobs, image_folder), daemon=True).start()
 
-    def _write_worker(self, jobs: list, manuscript_folder: str, image_folder: str):
+    def _write_worker(self, jobs: list, image_folder: str):
         done = 0
         total = len(jobs)
         try:
             self.session.control = self._run_control
-            for index, (blog, path) in enumerate(jobs, start=1):
+            for index, (blog, path, folder) in enumerate(jobs, start=1):
                 self._run_control.checkpoint()
                 title = os.path.splitext(os.path.basename(path))[0].strip() or "제목 없음"
                 body = self._manuscript_html(self._read_manuscript(path))
@@ -3249,7 +3711,7 @@ class BloggerApp:
                 post_url = self.session.publish_manuscript(blog.id, title, body, image_path)
                 if not post_url:
                     raise RuntimeError(f"{name}: 게시는 시도했지만 글 주소를 찾지 못했습니다. 원고는 그대로 둡니다.")
-                moved = self._move_manuscript_to_success(path, manuscript_folder)
+                moved = self._move_manuscript_to_success(path, folder)
                 done += 1
                 self.log(f"작성된 글 주소: {post_url}")
                 self.log(f"원고를 성공 폴더로 옮겼습니다: {os.path.basename(moved)}")
@@ -3439,6 +3901,7 @@ class BloggerApp:
             "blog_folder": self.blog_folder_var.get() if hasattr(self, "blog_folder_var") else "",
             "post_image": self.post_image_var.get() if hasattr(self, "post_image_var") else "",
             "write_count": self.write_count_var.get() if hasattr(self, "write_count_var") else "1",
+            "memo": self.memo_var.get() if hasattr(self, "memo_var") else "",
             "log": "",
         }
         box = getattr(self, "log_box", None)
@@ -3485,6 +3948,8 @@ class BloggerApp:
             self.post_image_var.set(data.get("post_image") or "")
         if "write_count" in data and hasattr(self, "write_count_var"):
             self.write_count_var.set(str(data.get("write_count") or "1"))
+        if "memo" in data and hasattr(self, "memo_var"):
+            self.memo_var.set(str(data.get("memo") or ""))
         text = data.get("log") or ""
         if text and hasattr(self, "log_box"):
             if ctk:

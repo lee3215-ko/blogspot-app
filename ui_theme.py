@@ -193,6 +193,8 @@ class HoverPopup:
         self._blocked_until = time.time() + max(0.0, seconds)
 
     def _on_enter(self, widget, lines) -> None:
+        if time.time() < getattr(self, "_blocked_until", 0):
+            return
         self.hide()
         self._widget = widget
         self._after = widget.after(180, lambda: self._show(widget, lines))
