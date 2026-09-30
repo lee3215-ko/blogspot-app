@@ -1,4 +1,5 @@
 """UI 토큰과 공통 위젯."""
+import time
 import tkinter as tk
 
 try:
@@ -29,9 +30,11 @@ COLORS = {
     "ok_bg": "#d1fae5",
     "wait_bg": "#fde68a",
     "chip_bg": "#e2e8f0",
-    "row_selected": "#eef2ff",
-    "row_checked": "#dbeafe",
-    "row_focus": "#eef2ff",
+    "row_selected": "#c7d2fe",
+    "row_checked": "#93c5fd",
+    "row_checked_border": "#1d4ed8",
+    "row_focus": "#a5b4fc",
+    "row_focus_border": "#3730a3",
 }
 
 FONT_FAMILY = "맑은 고딕"
@@ -159,6 +162,7 @@ class HoverPopup:
         self._win = None
         self._after = None
         self._widget = None
+        self._blocked_until = 0.0
 
     def bind(self, widget, lines):
         widget.bind("<Enter>", lambda _e, w=widget, rows=lines: self._on_enter(w, rows), add="+")
@@ -184,6 +188,10 @@ class HoverPopup:
                 pass
             self._win = None
 
+    def suppress(self, seconds: float = 0.4) -> None:
+        self.hide()
+        self._blocked_until = time.time() + max(0.0, seconds)
+
     def _on_enter(self, widget, lines) -> None:
         self.hide()
         self._widget = widget
@@ -198,6 +206,8 @@ class HoverPopup:
             return
         rows = lines() if callable(lines) else lines
         if not rows:
+            return
+        if time.time() < getattr(self, "_blocked_until", 0):
             return
         win = tk.Toplevel(self.root)
         win.withdraw()

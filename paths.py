@@ -3,7 +3,7 @@ import os
 import sys
 
 APP_NAME = "BloggerSpot"
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.10"
 UPDATE_VERSION_URL = (
     "https://raw.githubusercontent.com/lee3215-ko/blogspot-app/main/version.json"
 )

@@ -394,13 +394,14 @@ class NaverAdvisorSession:
             self._accept_consent()
             count = 0
             how = ""
-            for i in range(10):
+            deadline = time.time() + 12
+            while time.time() < deadline:
                 got = self.driver.execute_script(_COUNT_JS) or {}
                 count = int(got.get("n") or 0)
                 how = str(got.get("how") or "")
-                if how in {"label", "table"} or i >= 4:
+                if how in {"label", "table"} or count > 0:
                     break
-                time.sleep(0.6)
+                time.sleep(0.5)
             self.state.site_count = count
             self.state.logged_in = True
             self.state.url = self._url()
@@ -550,23 +551,26 @@ class NaverAdvisorSession:
     def check_site_ownership(self, site_url: str) -> dict:
         site = normalize_site_url(site_url)
         host = site_host_key(site)
-        self._goto_board()
-        self._tick(1.0)
+        if "/console/board" not in self._url():
+            self._goto_board()
+        self._wait_site_board()
         self._accept_alerts()
-        if not self._type_site_search(site):
-            raise RuntimeError("사이트 목록 검색창을 찾지 못했습니다.")
-        self._tick(0.4)
-        try:
-            self.driver.switch_to.active_element.send_keys(Keys.ENTER)
-        except Exception:
-            pass
-        status = {"found": False, "pending": False, "text": ""}
-        for _ in range(10):
-            self.control.checkpoint()
-            status = self._inspect_site_row(host)
-            if status.get("found"):
-                break
-            time.sleep(0.5)
+        status = self._inspect_site_row(host)
+        if not status.get("found"):
+            if not self._type_site_search(site):
+                raise RuntimeError("사이트 목록 검색창을 찾지 못했습니다.")
+            self._tick(0.4)
+            try:
+                self.driver.switch_to.active_element.send_keys(Keys.ENTER)
+            except Exception:
+                pass
+            status = {"found": False, "pending": False, "text": ""}
+            for _ in range(10):
+                self.control.checkpoint()
+                status = self._inspect_site_row(host)
+                if status.get("found"):
+                    break
+                time.sleep(0.5)
         if status.get("found"):
             extra = "소유확인 진행 링크 있음" if status.get("pending") else "소유확인 완료"
             self.log(f"사이트 목록 확인: {host} · {extra}")
@@ -574,28 +578,58 @@ class NaverAdvisorSession:
             self.log(f"사이트 목록에서 찾지 못함: {host}")
         return status
 
-    def _type_site_search(self, site_url: str) -> bool:
-        value = to_board_host_url(site_url)
-        ok = self.driver.execute_script(
+    def _wait_site_board(self) -> None:
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            self.control.checkpoint()
+            ready = self.driver.execute_script(
+                """
+                if (document.querySelector("tbody tr")) return true;
+                return !!document.querySelector('input[type="text"], input[type="search"]');
+                """
+            )
+            if ready:
+                return
+            time.sleep(0.4)
+
+    def _find_site_search(self):
+        return self.driver.execute_script(
             """
-            const value = arguments[0];
             const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="search"], input:not([type])'));
-            let el = null;
             for (const input of inputs) {
               const id = input.id || "";
               const lab = id ? document.querySelector('label[for="' + id + '"]') : null;
-              const wrap = input.closest('.v-text-field, .v-input, .d-flex, .col') || input.parentElement;
+              const slot = input.closest(".v-text-field__slot, .v-input, label") || input.parentElement;
               const meta = [
                 lab ? lab.textContent : "",
                 input.placeholder || "",
                 input.getAttribute("aria-label") || "",
-                wrap ? wrap.textContent : "",
+                slot ? slot.innerText : "",
               ].join(" ");
+              if (/URL을 입력|example\\.com/.test(meta)) continue;
               const r = input.getBoundingClientRect();
-              if (r.width < 60 || r.height < 10) continue;
-              if (/검색/.test(meta)) { el = input; break; }
+              if (r.width < 40 || r.height < 10) continue;
+              if (/검색/.test(meta)) return input;
             }
-            if (!el) return false;
+            return null;
+            """
+        )
+
+    def _type_site_search(self, site_url: str) -> bool:
+        value = to_board_host_url(site_url)
+        element = None
+        deadline = time.time() + 12
+        while time.time() < deadline and element is None:
+            self.control.checkpoint()
+            element = self._find_site_search()
+            if element is None:
+                time.sleep(0.4)
+        if element is None:
+            return False
+        ok = self.driver.execute_script(
+            """
+            const el = arguments[0];
+            const value = arguments[1];
             el.focus();
             el.click();
             const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
@@ -603,8 +637,9 @@ class NaverAdvisorSession:
             else el.value = value;
             el.dispatchEvent(new Event("input", {bubbles: true}));
             el.dispatchEvent(new Event("change", {bubbles: true}));
-            return true;
+            return (el.value || "") === value;
             """,
+            element,
             value,
         )
         if ok:
@@ -668,6 +703,7 @@ class NaverAdvisorSession:
             raise RuntimeError("수집할 글 주소가 없습니다. 먼저 글 목록을 인식해 주세요.")
         ok = 0
         fail = 0
+        done_urls: list[str] = []
         total = len(urls)
         grand = progress_total or (progress_base + total)
         for index, url in enumerate(urls, start=1):
@@ -676,12 +712,13 @@ class NaverAdvisorSession:
             result = self.submit_text_request(self._crawl_page(site), url)
             if result.get("ok"):
                 ok += 1
+                done_urls.append(url)
             else:
                 fail += 1
                 self.log(f"글페이지 수집 실패: {result.get('reason') or 'unknown'}")
         if ok and blog_id:
             self._mark_done(blog_id, "collect_post")
-        return {"ok": ok > 0, "success": ok, "fail": fail}
+        return {"ok": ok > 0, "success": ok, "fail": fail, "urls": done_urls}
 
     def _sitemap_page(self, site: str) -> str:
         return f"https://searchadvisor.naver.com/console/site/request/sitemap?site={quote(site, safe='')}"
@@ -917,9 +954,24 @@ class NaverAdvisorSession:
             else input.value = targetUrl;
             input.dispatchEvent(new Event("input", {bubbles: true}));
             input.dispatchEvent(new Event("change", {bubbles: true}));
+            let node = input;
+            let site = null;
+            while (node) {
+              const vm = node.__vue__;
+              if (vm && vm.$options && vm.$options.name === "SiteBaseInput" && typeof vm.clickConfirm === "function") {
+                site = vm;
+                break;
+              }
+              node = node.parentElement;
+            }
+            if (site) {
+              site.value = targetUrl;
+              site.clickConfirm();
+              return {ok: true, button: "확인", vue: true, value: site.value || input.value};
+            }
             for (const btn of document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')) {
-              const txt = (btn.textContent || btn.value || "").trim();
-              if (/^(확\\s*인|확인|제출|등록|추가|요청)$/.test(txt)) {
+              const txt = (btn.textContent || btn.value || "").replace(/\\s+/g, " ").trim();
+              if (/^(확인|제출|등록|추가|요청|수집\\s*요청|재수집)$/.test(txt)) {
                 const r = btn.getBoundingClientRect();
                 if (r.width > 0 && r.height > 0) {
                   btn.click();
@@ -931,7 +983,27 @@ class NaverAdvisorSession:
             """,
             value,
         ) or {"ok": False, "reason": "unknown"}
-        self._tick(1.8)
+        self._tick(1.2)
+        if submitted.get("vue"):
+            alert = self.driver.execute_script(
+                """
+                const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="url"], textarea'));
+                for (const input of inputs) {
+                  let node = input;
+                  while (node) {
+                    const vm = node.__vue__;
+                    if (vm && vm.$options && vm.$options.name === "SiteBaseInput") {
+                      if (vm.showAlert && vm.alertMessageText) return String(vm.alertMessageText);
+                      return "";
+                    }
+                    node = node.parentElement;
+                  }
+                }
+                return "";
+                """
+            ) or ""
+            if alert:
+                submitted = {"ok": False, "reason": str(alert), "value": value}
         self._drain_alerts()
         self._click_modal_confirm()
         self._drain_alerts()
