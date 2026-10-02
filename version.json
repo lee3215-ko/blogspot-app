@@ -1,9 +1,12 @@
 {
     "version":  "1.2.14",
-    "url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.14/BloggerSpot.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/604835183",
     "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.14/BloggerSpot.zip",
     "notes":  "HTML 코드 탭 이름을 바꾸고, 기록은 구글 이메일별로 묶고 선택한 행이 보이게 했습니다. 스프레드시트는 값이 같으면 열 순서를 덮어쓰지 않습니다.",
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/604835183",
+    "asset_id":  604835183,
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/604835183",
                           "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.14/BloggerSpot.zip",
                           "https://github.com/lee3215-ko/blogspot-app/releases/latest/download/BloggerSpot.zip"
                       ]
