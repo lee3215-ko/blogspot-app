@@ -1,9 +1,12 @@
 {
     "version":  "1.2.13",
-    "url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.13/BloggerSpot.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/604598781",
     "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.13/BloggerSpot.zip",
     "notes":  "블로그스팟과 서치어드바이저 로그인을 프로그램을 닫아도 유지하고, 다시 인식으로 현재 창의 아이디를 읽습니다.",
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/604598781",
+    "asset_id":  604598781,
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/604598781",
                           "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.13/BloggerSpot.zip",
                           "https://github.com/lee3215-ko/blogspot-app/releases/latest/download/BloggerSpot.zip"
                       ]
