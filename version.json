@@ -1,9 +1,12 @@
 {
     "version":  "1.2.15",
-    "url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.15/BloggerSpot.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/604969482",
     "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.15/BloggerSpot.zip",
     "notes":  "ChromeDriver 캐시로 로그인 실패 수정, 로봇 헤더/robots.txt, 시트 붙여넣기 시 전체 삭제 방지",
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/604969482",
+    "asset_id":  604969482,
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/604969482",
                           "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.15/BloggerSpot.zip",
                           "https://github.com/lee3215-ko/blogspot-app/releases/latest/download/BloggerSpot.zip"
                       ]
