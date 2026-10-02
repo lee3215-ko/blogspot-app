@@ -498,11 +498,14 @@ def build_robots_txt(address: str) -> str:
         raise RuntimeError("블로그 주소가 없어 robots.txt를 만들 수 없습니다.")
     base = f"https://{host}"
     return (
+        "User-agent: Mediapartners-Google\n"
+        "Disallow:\n"
+        "\n"
         "User-agent: *\n"
+        "Disallow: /share-widget\n"
         "Allow: /\n"
         "\n"
         f"Sitemap: {base}/sitemap.xml\n"
-        f"Sitemap: {base}/atom.xml\n"
     )
 
 
@@ -542,6 +545,37 @@ class RunControl:
             time.sleep(0.05)
         if self._stop.is_set():
             raise StopRequested("중지되었습니다.")
+
+
+def _find_cached_chromedriver() -> str:
+    roots = [
+        os.path.join(os.path.expanduser("~"), ".wdm", "drivers", "chromedriver"),
+        os.path.join(get_data_dir(), "chromedriver"),
+    ]
+    found: list[str] = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            if "chromedriver.exe" in files:
+                found.append(os.path.join(dirpath, "chromedriver.exe"))
+    if not found:
+        return ""
+    found.sort(key=lambda path: (0 if os.path.basename(os.path.dirname(path)) != "chromedriver-win64" else 1, -os.path.getmtime(path)))
+    return found[0]
+
+
+def _chrome_driver_service() -> Service:
+    cached = _find_cached_chromedriver()
+    if cached:
+        return Service(cached)
+    try:
+        path = ChromeDriverManager().install()
+        if path and os.path.isfile(path):
+            return Service(path)
+    except Exception:
+        pass
+    return Service()
 
 
 def _find_chrome() -> str:
@@ -848,7 +882,7 @@ class BloggerSession:
 
             options = Options()
             options.add_experimental_option("debuggerAddress", f"127.0.0.1:{BLOGGER_DEBUG_PORT}")
-            service = Service(ChromeDriverManager().install())
+            service = _chrome_driver_service()
             driver = webdriver.Chrome(service=service, options=options)
             driver.quit = lambda *args, **kwargs: None
             try:
@@ -3241,8 +3275,13 @@ class BloggerSession:
 
     def apply_robot_header_settings(self) -> None:
         self._enable_aria_checkbox("맞춤 로봇 헤더 태그 사용 설정")
-        self._wait_setting_unlocked("ZVRmn")
-        self.enable_homepage_all_tag()
+        for controller, label, tag in (
+            ("ZVRmn", "홈페이지 태그", "all"),
+            ("Y2HcZd", "자료실 및 검색 페이지 태그", "noindex"),
+            ("tybrDe", "글 및 페이지 태그", "all"),
+        ):
+            self._wait_setting_row_ready(controller, label)
+            self._set_robot_header_row(controller, label, tag)
 
     def set_custom_robots_txt(self, address: str) -> None:
         content = build_robots_txt(address)
@@ -3273,15 +3312,37 @@ class BloggerSession:
         self.log("맞춤 robots.txt를 저장했습니다.")
 
     def enable_homepage_all_tag(self) -> None:
+        self._set_robot_header_row("ZVRmn", "홈페이지 태그", "all")
+
+    def _set_robot_header_row(self, controller: str, label: str, wanted: str) -> None:
         self._close_open_dialogs()
-        self._click_setting_row("ZVRmn", "홈페이지 태그")
-        dialog = self._wait_dialog("홈페이지")
-        self._enable_aria_checkbox("all", scope=dialog)
+        self._click_setting_row(controller, label)
+        dialog = self._wait_dialog()
+        self._set_robot_tag_checks(dialog, wanted)
         self._click_named_button(dialog, "저장", wait_enabled=True)
         self._wait_dialog_closed(dialog)
-        self.log("홈페이지 태그 all을 켜고 저장했습니다.")
+        self.log(f"{label} {wanted}을(를) 켜고 저장했습니다.")
 
-    def _enable_aria_checkbox(self, aria_label: str, scope=None) -> None:
+    def _set_robot_tag_checks(self, dialog, wanted: str) -> None:
+        names = (
+            "all",
+            "noindex",
+            "nofollow",
+            "none",
+            "noarchive",
+            "nosnippet",
+            "noodp",
+            "notranslate",
+            "noimageindex",
+            "unavailable_after",
+        )
+        wanted = (wanted or "all").strip()
+        if wanted not in names:
+            raise RuntimeError(f"알 수 없는 로봇 태그: {wanted}")
+        for name in names:
+            self._set_aria_checkbox(name, name == wanted, scope=dialog)
+
+    def _set_aria_checkbox(self, aria_label: str, on: bool, scope=None) -> None:
         if scope is None:
             self._close_open_dialogs()
         selector = f'[aria-label="{aria_label}"][role="checkbox"]'
@@ -3292,21 +3353,24 @@ class BloggerSession:
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", box)
         self._tick()
         checked = (box.get_attribute("aria-checked") or "").lower() == "true"
-        if checked:
-            self.log(f"{aria_label}은(는) 이미 켜져 있습니다.")
+        if checked == on:
             return
         try:
             box.click()
         except Exception:
             self.driver.execute_script("arguments[0].click();", box)
+        expect = "true" if on else "false"
         self._wait(6).until(
             lambda d: (
                 (_displayed(root.find_elements(By.CSS_SELECTOR, selector))
                  or box).get_attribute("aria-checked")
                 or ""
             ).lower()
-            == "true"
+            == expect
         )
+
+    def _enable_aria_checkbox(self, aria_label: str, scope=None) -> None:
+        self._set_aria_checkbox(aria_label, True, scope=scope)
         self.log(f"{aria_label}을(를) 켰습니다.")
 
     def _wait_setting_unlocked(self, controller: str, timeout: float = 10) -> None:
@@ -3317,6 +3381,16 @@ class BloggerSession:
             return (els[0].get_attribute("data-is-disable-dialog") or "").lower() != "true"
 
         self._wait(timeout).until(unlocked)
+        self._tick()
+
+    def _wait_setting_row_ready(self, controller: str, label: str, timeout: float = 10) -> None:
+        def ready(_driver):
+            el = self._find_setting_row(controller, label)
+            if el is None:
+                return False
+            return (el.get_attribute("data-is-disable-dialog") or "").lower() != "true"
+
+        self._wait(timeout).until(ready)
         self._tick()
 
     def _current_settings_blog_id(self) -> str:
@@ -3562,7 +3636,7 @@ class BloggerSession:
                 self.log("열려 있는 블로그스팟 Chrome에 다시 연결합니다.")
                 options = Options()
                 options.add_experimental_option("debuggerAddress", f"127.0.0.1:{BLOGGER_DEBUG_PORT}")
-                service = Service(ChromeDriverManager().install())
+                service = _chrome_driver_service()
                 self.driver = webdriver.Chrome(service=service, options=options)
                 self.driver.quit = lambda *args, **kwargs: None
         self.detect()

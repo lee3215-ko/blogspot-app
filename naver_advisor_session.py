@@ -17,13 +17,11 @@ from selenium.common.exceptions import (
     WebDriverException,
 )
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
 
-from blogger_session import RunControl, StopRequested, _find_chrome, _release_driver, _wait_debug_port
+from blogger_session import RunControl, StopRequested, _chrome_driver_service, _find_chrome, _release_driver, _wait_debug_port
 from paths import get_data_dir
 
 BOARD = "https://searchadvisor.naver.com/console/board"
@@ -285,7 +283,7 @@ class NaverAdvisorSession:
         try:
             options = Options()
             options.add_experimental_option("debuggerAddress", f"127.0.0.1:{NAVER_DEBUG_PORT}")
-            service = Service(ChromeDriverManager().install())
+            service = _chrome_driver_service()
             self.driver = webdriver.Chrome(service=service, options=options)
             self.driver.quit = lambda *args, **kwargs: None
             if self._on_advisor_console():
@@ -330,7 +328,7 @@ class NaverAdvisorSession:
 
             options = Options()
             options.add_experimental_option("debuggerAddress", f"127.0.0.1:{NAVER_DEBUG_PORT}")
-            service = Service(ChromeDriverManager().install())
+            service = _chrome_driver_service()
             driver = webdriver.Chrome(service=service, options=options)
             driver.quit = lambda *args, **kwargs: None
             try:

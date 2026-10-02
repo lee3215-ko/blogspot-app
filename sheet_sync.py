@@ -14,10 +14,8 @@ from ctypes import wintypes
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 
-from blogger_session import _find_chrome, _wait_debug_port
+from blogger_session import _chrome_driver_service, _find_chrome, _wait_debug_port
 from paths import get_data_dir
 
 RECORD_SHEET_ID = "1xQnL0kc1dJm9jeAL78O5D-IUBXPZE9_qwI3kIVH6Wm0"
@@ -480,16 +478,28 @@ def _paste_rows(driver, rows: list[list[str]], gid: str = "") -> None:
     current = driver.current_url or ""
     if gid and f"gid={gid}" not in current:
         raise RuntimeError("기록 탭이 아니라서 다른 시트는 그대로 두었습니다.")
-    set_clipboard_text(to_tsv(rows))
+    if not rows:
+        return
+    last_col = chr(ord("A") + max(0, min(25, len(rows[0]) - 1)))
+    last_row = max(len(rows) + 40, 80)
+    used = f"A1:{last_col}{last_row}"
+    payload = to_tsv(rows)
     driver.execute_script("window.focus();")
     _select_a1(driver)
-    ActionChains(driver).key_down(Keys.CONTROL).send_keys("a").key_up(Keys.CONTROL).perform()
-    time.sleep(0.15)
+    box = driver.find_element("id", "t-name-box")
+    box.click()
+    box.send_keys(Keys.CONTROL, "a")
+    box.send_keys(used)
+    box.send_keys(Keys.ENTER)
+    time.sleep(0.25)
     ActionChains(driver).send_keys(Keys.DELETE).perform()
     time.sleep(0.2)
+    set_clipboard_text(payload)
     _select_a1(driver)
+    set_clipboard_text(payload)
     ActionChains(driver).key_down(Keys.CONTROL).send_keys("v").key_up(Keys.CONTROL).perform()
     time.sleep(0.8)
+
 
 
 def _sheet_target_id(url_part: str) -> str:
@@ -610,7 +620,7 @@ class _SheetChrome:
                     fresh = True
                 options = Options()
                 options.add_experimental_option("debuggerAddress", f"127.0.0.1:{SHEET_DEBUG_PORT}")
-                driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+                driver = webdriver.Chrome(service=_chrome_driver_service(), options=options)
                 driver.quit = lambda: None
                 self.driver = driver
             if not fresh:
