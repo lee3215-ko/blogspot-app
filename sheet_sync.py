@@ -28,29 +28,30 @@ DEFAULT_SHEET_URL = (
 )
 SHEET_DEBUG_PORT = 9338
 
+# 구글스팟 HOME NEW(gid=20260923) 왼쪽 순서. 없는 칸은 만들지 않고, 색인상태는 현재상태 옆에 둔다.
 HEADERS = [
-    "블로그제목",
-    "색인상태",
-    "현재상태",
     "핵심키워드",
+    "구글이메일",
     "주소",
-    "한줄메모",
-    "색인아이디",
+    "블로그제목",
+    "현재상태",
+    "색인상태",
     "검색결과",
-    "노출키워드",
     "현재작업",
-    "HTML코드",
-    "수집횟수",
-    "최근수집",
-    "처음수집",
-    "최근글수집",
+    "노출키워드",
     "최근확인",
+    "한줄메모",
+    "직전상태",
+    "처음수집",
     "첫색인일",
     "잘림시작",
-    "구글이메일",
-    "글주소",
+    "최근수집",
     "전체흐름",
-    "직전상태",
+    "색인아이디",
+    "HTML코드",
+    "수집횟수",
+    "최근글수집",
+    "글주소",
     "폴더",
     "블로그ID",
 ]
@@ -209,6 +210,57 @@ def fetch_sheet_csv(url: str) -> list[list[str]]:
 
 def _record_header(row: list[str]) -> bool:
     return bool(row) and "블로그ID" in row and "주소" in row
+
+
+def _same_record_values(left: list[list[str]], right: list[list[str]]) -> bool:
+    if not left or not right:
+        return False
+    left_header, right_header = left[0], right[0]
+    if "블로그ID" not in left_header or "블로그ID" not in right_header:
+        return False
+    left_ids = {str(row[left_header.index("블로그ID")]).strip() for row in left[1:] if left_header.index("블로그ID") < len(row)}
+    right_ids = {str(row[right_header.index("블로그ID")]).strip() for row in right[1:] if right_header.index("블로그ID") < len(row)}
+    if left_ids != right_ids:
+        return False
+    names = [name for name in HEADERS if name in left_header and name in right_header]
+    left_map = {}
+    right_map = {}
+    for row in left[1:]:
+        pos = left_header.index("블로그ID")
+        blog_id = str(row[pos]).strip() if pos < len(row) else ""
+        if blog_id:
+            left_map[blog_id] = row
+    for row in right[1:]:
+        pos = right_header.index("블로그ID")
+        blog_id = str(row[pos]).strip() if pos < len(row) else ""
+        if blog_id:
+            right_map[blog_id] = row
+    for blog_id in left_ids:
+        a = left_map.get(blog_id) or []
+        b = right_map.get(blog_id) or []
+        for name in names:
+            av = a[left_header.index(name)] if left_header.index(name) < len(a) else ""
+            bv = b[right_header.index(name)] if right_header.index(name) < len(b) else ""
+            if _cell(av) != _cell(bv):
+                return False
+    return True
+
+
+def _reorder_existing_rows(sheet_rows: list[list[str]]) -> list[list[str]]:
+    if not sheet_rows or not _record_header(sheet_rows[0]):
+        return [list(HEADERS)]
+    header = sheet_rows[0]
+    ordered = [list(HEADERS)]
+    for row in sheet_rows[1:]:
+        item = []
+        for name in HEADERS:
+            if name in header:
+                pos = header.index(name)
+                item.append(_cell(row[pos] if pos < len(row) else ""))
+            else:
+                item.append("")
+        ordered.append(item)
+    return ordered
 
 
 def merge_rows(program_rows: list[list[str]], sheet_rows: list[list[str]]) -> list[list[str]]:
@@ -661,8 +713,10 @@ def plan_sheet_update(
             row for row in merged[1:] if str(row[blog_col]).strip() not in drop
         ]
     current = merge_rows([], sheet_rows)
-    if list(sheet_rows[0]) == list(HEADERS) and to_tsv(merged) == to_tsv(current):
-        return None
+    if _same_record_values(merged, current):
+        if list(sheet_rows[0]) == list(HEADERS):
+            return None
+        return _reorder_existing_rows(sheet_rows)
     return merged
 
 
@@ -722,8 +776,11 @@ def _self_check() -> None:
     assert index_status_label(None, "", "https://a.blogspot.com/") == "확인 전"
     assert index_status_label(None, "", "") == "주소 없음"
     assert "생성순서" not in HEADERS
-    assert HEADERS[0] == "블로그제목"
-    assert HEADERS[1] == "색인상태"
+    assert HEADERS[0] == "핵심키워드"
+    assert HEADERS[1] == "구글이메일"
+    assert HEADERS[4] == "현재상태"
+    assert HEADERS[5] == "색인상태"
+    assert HEADERS.index("전체흐름") > HEADERS.index("직전상태")
     assert HEADERS[-1] == "블로그ID"
     old_header = [
         "블로그ID", "생성순서", "핵심키워드", "구글이메일", "블로그제목", "주소", "현재상태",
@@ -747,6 +804,25 @@ def _self_check() -> None:
     assert merged[2][HEADERS.index("블로그ID")] == "99"
     assert len(sheet_user_values(merged)) == 2
     live = [HEADERS, program_row({"id": "10", "order": "1", "title": "예전", "index_status": "확인 전"})]
+    same_old = [
+        ["블로그제목", "색인상태", "현재상태", "핵심키워드", "주소", "한줄메모", "색인아이디", "검색결과", "노출키워드", "현재작업", "HTML코드", "수집횟수", "최근수집", "처음수집", "최근글수집", "최근확인", "첫색인일", "잘림시작", "구글이메일", "글주소", "전체흐름", "직전상태", "폴더", "블로그ID"],
+        list(live[1]),
+    ]
+    same_old[1][same_old[0].index("블로그제목")] = live[1][HEADERS.index("블로그제목")]
+    same_old[1][same_old[0].index("색인상태")] = live[1][HEADERS.index("색인상태")]
+    same_old[1][same_old[0].index("블로그ID")] = "10"
+    header_only = plan_sheet_update(
+        [program_row({"id": "10", "order": "1", "title": "예전", "index_status": "확인 전"})],
+        same_old,
+    )
+    assert header_only is not None
+    assert header_only[0] == HEADERS
+    assert header_only[1][HEADERS.index("블로그제목")] == "예전"
+    skipped = plan_sheet_update(
+        [program_row({"id": "10", "order": "1", "title": "예전", "index_status": "확인 전"})],
+        live,
+    )
+    assert skipped is None
     changed = plan_sheet_update(
         [program_row({"id": "10", "order": "1", "title": "카드", "index_status": "미색인"})],
         live,

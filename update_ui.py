@@ -104,8 +104,13 @@ def _show_dialog(
 def _auto_update(root, info: UpdateInfo, app_name: str, exe_name: str, zip_inner_folder, log):
     dialog = __import__("tkinter").Toplevel(root)
     dialog.title("업데이트 중")
-    dialog.geometry("380x110")
     dialog.transient(root)
+    dialog.resizable(False, False)
+    width, height = 380, 110
+    root.update_idletasks()
+    x = root.winfo_rootx() + max(0, (root.winfo_width() - width) // 2)
+    y = root.winfo_rooty() + max(0, (root.winfo_height() - height) // 2)
+    dialog.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
     dialog.grab_set()
 
     status = ttk.Label(dialog, text="다운로드 중...")

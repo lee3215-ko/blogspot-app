@@ -1,13 +1,10 @@
 {
-    "version":  "1.2.13",
-    "url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/604598781",
-    "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.13/BloggerSpot.zip",
-    "notes":  "블로그스팟과 서치어드바이저 로그인을 프로그램을 닫아도 유지하고, 다시 인식으로 현재 창의 아이디를 읽습니다.",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/604598781",
-    "asset_id":  604598781,
+    "version":  "1.2.14",
+    "url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.14/BloggerSpot.zip",
+    "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.14/BloggerSpot.zip",
+    "notes":  "HTML 코드 탭 이름을 바꾸고, 기록은 구글 이메일별로 묶고 선택한 행이 보이게 했습니다. 스프레드시트는 값이 같으면 열 순서를 덮어쓰지 않습니다.",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/604598781",
-                          "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.13/BloggerSpot.zip",
+                          "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.14/BloggerSpot.zip",
                           "https://github.com/lee3215-ko/blogspot-app/releases/latest/download/BloggerSpot.zip"
                       ]
 }

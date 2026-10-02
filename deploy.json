@@ -26,6 +26,8 @@
     "requirements.txt",
     "updater.py",
     "update_ui.py",
+    "sheet_sync.py",
+    "naver_index_check.py",
     "deploy.json",
     "assets",
     "README.md",

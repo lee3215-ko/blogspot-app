@@ -132,6 +132,7 @@ class BloggerApp:
         self._sheet_sync_job = None
         self._sheet_sync_again = False
         self._record_vars: dict[str, dict[str, tk.StringVar]] = {}
+        self._record_row_frames: dict[str, object] = {}
         self._records_rendering = False
         self._record_fp: tuple | None = None
         self._meta_save_job = None
@@ -176,6 +177,7 @@ class BloggerApp:
             self.write_count_var.set(saved_count if saved_count.isdigit() else "1")
 
     def _build(self):
+        self._install_centered_dialogs()
         self._ensure_write_folders()
         shell = frame(self.root, COLORS["bg"])
         shell.pack(fill=tk.BOTH, expand=True, padx=20, pady=16)
@@ -559,7 +561,7 @@ class BloggerApp:
         label(html_inner, "HTML 편집", "heading", COLORS["text"]).pack(anchor="w")
         label(
             html_inner,
-            "코드를 여러 개 저장할 수 있습니다. 선택한 코드만 네이버 최초 HTML 코드 넣기에 사용합니다. 서치어드바이저 메타 태그는 <head> 바로 아래에 넣은 뒤, 전체를 테마 편집기에 붙여 넣습니다.",
+            "코드를 여러 개 저장할 수 있습니다. 탭을 더블클릭하면 이름을 바꿀 수 있고, 바꾼 이름은 블로그 기록과 시트에도 반영됩니다. 선택한 코드만 네이버 최초 HTML 코드 넣기에 사용합니다.",
             "body",
             COLORS["text_muted"],
             wraplength=720,
@@ -1539,10 +1541,17 @@ class BloggerApp:
             return
         blogs = self._dashboard_blogs()
         self._fill_program_records(blogs)
-        fp = tuple(blog.id for blog in blogs)
+        fp = tuple(
+            (
+                blog.id,
+                str((self._blog_meta.get(blog.id) or {}).get("google_email") or "").strip() or self._logged_google_email(),
+            )
+            for blog in blogs
+        )
         if fp == getattr(self, "_record_fp", None) and parent.winfo_children():
             self._record_dirty = False
             self._sync_program_record_vars(blogs)
+            self._paint_record_rows()
             return
         self._flush_record_vars()
         self._records_rendering = True
@@ -1550,15 +1559,127 @@ class BloggerApp:
             for child in list(parent.winfo_children()):
                 child.destroy()
             self._record_vars = {}
+            self._record_row_frames = {}
             self._record_fp = fp
             self._record_dirty = False
             if not blogs:
                 label(parent, "로그인하면 블로그 기록이 여기에 나타납니다.", "body", COLORS["text_muted"]).pack(anchor="w", pady=8)
                 return
+            grouped: dict[str, list[BlogInfo]] = {}
+            order: list[str] = []
             for blog in blogs:
-                self._render_record_row(parent, blog)
+                email = str((self._blog_meta.get(blog.id) or {}).get("google_email") or "").strip() or self._logged_google_email() or "이메일 없음"
+                if email not in grouped:
+                    grouped[email] = []
+                    order.append(email)
+                grouped[email].append(blog)
+            palettes = ("#eef2ff", "#ecfdf5", "#fff7ed", "#f0f9ff", "#fdf4ff")
+            for index, email in enumerate(order):
+                items = grouped[email]
+                group_bg = palettes[index % len(palettes)]
+                wrap = tk.Frame(parent, bg=group_bg, highlightbackground=COLORS["card_border"], highlightthickness=1)
+                wrap.pack(fill=tk.X, pady=(0, 10))
+                head = tk.Frame(wrap, bg=group_bg)
+                head.pack(fill=tk.X, padx=8, pady=(8, 4))
+                tk.Label(
+                    head,
+                    text=email,
+                    font=FONTS["body_bold"],
+                    fg=COLORS["text"],
+                    bg=group_bg,
+                ).pack(side=tk.LEFT)
+                tk.Label(
+                    head,
+                    text=f"{len(items)}개",
+                    font=FONTS["small"],
+                    fg=COLORS["text_muted"],
+                    bg=group_bg,
+                ).pack(side=tk.LEFT, padx=(8, 0))
+                for blog in items:
+                    self._render_record_row(wrap, blog, group_bg)
         finally:
             self._records_rendering = False
+            self._paint_record_rows()
+
+    def _paint_record_rows(self) -> None:
+        selected = (self.blog_var.get() or "").strip() if hasattr(self, "blog_var") else ""
+        checked = set()
+        for blog_id, var in (getattr(self, "_blog_check_vars", {}) or {}).items():
+            try:
+                if var.get():
+                    checked.add(blog_id)
+            except Exception:
+                pass
+        for blog_id, row in list((getattr(self, "_record_row_frames", {}) or {}).items()):
+            if not self._widget_alive(row):
+                continue
+            mark = getattr(row, "_record_mark", None)
+            if blog_id == selected:
+                bg, border, thick = "#c7d2fe", "#312e81", 4
+                cell_bg = "#e0e7ff"
+            elif blog_id in checked:
+                bg, border, thick = COLORS["row_checked"], COLORS["row_checked_border"], 2
+                cell_bg = "#dbeafe"
+            else:
+                bg = getattr(row, "_record_group_bg", COLORS["input_bg"])
+                border, thick, cell_bg = COLORS["border"], 1, COLORS["input_bg"]
+            try:
+                row.configure(bg=bg, highlightbackground=border, highlightcolor=border, highlightthickness=thick)
+            except Exception:
+                pass
+            bar = getattr(row, "_record_bar", None)
+            if self._widget_alive(bar):
+                try:
+                    bar.configure(bg=border if blog_id == selected else bg)
+                except Exception:
+                    pass
+            body = getattr(row, "_record_body", None)
+            if self._widget_alive(body):
+                self._set_record_bg(body, bg, cell_bg)
+            if self._widget_alive(mark):
+                if blog_id == selected:
+                    try:
+                        mark.pack(side=tk.RIGHT)
+                        mark.configure(text="선택됨")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        mark.pack_forget()
+                    except Exception:
+                        pass
+
+    def _set_record_bg(self, widget, bg: str, cell_bg: str | None = None) -> None:
+        kind = widget.winfo_class()
+        try:
+            if kind in {"Entry"}:
+                widget.configure(bg=cell_bg or bg, highlightbackground=COLORS["accent"] if cell_bg == "#e0e7ff" else COLORS["border"])
+            elif kind == "TCombobox":
+                pass
+            else:
+                widget.configure(bg=bg)
+        except Exception:
+            if kind not in {"Entry", "TCombobox"}:
+                return
+        for child in widget.winfo_children():
+            self._set_record_bg(child, bg, cell_bg)
+
+    def _select_record_row(self, blog_id: str) -> None:
+        if not blog_id:
+            return
+        self._select_blog(blog_id)
+
+    def _bind_record_select(self, widget, blog_id: str) -> None:
+        def on_pick(_event=None, bid=blog_id):
+            self._select_record_row(bid)
+
+        try:
+            widget.bind("<Button-1>", on_pick, add="+")
+            widget.bind("<FocusIn>", on_pick, add="+")
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            self._bind_record_select(child, blog_id)
 
     def _record_entry(self, parent, variable, width: int, placeholder: str):
         box = tk.Frame(parent, bg=COLORS["input_bg"])
@@ -1579,19 +1700,34 @@ class BloggerApp:
         ).pack(anchor="w", pady=(2, 0))
         return box
 
-    def _render_record_row(self, parent, blog: BlogInfo) -> None:
+    def _render_record_row(self, parent, blog: BlogInfo, group_bg: str | None = None) -> None:
         meta = self._blog_meta.get(blog.id) or {}
-        row = tk.Frame(parent, bg=COLORS["input_bg"], highlightbackground=COLORS["border"], highlightthickness=1)
-        row.pack(fill=tk.X, pady=3)
-        body = tk.Frame(row, bg=COLORS["input_bg"])
-        body.pack(fill=tk.X, padx=8, pady=6)
+        bg = group_bg or COLORS["input_bg"]
+        row = tk.Frame(parent, bg=bg, highlightbackground=COLORS["border"], highlightthickness=1)
+        row.pack(fill=tk.X, padx=8, pady=3)
+        row._record_group_bg = bg
+        bar = tk.Frame(row, bg=bg, width=8)
+        bar.pack(side=tk.LEFT, fill=tk.Y)
+        bar.pack_propagate(False)
+        row._record_bar = bar
+        body = tk.Frame(row, bg=bg)
+        body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 8), pady=6)
+        row._record_body = body
+        self._record_row_frames[blog.id] = row
+        title_line = tk.Frame(body, bg=bg)
+        title_line.pack(fill=tk.X)
         tk.Label(
-            body, text=blog.name or blog.address or blog.id, font=FONTS["body_bold"],
-            fg=COLORS["text"], bg=COLORS["input_bg"],
-        ).pack(anchor="w")
+            title_line, text=blog.name or blog.address or blog.id, font=FONTS["body_bold"],
+            fg=COLORS["text"], bg=bg,
+        ).pack(side=tk.LEFT)
+        mark = tk.Label(
+            title_line, text="선택됨", font=FONTS["caption"],
+            fg="#ffffff", bg="#312e81", padx=8, pady=1,
+        )
+        row._record_mark = mark
         tk.Label(
             body, text=blog.address or "주소 없음", font=FONTS["small"],
-            fg=COLORS["text_muted"], bg=COLORS["input_bg"],
+            fg=COLORS["text_muted"], bg=bg,
         ).pack(anchor="w")
         auto_bits = []
         indexed = str(meta.get("naver_id") or "").strip()
@@ -1609,7 +1745,7 @@ class BloggerApp:
         if auto_bits:
             tk.Label(
                 body, text=" · ".join(auto_bits), font=FONTS["small"],
-                fg=COLORS["text_muted"], bg=COLORS["input_bg"],
+                fg=COLORS["text_muted"], bg=bg,
             ).pack(anchor="w")
         fields: dict[str, tk.StringVar] = {}
 
@@ -1625,7 +1761,7 @@ class BloggerApp:
             fields[key] = var
             return var
 
-        line1 = tk.Frame(body, bg=COLORS["input_bg"])
+        line1 = tk.Frame(body, bg=bg)
         line1.pack(fill=tk.X, pady=(6, 0))
         keyword = bind("keyword", str(meta.get("keyword") or ""))
         email = bind("google_email", str(meta.get("google_email") or "").strip() or self._logged_google_email())
@@ -1635,15 +1771,15 @@ class BloggerApp:
         current = status.get()
         if current not in values:
             values.append(current)
-        status_box = tk.Frame(line1, bg=COLORS["input_bg"])
+        status_box = tk.Frame(line1, bg=bg)
         status_box.pack(side=tk.LEFT, padx=(0, 6))
         tk.Label(
-            status_box, text="상태", font=FONTS["caption"], fg=COLORS["text_muted"], bg=COLORS["input_bg"],
+            status_box, text="상태", font=FONTS["caption"], fg=COLORS["text_muted"], bg=bg,
         ).pack(anchor="w")
         menu = ttk.Combobox(status_box, textvariable=status, values=values, width=14, state="readonly")
         menu.pack(anchor="w", pady=(2, 0))
         self._record_entry(line1, email, 220, "구글 이메일").pack(side=tk.LEFT)
-        line2 = tk.Frame(body, bg=COLORS["input_bg"])
+        line2 = tk.Frame(body, bg=bg)
         line2.pack(fill=tk.X, pady=(4, 0))
         note = bind("sheet_note", str(meta.get("sheet_note") or ""))
         search = bind("search_result", str(meta.get("search_result") or ""))
@@ -1654,6 +1790,7 @@ class BloggerApp:
         self._record_entry(line2, work, 120, "현재작업").pack(side=tk.LEFT, padx=(0, 6))
         self._record_entry(line2, exposed, 140, "노출키워드").pack(side=tk.LEFT)
         self._record_vars[blog.id] = fields
+        self._bind_record_select(row, blog.id)
 
     def _on_record_var(self, blog_id: str, key: str, var: tk.StringVar) -> None:
         if getattr(self, "_records_rendering", False):
@@ -3125,6 +3262,7 @@ class BloggerApp:
             return
         self._update_sel_count()
         self._paint_rows_for(blog_id)
+        self._paint_record_rows()
         self._schedule_write_count()
 
     def _toggle_blog_check(self, blog_id: str) -> None:
@@ -3423,10 +3561,12 @@ class BloggerApp:
     def _select_blog(self, blog_id: str) -> None:
         prev = self.blog_var.get()
         if prev == blog_id:
+            self._paint_record_rows()
             return
         self.blog_var.set(blog_id)
         self._paint_rows_for(prev)
         self._paint_rows_for(blog_id)
+        self._paint_record_rows()
         if getattr(self, "_main_tab", "") == "블로그":
             self._render_blog_detail()
         else:
@@ -3435,6 +3575,7 @@ class BloggerApp:
 
     def _on_blog_selected(self) -> None:
         self._paint_rows_for(self.blog_var.get())
+        self._paint_record_rows()
         if getattr(self, "_main_tab", "") == "블로그":
             self._render_blog_detail()
 
@@ -3850,6 +3991,192 @@ class BloggerApp:
         ):
             btn.configure(state=state)
 
+    def _install_centered_dialogs(self) -> None:
+        if getattr(messagebox, "_app_centered", False):
+            return
+        root = self.root
+
+        def wrap(fn):
+            def inner(*args, **kwargs):
+                kwargs.setdefault("parent", root)
+                return fn(*args, **kwargs)
+
+            return inner
+
+        for name in (
+            "showinfo",
+            "showwarning",
+            "showerror",
+            "askyesno",
+            "askokcancel",
+            "askquestion",
+            "askretrycancel",
+            "askyesnocancel",
+        ):
+            current = getattr(messagebox, name, None)
+            if current is not None:
+                setattr(messagebox, name, wrap(current))
+        for name in ("askdirectory", "askopenfilename", "asksaveasfilename", "askopenfilenames"):
+            current = getattr(filedialog, name, None)
+            if current is not None:
+                setattr(filedialog, name, wrap(current))
+        messagebox._app_centered = True
+
+    def _center_on_app(self, win) -> None:
+        try:
+            win.update_idletasks()
+            self.root.update_idletasks()
+            width = max(win.winfo_reqwidth(), win.winfo_width())
+            height = max(win.winfo_reqheight(), win.winfo_height())
+            if width < 80:
+                width = 420
+            if height < 40:
+                height = 180
+            x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+            y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 2)
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            x = min(max(0, x), max(0, screen_w - width))
+            y = min(max(0, y), max(0, screen_h - height))
+            win.geometry(f"+{int(x)}+{int(y)}")
+        except Exception:
+            pass
+
+    def _ask_html_code_name(self, title: str, heading: str, initial: str, taken: set[str]) -> str | None:
+        outcome: dict[str, str | None] = {"value": None}
+        win = ctk.CTkToplevel(self.root) if ctk else tk.Toplevel(self.root)
+        win.title(title)
+        win.withdraw()
+        win.transient(self.root)
+        win.resizable(False, False)
+        if ctk:
+            win.configure(fg_color=COLORS["card"])
+        else:
+            win.configure(bg=COLORS["card"])
+        body = frame(win, COLORS["card"])
+        body.pack(fill=tk.BOTH, expand=True, padx=18, pady=16)
+        label(body, heading, "heading", COLORS["text"]).pack(anchor="w")
+        label(body, "블로그 목록과 기록 시트에 같은 이름으로 표시됩니다.", "small", COLORS["text_muted"]).pack(
+            anchor="w", pady=(4, 10)
+        )
+        var = tk.StringVar(value=initial)
+        if ctk:
+            entry = ctk.CTkEntry(
+                body, textvariable=var, width=360, height=36, font=FONTS["body"],
+                fg_color=COLORS["input_bg"], border_color=COLORS["border"], text_color=COLORS["text"],
+            )
+        else:
+            entry = tk.Entry(body, textvariable=var, width=36, font=FONTS["body"])
+        entry.pack(anchor="w")
+        error = label(body, "", "small", COLORS["danger"])
+        error.pack(anchor="w", pady=(6, 0))
+        actions = frame(body, COLORS["card"])
+        actions.pack(fill=tk.X, pady=(12, 0))
+
+        def close(value: str | None) -> None:
+            outcome["value"] = value
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+
+        def confirm() -> None:
+            name = " ".join(var.get().split())
+            if not name:
+                error.configure(text="이름을 입력해 주세요.")
+                return
+            if len(name) > 40:
+                error.configure(text="이름은 40자까지 입력할 수 있습니다.")
+                return
+            if name in taken:
+                error.configure(text="이미 있는 코드 이름입니다.")
+                return
+            close(name)
+
+        button(actions, "취소", variant="ghost", width=88, height=34, command=lambda: close(None)).pack(side=tk.RIGHT)
+        button(actions, "확인", variant="primary", width=88, height=34, command=confirm).pack(side=tk.RIGHT, padx=(0, 8))
+        win.protocol("WM_DELETE_WINDOW", lambda: close(None))
+        win.bind("<Return>", lambda _event: confirm())
+        win.bind("<Escape>", lambda _event: close(None))
+        self._center_on_app(win)
+        try:
+            win.deiconify()
+            win.lift()
+            win.grab_set()
+            win.focus_force()
+        except Exception:
+            pass
+        try:
+            entry.focus_set()
+            entry.select_range(0, "end")
+        except Exception:
+            pass
+        self.root.wait_window(win)
+        return outcome["value"]
+
+    def _html_tab_width(self, name: str) -> int:
+        return max(88, min(280, 36 + len(name or "코드") * 16))
+
+    def _on_html_code_tab(self, index: int) -> None:
+        if getattr(self, "_html_rename_open", False):
+            return
+        now = time.monotonic()
+        if now < getattr(self, "_html_rename_skip_until", 0):
+            return
+        last_index, last_at = getattr(self, "_html_tab_click", (-1, 0.0))
+        self._html_tab_click = (index, now)
+        if last_index == index and (now - last_at) <= 0.5:
+            self._html_tab_click = (-1, 0.0)
+            self.on_rename_html_code(index)
+            return
+        self.on_select_html_code(index)
+
+    def _bind_html_tab_double(self, widget, index: int) -> None:
+        def on_double(_event, pick=index):
+            self._html_tab_click = (-1, 0.0)
+            self.on_rename_html_code(pick)
+            return "break"
+
+        try:
+            widget.bind("<Double-Button-1>", on_double, add="+")
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            self._bind_html_tab_double(child, index)
+
+    def _apply_html_code_rename(self, old: str, new: str) -> None:
+        changed: list[str] = []
+        for blog_id, meta in list((self._blog_meta or {}).items()):
+            if not isinstance(meta, dict):
+                continue
+            if str(meta.get("html_code") or "").strip() != old:
+                continue
+            meta["html_code"] = new
+            changed.append(str(blog_id))
+        if not changed:
+            return
+        try:
+            self._save_blog_meta()
+        except Exception:
+            pass
+        self._record_fp = None
+        self._dashboard_fp = None
+        self._blog_dirty = True
+        self._index_dirty = True
+        try:
+            self._refresh_dashboard()
+        except Exception:
+            pass
+        try:
+            self._render_record_rows(force=True)
+        except Exception:
+            pass
+        try:
+            self._queue_sheet_sync(changed, "HTML 코드 이름")
+        except Exception:
+            pass
+
     def _next_html_code_name(self, used: set[str] | None = None) -> str:
         taken = set(used or set())
         if used is None:
@@ -3921,14 +4248,17 @@ class BloggerApp:
             child.destroy()
         current = int(getattr(self, "_html_code_index", 0) or 0)
         for index, item in enumerate(getattr(self, "_html_codes", []) or []):
-            button(
+            name = str(item.get("name") or f"{index + 1}코드")
+            tab = button(
                 host,
-                str(item.get("name") or f"{index + 1}코드"),
+                name,
                 variant="primary" if index == current else "ghost",
-                width=88,
+                width=self._html_tab_width(name),
                 height=32,
-                command=lambda pick=index: self.on_select_html_code(pick),
-            ).pack(side=tk.LEFT, padx=(0, 6), pady=4)
+                command=lambda pick=index: self._on_html_code_tab(pick),
+            )
+            tab.pack(side=tk.LEFT, padx=(0, 6), pady=4)
+            self._bind_html_tab_double(tab, index)
 
     def _apply_html_codes(self, raw, index, fallback_html: str = "") -> None:
         self._html_codes = self._normalize_html_codes(raw, fallback_html)
@@ -3983,12 +4313,41 @@ class BloggerApp:
         self._flush_html_editor()
         if not isinstance(getattr(self, "_html_codes", None), list):
             self._html_codes = []
-        name = self._next_html_code_name()
+        taken = {str(item.get("name") or "") for item in self._html_codes}
+        name = self._ask_html_code_name("코드 추가", "새 코드 탭 이름", "", taken)
+        if not name:
+            return
         self._html_codes.append({"name": name, "html": ""})
         self._html_code_index = len(self._html_codes) - 1
         self._render_html_code_buttons()
         self._load_html_editor()
         self.log(f"HTML 코드를 추가했습니다: {name}")
+        try:
+            self._save_local_settings()
+        except Exception:
+            pass
+
+    def on_rename_html_code(self, index: int) -> None:
+        self._flush_html_editor()
+        codes = getattr(self, "_html_codes", None) or []
+        if index < 0 or index >= len(codes):
+            return
+        if getattr(self, "_html_rename_open", False):
+            return
+        old = str(codes[index].get("name") or "").strip()
+        taken = {str(item.get("name") or "") for pos, item in enumerate(codes) if pos != index}
+        self._html_rename_open = True
+        try:
+            name = self._ask_html_code_name("코드 이름", "코드 탭 이름", old, taken)
+        finally:
+            self._html_rename_open = False
+            self._html_rename_skip_until = time.monotonic() + 0.4
+        if not name or name == old:
+            return
+        codes[index]["name"] = name
+        self._render_html_code_buttons()
+        self._apply_html_code_rename(old, name)
+        self.log(f"코드 이름을 바꿨습니다: {old} → {name}")
         try:
             self._save_local_settings()
         except Exception:
@@ -4927,6 +5286,7 @@ class BloggerApp:
         outcome: dict[str, int | None] = {"value": None}
         win = ctk.CTkToplevel(self.root) if ctk else tk.Toplevel(self.root)
         win.title("글 작성")
+        win.withdraw()
         win.transient(self.root)
         win.resizable(False, False)
         if ctk:
@@ -4983,9 +5343,12 @@ class BloggerApp:
         win.protocol("WM_DELETE_WINDOW", lambda: close(None))
         win.bind("<Return>", lambda _event: confirm())
         win.bind("<Escape>", lambda _event: close(None))
-        win.update_idletasks()
+        self._center_on_app(win)
         try:
+            win.deiconify()
+            win.lift()
             win.grab_set()
+            win.focus_force()
         except Exception:
             pass
         entry.focus_set()
