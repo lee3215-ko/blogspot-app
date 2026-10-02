@@ -28,8 +28,21 @@ from blogger_session import (
     normalize_posts,
 )
 from naver_advisor_session import NaverAdvisorSession, OwnershipPending
+from naver_index_check import DEFAULT_DELAY_SEC, check_naver_index
 from paths import APP_VERSION, data_path, get_app_dir, is_frozen
-from ui_theme import COLORS, FONTS, HoverPopup, button, card, frame, label, pill, scrollable
+from sheet_sync import (
+    DEFAULT_SHEET_URL,
+    RECORD_FIELDS,
+    STATUS_OPTIONS,
+    index_status_label,
+    program_row,
+    pull_rows,
+    push_rows,
+    push_updated_rows,
+    sheet_tab_url,
+    spreadsheet_id,
+)
+from ui_theme import COLORS, FONTS, HoverPopup, button, card, frame, label, light_scroll, pill, scrollable
 
 try:
     import customtkinter as ctk
@@ -37,6 +50,8 @@ except ImportError:
     ctk = None
 
 IMAGE_EXTS = {".ico", ".jpg", ".jpeg", ".gif", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+PROGRAM_STATUSES = {"생성만", "설정완료", "수집요청", "재수집요청"}
+SETTINGS_DONE_KEYS = {"description", "search_desc", "timezone", "robots", "headers"}
 SETTINGS_FILE = "settings.json"
 PROGRESS_FILE = "blog_progress.json"
 BLOG_META_FILE = "blog_meta.json"
@@ -108,6 +123,18 @@ class BloggerApp:
         self._html_codes: list[dict] = [{"name": "A코드", "html": ""}]
         self._html_code_index = 0
         self.memo_var = tk.StringVar(value="")
+        self.sheet_url_var = tk.StringVar(value=DEFAULT_SHEET_URL)
+        self._sheet_busy = False
+        self._sheet_sync_ids: set[str] = set()
+        self._sheet_sync_new: set[str] = set()
+        self._sheet_sync_drop: set[str] = set()
+        self._sheet_sync_reason = ""
+        self._sheet_sync_job = None
+        self._sheet_sync_again = False
+        self._record_vars: dict[str, dict[str, tk.StringVar]] = {}
+        self._records_rendering = False
+        self._record_fp: tuple | None = None
+        self._meta_save_job = None
         self._memo_parts = ["", "", "", ""]
         self._index_labels: list = []
 
@@ -281,6 +308,8 @@ class BloggerApp:
             ("블로그", 110),
             ("만들기", 110),
             ("HTML 편집", 130),
+            ("기록", 90),
+            ("색인 확인", 120),
             ("로그", 90),
         ):
             btn = button(
@@ -595,8 +624,11 @@ class BloggerApp:
             self.log_box.configure(state="disabled")
         else:
             self.log_box.configure(state=tk.DISABLED)
+        self._build_records_page()
+        self._build_index_page()
         self._show_main_tab("블로그")
         self._fit_window()
+        self.root.after(350, self._warm_hidden_lists)
         self.root.bind("<Configure>", self._on_root_configured, add="+")
         self.root.after(200, self._install_drag_hook)
 
@@ -789,6 +821,1072 @@ class BloggerApp:
         ).pack(anchor="w", fill=tk.X, pady=(12, 0))
         self._refresh_write_count()
 
+    def _build_index_page(self) -> None:
+        page = frame(self.tab_body, COLORS["bg"])
+        self._main_pages["색인 확인"] = page
+        card_wrap = card(page)
+        card_wrap.pack(fill=tk.BOTH, expand=True)
+        inner = frame(card_wrap, COLORS["card"])
+        inner.pack(fill=tk.BOTH, expand=True, padx=16, pady=14)
+        label(inner, "색인 확인", "heading", COLORS["text"]).pack(anchor="w")
+        label(
+            inner,
+            "등록된 블로그를 네이버 site: 검색으로 확인합니다. 로그인은 필요 없습니다. 블로그를 삭제하면 이 목록에서도 빠집니다.",
+            "body",
+            COLORS["text_muted"],
+            wraplength=980,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 8))
+        self.index_summary = label(inner, "블로그 0개", "small", COLORS["text_muted"])
+        self.index_summary.pack(anchor="w")
+        if not isinstance(getattr(self, "index_query", None), tk.StringVar):
+            self.index_query = tk.StringVar(value="")
+        if ctk:
+            self.index_search = ctk.CTkEntry(
+                inner,
+                textvariable=self.index_query,
+                height=32,
+                font=FONTS["body"],
+                fg_color=COLORS["input_bg"],
+                border_color=COLORS["border"],
+                text_color=COLORS["text"],
+                placeholder_text="블로그 찾기 · 이름, 주소, 색인",
+            )
+        else:
+            self.index_search = tk.Entry(inner, textvariable=self.index_query, font=FONTS["body"])
+        self.index_search.pack(fill=tk.X, pady=(8, 0))
+        self.index_query.trace_add("write", self._on_index_query_changed)
+        actions = frame(inner, COLORS["card"])
+        actions.pack(fill=tk.X, pady=(8, 0))
+        self.index_check_btn = button(
+            actions, "색인 확인", variant="primary", width=110, height=36, command=lambda: self.on_index_check(False),
+        )
+        self.index_check_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.index_recheck_btn = button(
+            actions, "다시 확인", variant="ghost", width=100, height=36, command=lambda: self.on_index_check(True),
+        )
+        self.index_recheck_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.index_stop_btn = button(
+            actions, "중지", variant="danger", width=70, height=36, command=self.on_index_stop,
+        )
+        self.index_stop_btn.pack(side=tk.LEFT)
+        self.index_stop_btn.configure(state="disabled")
+        self.index_progress = label(inner, "대기 중", "small", COLORS["text_muted"])
+        self.index_progress.pack(anchor="w", pady=(8, 0))
+        self.index_list = light_scroll(inner, height=420, bg=COLORS["card"])
+        self.index_list.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        host = getattr(self.index_list, "inner", self.index_list)
+        self._index_list_inner = tk.Frame(host, bg=COLORS["card"])
+        self._index_list_inner.pack(fill=tk.X)
+        self._index_row_frames = {}
+        self._index_fp = None
+        self._index_vis_query = None
+        self._listed_index_blogs = []
+
+    def _set_index_progress(self, text: str) -> None:
+        label_widget = getattr(self, "index_progress", None)
+        if self._widget_alive(label_widget):
+            label_widget.configure(text=text)
+
+    def _set_index_buttons(self, running: bool) -> None:
+        for widget, enabled in (
+            (getattr(self, "index_check_btn", None), not running),
+            (getattr(self, "index_recheck_btn", None), not running),
+            (getattr(self, "index_stop_btn", None), running),
+        ):
+            if self._widget_alive(widget):
+                widget.configure(state="normal" if enabled else "disabled")
+
+    def _index_fingerprint(self, blogs: list[BlogInfo]) -> tuple:
+        rows = []
+        for blog in blogs:
+            meta = self._blog_meta.get(blog.id) or {}
+            rows.append(
+                (
+                    blog.id,
+                    blog.name,
+                    blog.address,
+                    meta.get("naver_indexed", None),
+                    str(meta.get("naver_index_checked_at") or ""),
+                    str(meta.get("naver_index_message") or ""),
+                    str(meta.get("naver_index_sample") or ""),
+                )
+            )
+        return tuple(rows)
+
+    def _index_status_view(self, blog: BlogInfo) -> tuple[str, str, str]:
+        address = (blog.address or "").strip()
+        meta = self._blog_meta.get(blog.id) or {}
+        checked = str(meta.get("naver_index_checked_at") or "").strip()
+        if not address:
+            return "주소 없음", "off", ""
+        if not checked:
+            return "확인 전", "off", ""
+        when = self._fmt_when(checked)
+        count = int(meta.get("naver_index_count") or 0)
+        extra = when
+        if count:
+            extra = f"{count}건" + (f" · {when}" if when else "")
+        indexed = meta.get("naver_indexed")
+        if indexed is True:
+            return "색인됨", "ok", extra
+        if indexed is False:
+            return "미색인", "wait", extra
+        return "확인 실패", "wait", extra
+
+    def _refresh_index_tab(self, force: bool = False) -> None:
+        host = getattr(self, "_index_list_inner", None)
+        if not self._widget_alive(host):
+            return
+        if not force and getattr(self, "_main_tab", "") != "색인 확인":
+            return
+        blogs = self._dashboard_blogs()
+        fp = self._index_fingerprint(blogs)
+        if fp == getattr(self, "_index_fp", None):
+            self._index_dirty = False
+            return
+        self._index_fp = fp
+        self._index_dirty = False
+        self._render_index_rows(blogs)
+
+    def _on_index_query_changed(self, *_args) -> None:
+        after_id = getattr(self, "_index_query_after", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self._index_query_after = self.root.after(120, self._apply_index_visibility)
+
+    def _index_search_text(self, blog: BlogInfo) -> str:
+        status, _tone, extra = self._index_status_view(blog)
+        return " ".join((blog.name or "", blog.address or "", blog.id or "", status, extra)).casefold()
+
+    def _index_row_matches(self, blog: BlogInfo, query: str) -> bool:
+        if not query:
+            return True
+        text = getattr(blog, "_index_search_text", "") or self._index_search_text(blog)
+        return query in text
+
+    def _apply_index_visibility(self) -> None:
+        self._index_query_after = None
+        rows = getattr(self, "_index_row_frames", None) or {}
+        listed = getattr(self, "_listed_index_blogs", None) or []
+        if not rows or not listed:
+            return
+        query = (self.index_query.get() or "").strip().casefold() if hasattr(self, "index_query") else ""
+        if not query and query == getattr(self, "_index_vis_query", None):
+            self._update_index_summary(listed)
+            return
+        visible: list[tuple] = []
+        for blog in listed:
+            blog._index_search_text = self._index_search_text(blog)
+            row = rows.get(blog.id)
+            if row is None or not self._widget_alive(row):
+                continue
+            row.pack_forget()
+            if self._index_row_matches(blog, query):
+                visible.append(row)
+        for row in visible:
+            row.pack(fill=tk.X, pady=4, padx=2)
+        shown = len(visible)
+        self._index_vis_query = query
+        self._update_index_summary(listed, shown=shown)
+
+    def _update_index_summary(self, blogs: list[BlogInfo], shown: int | None = None) -> None:
+        summary = getattr(self, "index_summary", None)
+        if not self._widget_alive(summary):
+            return
+        indexed = missing = failed = waiting = 0
+        for blog in blogs:
+            meta = self._blog_meta.get(blog.id) or {}
+            if not str(meta.get("naver_index_checked_at") or "").strip():
+                waiting += 1
+            elif meta.get("naver_indexed") is True:
+                indexed += 1
+            elif meta.get("naver_indexed") is False:
+                missing += 1
+            else:
+                failed += 1
+        text = f"블로그 {len(blogs)}개 · 색인됨 {indexed} · 미색인 {missing} · 확인 전 {waiting}"
+        if failed:
+            text += f" · 실패 {failed}"
+        query = (self.index_query.get() or "").strip() if hasattr(self, "index_query") else ""
+        if query:
+            visible = len(blogs) if shown is None else shown
+            text += f" · 검색 {visible}개"
+        summary.configure(text=text)
+
+    def _paint_index_status(self, row, blog: BlogInfo) -> None:
+        status, tone, extra = self._index_status_view(blog)
+        tones = {
+            "ok": (COLORS["success"], COLORS["ok_bg"]),
+            "wait": ("#b45309", COLORS["wait_bg"]),
+            "off": (COLORS["text_muted"], COLORS["chip_bg"]),
+        }
+        fg, bg = tones.get(tone, tones["off"])
+        pill_widget = getattr(row, "_status_pill", None)
+        if self._widget_alive(pill_widget):
+            try:
+                pill_widget.configure(text=status, text_color=fg, fg_color=bg)
+            except Exception:
+                try:
+                    pill_widget.configure(text=status, fg=fg, bg=bg)
+                except Exception:
+                    pass
+        extra_widget = getattr(row, "_extra_label", None)
+        if self._widget_alive(extra_widget):
+            extra_widget.configure(text=extra)
+        sample = str((self._blog_meta.get(blog.id) or {}).get("naver_index_sample") or "").strip()
+        opener = getattr(row, "_sample_label", None)
+        bottom = getattr(row, "_bottom", None)
+        if sample and not self._widget_alive(opener) and self._widget_alive(bottom):
+            opener = tk.Label(bottom, text="결과 열기", font=FONTS["small"], fg=COLORS["accent"], bg=bottom.cget("bg"), cursor="hand2")
+            opener.pack(side=tk.RIGHT)
+            opener.bind("<Button-1>", lambda event, url=sample: self._open_index_sample(event, url))
+            opener.bind("<Double-Button-1>", lambda event, url=sample: self._open_index_sample(event, url))
+            self._mark_check_hit(opener)
+            try:
+                opener.configure(cursor="hand2")
+            except Exception:
+                pass
+            row._sample_label = opener
+            row._sample_url = sample
+        elif self._widget_alive(opener) and sample and getattr(row, "_sample_url", "") != sample:
+            opener.bind("<Button-1>", lambda event, url=sample: self._open_index_sample(event, url))
+            opener.bind("<Double-Button-1>", lambda event, url=sample: self._open_index_sample(event, url))
+            row._sample_url = sample
+
+    def _sync_index_row(self, blog_id: str) -> None:
+        blog = next((item for item in self._dashboard_blogs() if item.id == blog_id), None)
+        row = (getattr(self, "_index_row_frames", {}) or {}).get(blog_id)
+        if blog is None or not self._widget_alive(row):
+            self._index_fp = None
+            if getattr(self, "_main_tab", "") == "색인 확인":
+                self._refresh_index_tab(force=True)
+            return
+        self._paint_index_status(row, blog)
+        blog._index_search_text = self._index_search_text(blog)
+        listed = getattr(self, "_listed_index_blogs", None) or []
+        self._apply_index_visibility()
+        self._update_index_summary(listed)
+        self._index_fp = self._index_fingerprint(self._dashboard_blogs())
+
+    def _render_index_rows(self, blogs: list[BlogInfo]) -> None:
+        host = getattr(self, "_index_list_inner", None)
+        if not self._widget_alive(host):
+            return
+        for child in list(host.winfo_children()):
+            child.destroy()
+        self._index_row_frames = {}
+        self._stale_index_rows = set()
+        self._listed_index_blogs = list(blogs)
+        self._update_index_summary(blogs)
+        if not blogs:
+            label(host, "로그인된 계정의 블로그가 없습니다.", "body", COLORS["text_muted"]).pack(anchor="w", pady=8)
+            return
+        for blog in blogs:
+            blog._index_search_text = self._index_search_text(blog)
+            self._render_index_row(host, blog)
+        self._index_vis_query = None
+        self._apply_index_visibility()
+
+    def _render_index_row(self, parent, blog: BlogInfo) -> None:
+        bg, border, width = self._row_look(blog.id)
+        row = tk.Frame(parent, bg=bg, highlightbackground=border, highlightthickness=width)
+        row.pack(fill=tk.X, pady=4, padx=2)
+        self._index_row_frames[blog.id] = row
+        top = tk.Frame(row, bg=bg)
+        top.pack(fill=tk.X, padx=8, pady=(8, 0))
+        bottom = tk.Frame(row, bg=bg)
+        bottom.pack(fill=tk.X, padx=8, pady=(2, 8))
+        row._paint_parts = [row, top, bottom]
+        row._bottom = bottom
+        self._bind_row_focus(row, blog.id)
+        self._bind_row_focus(top, blog.id)
+        self._bind_row_focus(bottom, blog.id)
+        check_var = self._ensure_check(blog.id)
+        check = tk.Checkbutton(
+            top, text="", variable=check_var, bg=bg, activebackground=bg,
+            command=lambda bid=blog.id: self._on_blog_checked(bid),
+        )
+        check.pack(side=tk.LEFT)
+        self._mark_check_hit(check)
+        title = blog.name or blog.address or blog.id
+        name = tk.Label(top, text=title, font=FONTS["body_bold"], fg=COLORS["text"], bg=bg)
+        name.pack(side=tk.LEFT, padx=(6, 8))
+        self._bind_row_focus(name, blog.id)
+        status, tone, extra = self._index_status_view(blog)
+        status_fg, status_bg = {
+            "ok": (COLORS["success"], COLORS["ok_bg"]),
+            "wait": ("#b45309", COLORS["wait_bg"]),
+            "off": (COLORS["text_muted"], COLORS["chip_bg"]),
+        }.get(tone, (COLORS["text_muted"], COLORS["chip_bg"]))
+        status_pill = tk.Label(
+            top, text=status, font=FONTS["small"], fg=status_fg, bg=status_bg, padx=8, pady=2,
+        )
+        status_pill.pack(side=tk.LEFT, padx=(0, 6))
+        self._bind_row_focus(status_pill, blog.id)
+        extra_label = tk.Label(top, text=extra, font=FONTS["small"], fg=COLORS["text_muted"], bg=bg)
+        extra_label.pack(side=tk.LEFT)
+        self._bind_row_focus(extra_label, blog.id)
+        row._status_pill = status_pill
+        row._extra_label = extra_label
+        address = (blog.address or "").strip() or "주소 없음"
+        address_label = tk.Label(bottom, text=address, font=FONTS["small"], fg=COLORS["text_muted"], bg=bg)
+        address_label.pack(side=tk.LEFT)
+        self._bind_row_focus(address_label, blog.id)
+        sample = str((self._blog_meta.get(blog.id) or {}).get("naver_index_sample") or "").strip()
+        if sample:
+            opener = tk.Label(bottom, text="결과 열기", font=FONTS["small"], fg=COLORS["accent"], bg=bg, cursor="hand2")
+            opener.pack(side=tk.RIGHT)
+            opener.bind("<Button-1>", lambda event, url=sample: self._open_index_sample(event, url))
+            opener.bind("<Double-Button-1>", lambda event, url=sample: self._open_index_sample(event, url))
+            self._mark_check_hit(opener)
+            try:
+                opener.configure(cursor="hand2")
+            except Exception:
+                pass
+            row._sample_label = opener
+            row._sample_url = sample
+
+    def _open_index_sample(self, _event, url: str):
+        if url:
+            webbrowser.open(url)
+        return "break"
+
+    def on_index_stop(self) -> None:
+        stop = getattr(self, "_index_stop", None)
+        if stop is not None:
+            stop.set()
+        self._set_index_progress("색인 확인을 중지하는 중...")
+
+    def on_index_check(self, recheck: bool = False) -> None:
+        if getattr(self, "_index_busy", False):
+            return
+        blogs = self._dashboard_blogs()
+        selected = [blog for blog in blogs if self._ensure_check(blog.id).get()]
+        query = (self.index_query.get() or "").strip().casefold() if hasattr(self, "index_query") else ""
+        if selected:
+            targets = selected
+        else:
+            targets = [blog for blog in blogs if self._index_row_matches(blog, query)]
+        ready: list[BlogInfo] = []
+        skipped = 0
+        for blog in targets:
+            if not (blog.address or "").strip():
+                continue
+            meta = self._blog_meta.get(blog.id) or {}
+            if not recheck and meta.get("naver_indexed") is True:
+                skipped += 1
+                continue
+            ready.append(blog)
+        if not ready:
+            if skipped:
+                self._set_index_progress(f"이미 색인된 {skipped}개는 건너뛰었습니다. 다시 확인하면 다시 검색합니다.")
+            else:
+                self._set_index_progress("확인할 주소가 있는 블로그가 없습니다.")
+            return
+        self._index_busy = True
+        self._index_stop = threading.Event()
+        self._set_index_buttons(True)
+        scope = "선택한" if selected else ("검색된" if query else "등록된")
+        self._set_index_progress(f"{scope} 블로그 {len(ready)}개 확인을 시작합니다.")
+        threading.Thread(
+            target=self._index_check_worker,
+            args=(ready, skipped),
+            daemon=True,
+        ).start()
+
+    def _index_check_worker(self, blogs: list[BlogInfo], skipped: int) -> None:
+        indexed = 0
+        not_indexed = 0
+        failed = 0
+        total = len(blogs)
+        stopped = False
+        try:
+            for index, blog in enumerate(blogs, 1):
+                if self._index_stop.is_set():
+                    stopped = True
+                    break
+                if not any(item.id == blog.id for item in self.session.state.blogs):
+                    continue
+                address = (blog.address or "").strip()
+                name = blog.name or address or blog.id
+                self.root.after(
+                    0,
+                    lambda i=index, t=total, label=name: self._set_index_progress(f"색인 확인 {i}/{t}: {label}"),
+                )
+                self.log(f"색인 확인 {index}/{total}: {name}")
+                status = check_naver_index(address)
+                if not any(item.id == blog.id for item in self.session.state.blogs):
+                    continue
+                cur = self._blog_meta.setdefault(blog.id, {})
+                cur["naver_indexed"] = status.get("indexed")
+                cur["naver_index_message"] = status.get("message") or ""
+                cur["naver_index_sample"] = status.get("sample_url") or ""
+                cur["naver_index_count"] = status.get("result_count") or 0
+                cur["naver_index_query"] = status.get("query") or ""
+                cur["naver_index_checked_at"] = datetime.now().isoformat(timespec="seconds")
+                if status.get("indexed") is True:
+                    indexed += 1
+                    self.log(f"색인됨: {name}")
+                elif status.get("indexed") is False:
+                    not_indexed += 1
+                    self.log(f"미색인: {name}")
+                else:
+                    failed += 1
+                    self.log(f"색인 확인 실패: {name} · {status.get('message') or ''}")
+                self._schedule_meta_save()
+                self.root.after(0, lambda bid=blog.id: self._sync_index_row(bid))
+                if index < total and not self._index_stop.is_set():
+                    time.sleep(DEFAULT_DELAY_SEC)
+            if stopped:
+                self.root.after(0, lambda: self._set_index_progress("색인 확인을 중지했습니다."))
+                self.log("색인 확인을 중지했습니다.")
+            else:
+                skip = f" · 이미 색인 {skipped}건 건너뜀" if skipped else ""
+                fail = f" · 실패 {failed}" if failed else ""
+                text = f"완료: {indexed + not_indexed + failed}건 확인 · 색인 {indexed} · 미색인 {not_indexed}{fail}{skip}"
+                self.root.after(0, lambda message=text: self._set_index_progress(message))
+                self.log(text)
+        except Exception as exc:
+            detail = _exc_text(exc)
+            self.log(f"색인 확인 오류: {detail}")
+            self.root.after(0, lambda message=detail: self._set_index_progress(f"색인 확인 오류: {message}"))
+        finally:
+            self._index_busy = False
+            self.root.after(0, lambda: self._set_index_buttons(False))
+            self._queue_sheet_sync([blog.id for blog in blogs], "색인 확인")
+
+    def _build_records_page(self) -> None:
+        page = frame(self.tab_body, COLORS["bg"])
+        self._main_pages["기록"] = page
+        card_wrap = card(page)
+        card_wrap.pack(fill=tk.BOTH, expand=True)
+        inner = frame(card_wrap, COLORS["card"])
+        inner.pack(fill=tk.BOTH, expand=True, padx=16, pady=14)
+        label(inner, "기록 시트", "heading", COLORS["text"]).pack(anchor="w")
+        label(
+            inner,
+            "블로그마다 한 줄로 정리합니다. 구글 이메일은 로그인한 계정이 들어가고, 제목·주소·글·수집·색인 아이디도 프로그램이 채웁니다. 핵심키워드, 검색결과, 노출, 한줄 메모는 직접 입력합니다.",
+            "body",
+            COLORS["text_muted"],
+            wraplength=980,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 8))
+        if ctk:
+            self.sheet_url_entry = ctk.CTkEntry(
+                inner,
+                textvariable=self.sheet_url_var,
+                height=36,
+                font=FONTS["body"],
+                fg_color=COLORS["input_bg"],
+                border_color=COLORS["border"],
+                text_color=COLORS["text"],
+                placeholder_text="구글 스프레드시트 주소",
+            )
+        else:
+            self.sheet_url_entry = tk.Entry(inner, textvariable=self.sheet_url_var, font=FONTS["body"])
+        self.sheet_url_entry.pack(fill=tk.X)
+        actions = frame(inner, COLORS["card"])
+        actions.pack(fill=tk.X, pady=(8, 0))
+        actions_more = frame(inner, COLORS["card"])
+        actions_more.pack(fill=tk.X)
+        for host, items in (
+            (
+                actions,
+                (
+                    ("이 시트 사용", "primary", 110, self.on_sheet_create),
+                    ("주소 저장", "ghost", 90, self.on_sheet_save_url),
+                    ("시트 열기", "ghost", 90, self.on_sheet_open),
+                    ("가져오기", "ghost", 90, self.on_sheet_pull),
+                    ("올리기", "success", 90, self.on_sheet_push),
+                ),
+            ),
+            (
+                actions_more,
+                (("선택에 메모 이메일", "ghost", 160, self.on_sheet_apply_memo_email),),
+            ),
+        ):
+            for title, variant, width, command in items:
+                button(host, title, variant=variant, width=width, height=32, command=command).pack(
+                    side=tk.LEFT, padx=(0, 6), pady=(0, 4)
+                )
+        label(
+            inner,
+            "상태: " + " · ".join(STATUS_OPTIONS),
+            "small",
+            COLORS["text_muted"],
+            wraplength=980,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 6))
+        self.records_list = light_scroll(inner, height=420, bg=COLORS["card"])
+        self.records_list.pack(fill=tk.BOTH, expand=True)
+        host = getattr(self.records_list, "inner", self.records_list)
+        self._record_list_inner = tk.Frame(host, bg=COLORS["card"])
+        self._record_list_inner.pack(fill=tk.X)
+
+    def _sheet_day(self, raw: str = "") -> str:
+        value = (raw or "").strip()
+        if not value:
+            return ""
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+        return f"{dt.month}/{dt.day}"
+
+    def _schedule_meta_save(self) -> None:
+        job = getattr(self, "_meta_save_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        try:
+            self._meta_save_job = self.root.after(400, self._save_blog_meta)
+        except Exception:
+            self._meta_save_job = None
+
+    def _set_record_field(self, blog_id: str, key: str, value: str) -> None:
+        if not blog_id or key not in RECORD_FIELDS:
+            return
+        cur = self._blog_meta.setdefault(blog_id, {})
+        value = (value or "").strip()
+        old = str(cur.get(key) or "").strip()
+        if old == value:
+            return
+        if key == "sheet_status":
+            cur["prev_status"] = old
+            if value:
+                now = datetime.now()
+                stamp = f"{now.month}/{now.day}"
+                piece = f"{stamp} {value}"
+                flow = self._clean_status_flow(str(cur.get("status_flow") or ""))
+                if not flow.endswith(piece):
+                    cur["status_flow"] = f"{flow} → {piece}" if flow else piece
+                else:
+                    cur["status_flow"] = flow
+                cur["last_check"] = stamp
+        cur[key] = value
+        self._schedule_meta_save()
+        self._schedule_sheet_sync([blog_id], "기록 수정")
+
+    def _flush_record_vars(self) -> None:
+        if getattr(self, "_records_rendering", False):
+            return
+        for blog_id, fields in list(getattr(self, "_record_vars", {}).items()):
+            for key, var in fields.items():
+                try:
+                    value = var.get()
+                except Exception:
+                    continue
+                if key == "sheet_status" and value.strip() == "미정":
+                    value = ""
+                self._set_record_field(blog_id, key, value)
+
+    def _logged_google_email(self) -> str:
+        account = str(getattr(getattr(self.session, "state", None), "account", "") or "").strip()
+        if account:
+            return account
+        return str(getattr(self, "_shown_account", "") or "").strip()
+
+    def _clean_status_flow(self, flow: str) -> str:
+        parts = [part.strip() for part in (flow or "").split("→") if part.strip()]
+        cleaned: list[str] = []
+        for part in parts:
+            if not cleaned or cleaned[-1] != part:
+                cleaned.append(part)
+        return " → ".join(cleaned)
+
+    def _program_sheet_status(self, blog: BlogInfo) -> str:
+        meta = self._blog_meta.get(blog.id) or {}
+        done = set(getattr(blog, "done", set()) or set())
+        done.update(self._progress_map.get(blog.id) or [])
+        count = self._count_value(meta.get("blog_crawl_count"))
+        collected = "collect" in done or bool(str(meta.get("last_blog_crawl") or "").strip())
+        if collected and count < 1:
+            count = 1
+        if count > 1:
+            return "재수집요청"
+        if collected:
+            return "수집요청"
+        if SETTINGS_DONE_KEYS <= done:
+            return "설정완료"
+        return "생성만"
+
+    def _fill_program_records(self, blogs: list[BlogInfo] | None = None) -> bool:
+        email = self._logged_google_email()
+        targets = list(blogs) if blogs is not None else self._dashboard_blogs()
+        changed = False
+        for blog in targets:
+            cur = self._blog_meta.setdefault(blog.id, {})
+            if email and not str(cur.get("google_email") or "").strip():
+                cur["google_email"] = email
+                changed = True
+            flow = str(cur.get("status_flow") or "").strip()
+            cleaned = self._clean_status_flow(flow)
+            if cleaned != flow:
+                cur["status_flow"] = cleaned
+                changed = True
+            done = set(getattr(blog, "done", set()) or set())
+            done.update(self._progress_map.get(blog.id) or [])
+            if SETTINGS_DONE_KEYS <= done:
+                now = datetime.now()
+                piece = f"{now.month}/{now.day} 설정완료"
+                flow = self._clean_status_flow(str(cur.get("status_flow") or ""))
+                if piece not in [part.strip() for part in flow.split("→")]:
+                    cur["status_flow"] = f"{flow} → {piece}" if flow else piece
+                    cur["last_check"] = f"{now.month}/{now.day}"
+                    changed = True
+            status = str(cur.get("sheet_status") or "").strip()
+            if status in PROGRAM_STATUSES or not status:
+                derived = self._program_sheet_status(blog)
+                if derived and derived != status:
+                    if status:
+                        cur["prev_status"] = status
+                    now = datetime.now()
+                    stamp = f"{now.month}/{now.day}"
+                    piece = f"{stamp} {derived}"
+                    flow = self._clean_status_flow(str(cur.get("status_flow") or ""))
+                    if flow.endswith(piece):
+                        cur["status_flow"] = flow
+                    else:
+                        cur["status_flow"] = f"{flow} → {piece}" if flow else piece
+                    cur["last_check"] = stamp
+                    cur["sheet_status"] = derived
+                    changed = True
+        if changed:
+            self._schedule_meta_save()
+        return changed
+
+    def _sync_program_record_vars(self, blogs: list[BlogInfo]) -> None:
+        self._records_rendering = True
+        try:
+            for blog in blogs:
+                fields = (getattr(self, "_record_vars", {}) or {}).get(blog.id) or {}
+                meta = self._blog_meta.get(blog.id) or {}
+                email = fields.get("google_email")
+                stored_email = str(meta.get("google_email") or "").strip()
+                if email is not None and stored_email and not email.get().strip():
+                    email.set(stored_email)
+                status = fields.get("sheet_status")
+                stored_status = str(meta.get("sheet_status") or "").strip()
+                if status is None or not stored_status:
+                    continue
+                shown = status.get().strip()
+                if shown in {"", "미정"} or shown in PROGRAM_STATUSES:
+                    if shown != stored_status:
+                        status.set(stored_status)
+        finally:
+            self._records_rendering = False
+
+    def _sheet_record_dicts(self, only_ids: set[str] | None = None) -> list[dict]:
+        blogs = self._dashboard_blogs()
+        targets = blogs if only_ids is None else [blog for blog in blogs if blog.id in only_ids]
+        self._fill_program_records(targets)
+        records = []
+        for blog in blogs:
+            if only_ids is not None and blog.id not in only_ids:
+                continue
+            meta = self._blog_meta.get(blog.id) or {}
+            urls = [str(post.get("url") or "").strip() for post in (blog.posts or []) if str(post.get("url") or "").strip()]
+            done = set(getattr(blog, "done", set()) or set())
+            done.update(self._progress_map.get(blog.id) or [])
+            collect_count = self._count_value(meta.get("blog_crawl_count"))
+            if collect_count < 1 and ("collect" in done or str(meta.get("last_blog_crawl") or "").strip()):
+                collect_count = 1
+            records.append(
+                {
+                    "id": blog.id,
+                    "keyword": meta.get("keyword") or "",
+                    "google_email": str(meta.get("google_email") or "").strip() or self._logged_google_email(),
+                    "title": blog.name or "",
+                    "address": blog.address or "",
+                    "posts": " · ".join(urls),
+                    "html_code": meta.get("html_code") or "",
+                    "naver_id": meta.get("naver_id") or "",
+                    "index_status": index_status_label(
+                        meta.get("naver_indexed") if isinstance(meta.get("naver_indexed"), bool) else None,
+                        str(meta.get("naver_index_checked_at") or ""),
+                        blog.address or "",
+                    ),
+                    "sheet_status": meta.get("sheet_status") or "",
+                    "search_result": meta.get("search_result") or "",
+                    "work": meta.get("work") or "",
+                    "exposed_keyword": meta.get("exposed_keyword") or "",
+                    "last_check": meta.get("last_check") or "",
+                    "sheet_note": meta.get("sheet_note") or "",
+                    "first_collect": self._sheet_day(str(meta.get("blog_collect_at") or meta.get("last_blog_crawl") or "")),
+                    "last_collect": self._sheet_day(str(meta.get("last_blog_crawl") or "")),
+                    "collect_count": str(collect_count or ""),
+                    "last_post_collect": self._sheet_day(str(meta.get("last_post_crawl") or "")),
+                    "first_index_at": meta.get("first_index_at") or "",
+                    "trim_started_at": meta.get("trim_started_at") or "",
+                    "status_flow": meta.get("status_flow") or "",
+                    "prev_status": meta.get("prev_status") or "",
+                    "folder": meta.get("folder") or "",
+                }
+            )
+        return records
+
+    def _render_record_rows(self, force: bool = False) -> None:
+        parent = getattr(self, "_record_list_inner", None)
+        if parent is None or not self._widget_alive(parent):
+            return
+        if not force and getattr(self, "_main_tab", "") != "기록":
+            return
+        blogs = self._dashboard_blogs()
+        self._fill_program_records(blogs)
+        fp = tuple(blog.id for blog in blogs)
+        if fp == getattr(self, "_record_fp", None) and parent.winfo_children():
+            self._record_dirty = False
+            self._sync_program_record_vars(blogs)
+            return
+        self._flush_record_vars()
+        self._records_rendering = True
+        try:
+            for child in list(parent.winfo_children()):
+                child.destroy()
+            self._record_vars = {}
+            self._record_fp = fp
+            self._record_dirty = False
+            if not blogs:
+                label(parent, "로그인하면 블로그 기록이 여기에 나타납니다.", "body", COLORS["text_muted"]).pack(anchor="w", pady=8)
+                return
+            for blog in blogs:
+                self._render_record_row(parent, blog)
+        finally:
+            self._records_rendering = False
+
+    def _record_entry(self, parent, variable, width: int, placeholder: str):
+        box = tk.Frame(parent, bg=COLORS["input_bg"])
+        tk.Label(
+            box, text=placeholder, font=FONTS["caption"], fg=COLORS["text_muted"], bg=COLORS["input_bg"],
+        ).pack(anchor="w")
+        tk.Entry(
+            box,
+            textvariable=variable,
+            font=FONTS["small"],
+            width=max(10, width // 9),
+            bg=COLORS["input_bg"],
+            fg=COLORS["text"],
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+            highlightcolor=COLORS["accent"],
+        ).pack(anchor="w", pady=(2, 0))
+        return box
+
+    def _render_record_row(self, parent, blog: BlogInfo) -> None:
+        meta = self._blog_meta.get(blog.id) or {}
+        row = tk.Frame(parent, bg=COLORS["input_bg"], highlightbackground=COLORS["border"], highlightthickness=1)
+        row.pack(fill=tk.X, pady=3)
+        body = tk.Frame(row, bg=COLORS["input_bg"])
+        body.pack(fill=tk.X, padx=8, pady=6)
+        tk.Label(
+            body, text=blog.name or blog.address or blog.id, font=FONTS["body_bold"],
+            fg=COLORS["text"], bg=COLORS["input_bg"],
+        ).pack(anchor="w")
+        tk.Label(
+            body, text=blog.address or "주소 없음", font=FONTS["small"],
+            fg=COLORS["text_muted"], bg=COLORS["input_bg"],
+        ).pack(anchor="w")
+        auto_bits = []
+        indexed = str(meta.get("naver_id") or "").strip()
+        if indexed:
+            auto_bits.append(f"색인 {indexed}")
+        collected = self._sheet_day(str(meta.get("last_blog_crawl") or meta.get("blog_collect_at") or ""))
+        if collected:
+            auto_bits.append(f"수집 {collected}")
+        posted = self._sheet_day(str(meta.get("last_post_crawl") or ""))
+        if posted:
+            auto_bits.append(f"글수집 {posted}")
+        code_name = str(meta.get("html_code") or "").strip()
+        if code_name:
+            auto_bits.append(f"HTML {code_name}")
+        if auto_bits:
+            tk.Label(
+                body, text=" · ".join(auto_bits), font=FONTS["small"],
+                fg=COLORS["text_muted"], bg=COLORS["input_bg"],
+            ).pack(anchor="w")
+        fields: dict[str, tk.StringVar] = {}
+
+        def bind(key: str, initial: str):
+            shown = initial
+            if key == "sheet_status":
+                shown = initial or "미정"
+            var = tk.StringVar(value=shown)
+            var.trace_add(
+                "write",
+                lambda *_args, bid=blog.id, field=key, target=var: self._on_record_var(bid, field, target),
+            )
+            fields[key] = var
+            return var
+
+        line1 = tk.Frame(body, bg=COLORS["input_bg"])
+        line1.pack(fill=tk.X, pady=(6, 0))
+        keyword = bind("keyword", str(meta.get("keyword") or ""))
+        email = bind("google_email", str(meta.get("google_email") or "").strip() or self._logged_google_email())
+        status = bind("sheet_status", str(meta.get("sheet_status") or ""))
+        self._record_entry(line1, keyword, 160, "핵심키워드").pack(side=tk.LEFT, padx=(0, 6))
+        values = ["미정", *STATUS_OPTIONS]
+        current = status.get()
+        if current not in values:
+            values.append(current)
+        status_box = tk.Frame(line1, bg=COLORS["input_bg"])
+        status_box.pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(
+            status_box, text="상태", font=FONTS["caption"], fg=COLORS["text_muted"], bg=COLORS["input_bg"],
+        ).pack(anchor="w")
+        menu = ttk.Combobox(status_box, textvariable=status, values=values, width=14, state="readonly")
+        menu.pack(anchor="w", pady=(2, 0))
+        self._record_entry(line1, email, 220, "구글 이메일").pack(side=tk.LEFT)
+        line2 = tk.Frame(body, bg=COLORS["input_bg"])
+        line2.pack(fill=tk.X, pady=(4, 0))
+        note = bind("sheet_note", str(meta.get("sheet_note") or ""))
+        search = bind("search_result", str(meta.get("search_result") or ""))
+        work = bind("work", str(meta.get("work") or ""))
+        exposed = bind("exposed_keyword", str(meta.get("exposed_keyword") or ""))
+        self._record_entry(line2, note, 220, "한줄 메모").pack(side=tk.LEFT, padx=(0, 6))
+        self._record_entry(line2, search, 140, "검색결과").pack(side=tk.LEFT, padx=(0, 6))
+        self._record_entry(line2, work, 120, "현재작업").pack(side=tk.LEFT, padx=(0, 6))
+        self._record_entry(line2, exposed, 140, "노출키워드").pack(side=tk.LEFT)
+        self._record_vars[blog.id] = fields
+
+    def _on_record_var(self, blog_id: str, key: str, var: tk.StringVar) -> None:
+        if getattr(self, "_records_rendering", False):
+            return
+        value = var.get()
+        if key == "sheet_status" and value.strip() == "미정":
+            value = ""
+        self._set_record_field(blog_id, key, value)
+
+    def _sheet_url_or_warn(self) -> str:
+        url = self.sheet_url_var.get().strip() if hasattr(self, "sheet_url_var") else ""
+        try:
+            spreadsheet_id(url)
+        except ValueError as exc:
+            messagebox.showwarning("기록 시트", str(exc))
+            return ""
+        return url
+
+    def on_sheet_save_url(self) -> None:
+        if not self._sheet_url_or_warn():
+            return
+        self._save_local_settings()
+        self.log("기록 시트 주소를 저장했습니다.")
+
+    def on_sheet_apply_memo_email(self) -> None:
+        email = ""
+        if hasattr(self, "memo_var"):
+            email = str(self._parse_memo(self.memo_var.get())[0] or "").strip()
+        if not email:
+            messagebox.showwarning("기록 시트", "상단 메모에 이메일을 먼저 적어 주세요.")
+            return
+        blogs = self._checked_blogs()
+        if not blogs:
+            messagebox.showwarning("기록 시트", "이메일을 넣을 블로그를 선택해 주세요.")
+            return
+        self._records_rendering = True
+        try:
+            for blog in blogs:
+                cur = self._blog_meta.setdefault(blog.id, {})
+                cur["google_email"] = email
+                var = (self._record_vars.get(blog.id) or {}).get("google_email")
+                if var is not None:
+                    var.set(email)
+        finally:
+            self._records_rendering = False
+        self._schedule_meta_save()
+        self._schedule_sheet_sync([blog.id for blog in blogs], "구글 이메일")
+        self.log(f"선택한 {len(blogs)}개 블로그에 메모 이메일을 넣었습니다.")
+
+    def on_sheet_create(self) -> None:
+        self.sheet_url_var.set(DEFAULT_SHEET_URL)
+        self._save_local_settings()
+        self.log("기록은 지정한 스프레드시트의 블로그스팟 기록 탭에 올립니다.")
+
+    def on_sheet_open(self) -> None:
+        url = self._sheet_url_or_warn()
+        if not url:
+            return
+        webbrowser.open(sheet_tab_url(url))
+        self.log("기록 시트의 블로그스팟 기록 탭을 브라우저에서 열었습니다.")
+
+    def on_sheet_push(self) -> None:
+        url = self._sheet_url_or_warn()
+        if not url or self._sheet_busy:
+            return
+        self._flush_record_vars()
+        records = [program_row(item) for item in self._sheet_record_dicts()]
+        if not records:
+            messagebox.showwarning("기록 시트", "올릴 블로그가 없습니다. 로그인 후 블로그 목록이 보이면 다시 눌러 주세요.")
+            return
+        self._sheet_busy = True
+        self.log(f"기록 {len(records)}개를 시트에 올립니다.")
+        threading.Thread(target=self._sheet_push_worker, args=(url, records), daemon=True).start()
+
+    def _sheet_push_worker(self, url: str, records: list[list[str]]) -> None:
+        try:
+            pushed, extra = push_rows(url, records)
+            self.log(f"기록 시트에 {pushed}개 블로그를 올렸습니다. 시트에만 있는 줄 {extra}개도 유지했습니다.")
+            self.root.after(
+                0,
+                lambda n=pushed: messagebox.showinfo("기록 시트", f"블로그 {n}개를 블로그스팟 기록 탭에 정리했습니다."),
+            )
+        except Exception as exc:
+            detail = str(exc)
+            self.log(f"시트 올리기 오류: {detail}")
+            self.root.after(0, lambda m=detail: messagebox.showerror("기록 시트", m))
+        finally:
+            self._sheet_busy = False
+            self.root.after(0, self._sheet_sync_continue)
+
+    def _schedule_sheet_sync(
+        self,
+        blog_ids,
+        reason: str = "",
+        *,
+        new_ids=None,
+        drop: bool = False,
+    ) -> None:
+        ids = [str(item).strip() for item in blog_ids if str(item).strip()]
+        fresh = [str(item).strip() for item in (new_ids or []) if str(item).strip()]
+        if not ids and not fresh:
+            return
+        if drop:
+            self._sheet_sync_drop.update(ids)
+            self._sheet_sync_ids.difference_update(ids)
+            self._sheet_sync_new.difference_update(ids)
+        else:
+            self._sheet_sync_ids.update(ids)
+            self._sheet_sync_new.update(fresh)
+        if reason:
+            self._sheet_sync_reason = reason
+        job = getattr(self, "_sheet_sync_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        try:
+            self._sheet_sync_job = self.root.after(1600, self._flush_sheet_sync)
+        except Exception:
+            self._sheet_sync_job = None
+
+    def _queue_sheet_sync(self, blog_ids, reason: str, *, new_ids=None, drop: bool = False) -> None:
+        ids = [str(item).strip() for item in blog_ids if str(item).strip()]
+        fresh = [str(item).strip() for item in (new_ids or []) if str(item).strip()]
+        self.root.after(
+            0,
+            lambda: self._schedule_sheet_sync(ids, reason, new_ids=fresh, drop=drop),
+        )
+
+    def _flush_sheet_sync(self) -> None:
+        self._sheet_sync_job = None
+        if self._sheet_busy:
+            self._sheet_sync_again = True
+            return
+        ids = set(self._sheet_sync_ids)
+        fresh = set(self._sheet_sync_new)
+        drop_ids = set(self._sheet_sync_drop)
+        reason = self._sheet_sync_reason or "기록"
+        self._sheet_sync_ids.clear()
+        self._sheet_sync_new.clear()
+        self._sheet_sync_drop.clear()
+        self._sheet_sync_reason = ""
+        if not ids and not drop_ids:
+            return
+        url = self.sheet_url_var.get().strip() if hasattr(self, "sheet_url_var") else ""
+        try:
+            spreadsheet_id(url)
+        except ValueError:
+            return
+        self._flush_record_vars()
+        records = [program_row(item) for item in self._sheet_record_dicts(ids)]
+        self._sheet_busy = True
+        threading.Thread(
+            target=self._sheet_auto_worker,
+            args=(url, records, drop_ids, fresh, reason),
+            daemon=True,
+        ).start()
+
+    def _sheet_auto_worker(self, url: str, records, drop_ids: set[str], new_ids: set[str], reason: str) -> None:
+        try:
+            _updated, pasted = push_updated_rows(url, records, drop_ids, new_ids)
+            if pasted:
+                self.log(f"기록 시트를 자동으로 갱신했습니다. ({reason})")
+        except Exception as exc:
+            self.log(f"기록 시트 자동 갱신 오류: {_exc_text(exc)}")
+        finally:
+            self._sheet_busy = False
+            try:
+                self.root.after(0, self._sheet_sync_continue)
+            except Exception:
+                pass
+
+    def _sheet_sync_continue(self) -> None:
+        if self._sheet_sync_again or self._sheet_sync_ids or self._sheet_sync_drop:
+            self._sheet_sync_again = False
+            self._flush_sheet_sync()
+
+    def on_sheet_pull(self) -> None:
+        url = self._sheet_url_or_warn()
+        if not url or self._sheet_busy:
+            return
+        self._sheet_busy = True
+        self.log("시트에서 키워드와 상태를 가져옵니다.")
+        threading.Thread(target=self._sheet_pull_worker, args=(url,), daemon=True).start()
+
+    def _sheet_pull_worker(self, url: str) -> None:
+        try:
+            rows = pull_rows(url)
+        except Exception as exc:
+            detail = str(exc)
+            self.log(f"시트 가져오기 오류: {detail}")
+            self.root.after(0, lambda m=detail: messagebox.showerror("기록 시트", m))
+            self._sheet_busy = False
+            self.root.after(0, self._sheet_sync_continue)
+            return
+        self.root.after(0, lambda found=rows: self._apply_sheet_rows(found))
+
+    def _apply_sheet_rows(self, rows: list[dict]) -> None:
+        try:
+            blogs = self._dashboard_blogs()
+            by_id = {blog.id: blog for blog in blogs}
+            by_address = {str(blog.address or "").strip().rstrip("/").lower(): blog for blog in blogs if blog.address}
+            applied = 0
+            self._records_rendering = True
+            try:
+                for row in rows:
+                    blog = by_id.get(row.get("id") or "")
+                    if blog is None:
+                        blog = by_address.get(str(row.get("address") or "").strip().rstrip("/").lower())
+                    if blog is None:
+                        continue
+                    cur = self._blog_meta.setdefault(blog.id, {})
+                    for key in RECORD_FIELDS:
+                        if key not in row:
+                            continue
+                        cur[key] = str(row.get(key) or "")
+                    vars_for_blog = self._record_vars.get(blog.id) or {}
+                    for key, var in vars_for_blog.items():
+                        value = str(cur.get(key) or "")
+                        if key == "sheet_status":
+                            value = value or "미정"
+                        var.set(value)
+                    applied += 1
+            finally:
+                self._records_rendering = False
+            self._save_blog_meta()
+            self.log(f"시트에서 {applied}개 블로그의 키워드·상태를 가져왔습니다.")
+            messagebox.showinfo("기록 시트", f"{applied}개 블로그 기록을 가져왔습니다.")
+        finally:
+            self._sheet_busy = False
+            self.root.after(0, self._sheet_sync_continue)
+
     def _widget_alive(self, widget) -> bool:
         if widget is None:
             return False
@@ -806,38 +1904,131 @@ class BloggerApp:
                 page = self._main_pages.get(name)
         if not self._widget_alive(page):
             return
+        self._ensure_tabs_stacked()
+        self._place_main_page(page)
+        if (
+            name == getattr(self, "_main_tab", "")
+            and getattr(page, "_tab_placed", False)
+            and getattr(self, "_tab_raise_ready", False)
+        ):
+            return
         self._main_tab = name
+        try:
+            page.tkraise()
+        except Exception:
+            try:
+                page.lift()
+            except Exception:
+                pass
+        self._tab_raise_ready = True
+        if getattr(self, "_tab_paint_job", None) is None:
+            self._tab_paint_job = self.root.after(1, self._paint_tab_buttons_later)
+        if self._tab_needs_refresh(name):
+            self._schedule_tab_refresh(name)
+
+    def _ensure_tabs_stacked(self) -> None:
+        if getattr(self, "_tabs_stacked", False):
+            return
         try:
             self.tab_body.grid_rowconfigure(0, weight=1)
             self.tab_body.grid_columnconfigure(0, weight=1)
         except Exception:
             pass
-        for key, item in list(self._main_pages.items()):
-            if not self._widget_alive(item):
-                self._main_pages.pop(key, None)
-                continue
+        for item in list(self._main_pages.values()):
+            self._place_main_page(item)
+        self._tabs_stacked = True
+
+    def _paint_tab_buttons_later(self) -> None:
+        self._tab_paint_job = None
+        self._paint_main_tabs()
+
+    def _tab_needs_refresh(self, name: str) -> bool:
+        if name == "글쓰기":
+            return True
+        if name == "블로그":
+            return bool(
+                getattr(self, "_blog_dirty", False)
+                or getattr(self, "_detail_dirty", False)
+                or getattr(self, "_stale_blog_rows", None)
+            )
+        if name in ("기록", "색인 확인"):
+            return False
+        return False
+
+    def _queue_side_lists(self) -> None:
+        job = getattr(self, "_side_list_job", None)
+        if job is not None:
             try:
-                item.pack_forget()
+                self.root.after_cancel(job)
             except Exception:
                 pass
-            if key == name:
-                item.grid(row=0, column=0, sticky="nsew")
-                try:
-                    item.lift()
-                except Exception:
-                    pass
-            else:
-                try:
-                    item.grid_remove()
-                except Exception:
-                    pass
-        self._paint_main_tabs()
+        self._side_list_job = self.root.after(40, self._refresh_side_lists)
+
+    def _refresh_side_lists(self) -> None:
+        self._side_list_job = None
+        tab = getattr(self, "_main_tab", "")
+        if tab != "기록":
+            self._render_record_rows(force=True)
+        if tab != "색인 확인":
+            self._refresh_index_tab(force=True)
+
+    def _warm_hidden_lists(self) -> None:
+        if getattr(self, "_record_fp", None) is None:
+            self._render_record_rows(force=True)
+        if getattr(self, "_index_fp", None) is None:
+            self._refresh_index_tab(force=True)
+
+    def _place_main_page(self, page) -> None:
+        if not self._widget_alive(page) or getattr(page, "_tab_placed", False):
+            return
+        try:
+            page.pack_forget()
+        except Exception:
+            pass
+        try:
+            page.grid(row=0, column=0, sticky="nsew")
+        except Exception:
+            return
+        page._tab_placed = True
+
+    def _schedule_tab_refresh(self, name: str) -> None:
+        job = getattr(self, "_tab_refresh_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._tab_refresh_job = self.root.after(16, lambda tab=name: self._refresh_visible_tab(tab))
+
+    def _refresh_visible_tab(self, name: str) -> None:
+        self._tab_refresh_job = None
+        if getattr(self, "_main_tab", "") != name:
+            return
         if name == "글쓰기":
             self._refresh_write_count()
+        elif name == "블로그":
+            self._flush_stale_rows("blog")
+            if getattr(self, "_blog_dirty", False):
+                self._refresh_dashboard()
+            if getattr(self, "_detail_dirty", False):
+                self._render_blog_detail()
+        elif name == "기록":
+            self._render_record_rows()
+        elif name == "색인 확인":
+            if getattr(self, "_index_dirty", False) or getattr(self, "_index_fp", None) is None:
+                self._refresh_index_tab()
+            else:
+                self._flush_stale_rows("index")
 
     def _paint_main_tabs(self) -> None:
-        for name, btn in self._main_tab_buttons.items():
-            active = name == self._main_tab
+        current = getattr(self, "_main_tab", "")
+        prev = getattr(self, "_painted_tab", None)
+        names = list(self._main_tab_buttons) if prev is None else ([current] if prev == current else [prev, current])
+        for name in names:
+            btn = self._main_tab_buttons.get(name)
+            if btn is None or not self._widget_alive(btn):
+                continue
+            active = name == current
             if ctk:
                 btn.configure(
                     fg_color=COLORS["accent"] if active else COLORS["border"],
@@ -849,6 +2040,7 @@ class BloggerApp:
                     bg=COLORS["accent"] if active else COLORS["border"],
                     fg="#ffffff" if active else COLORS["text"],
                 )
+        self._painted_tab = current
 
     def log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
@@ -1022,6 +2214,8 @@ class BloggerApp:
             )
         if hasattr(self, "memo_var"):
             self.memo_var.set(str(data.get("account_memo") or ""))
+        if hasattr(self, "sheet_url_var"):
+            self.sheet_url_var.set(str(data.get("sheet_url") or "").strip() or DEFAULT_SHEET_URL)
 
     def _load_progress(self) -> None:
         path = data_path(PROGRESS_FILE)
@@ -1078,6 +2272,13 @@ class BloggerApp:
                     "folder": str(item.get("folder") or ""),
                     "html_code": str(item.get("html_code") or ""),
                     "post_crawls": item.get("post_crawls") if isinstance(item.get("post_crawls"), dict) else {},
+                    "naver_indexed": item.get("naver_indexed") if isinstance(item.get("naver_indexed"), bool) else None,
+                    "naver_index_checked_at": str(item.get("naver_index_checked_at") or ""),
+                    "naver_index_message": str(item.get("naver_index_message") or ""),
+                    "naver_index_sample": str(item.get("naver_index_sample") or ""),
+                    "naver_index_count": self._count_value(item.get("naver_index_count")),
+                    "naver_index_query": str(item.get("naver_index_query") or ""),
+                    **{key: str(item.get(key) or "") for key in RECORD_FIELDS},
                 }
             self._fill_missing_post_crawls()
         except Exception:
@@ -1140,6 +2341,7 @@ class BloggerApp:
             "html_code_index": int(getattr(self, "_html_code_index", 0) or 0),
             "theme_html": self._selected_html_template(),
             "account_memo": self.memo_var.get() if hasattr(self, "memo_var") else "",
+            "sheet_url": self.sheet_url_var.get().strip() if hasattr(self, "sheet_url_var") else "",
         }
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(data, handle, ensure_ascii=False, indent=2)
@@ -1373,30 +2575,25 @@ class BloggerApp:
     def on_login(self):
         if self._login_busy:
             return
-        if self.session.is_alive() and self.session.state.logged_in:
-            self.log("이미 로그인되어 있습니다. 목록과 주소를 다시 읽습니다.")
-            threading.Thread(target=self._redetect_worker, daemon=True).start()
-            return
         self._login_busy = True
-        self._set_login_button("로그인 대기 중...", enabled=False)
-        self._set_status("Chrome 창에서 로그인해 주세요", COLORS["warning"])
+        self._set_login_button("인식 중...", enabled=False)
+        self._set_status("블로그스팟 창의 아이디를 읽는 중", COLORS["warning"])
         threading.Thread(target=self._login_worker, daemon=True).start()
 
     def _login_worker(self):
         try:
-            self.session.start_browser()
-            state = self.session.wait_until_logged_in()
-            if not self.session.is_alive():
+            state = self.session.recognize()
+            if not self.session.chrome_running():
                 self.root.after(0, self._on_browser_closed)
                 return
             if not state.logged_in:
-                self.root.after(0, lambda: self._login_failed("로그인을 확인하지 못했습니다."))
+                self.root.after(0, self._on_blogger_signed_out)
                 return
             self._merge_blog_meta(state.blogs)
             self.root.after(0, lambda: self._on_logged_in(state))
             self._catalog_worker()
         except Exception as exc:
-            self.log(f"로그인 창 오류: {exc}")
+            self.log(f"블로그스팟 인식 오류: {exc}")
             self.root.after(0, lambda: self._login_failed(str(exc)))
 
     def _redetect_worker(self):
@@ -1429,6 +2626,7 @@ class BloggerApp:
 
     def _on_logged_in(self, state: SessionState):
         self._login_busy = False
+        self._blogger_signed_out_noted = False
         self._set_login_button("다시 인식", enabled=True)
         self._apply_state(state)
         names = ", ".join(blog.name or blog.id for blog in state.blogs) or "(없음)"
@@ -1441,6 +2639,13 @@ class BloggerApp:
         self._set_login_button("블로그스팟 로그인", enabled=True)
         self._set_status("로그인 실패", COLORS["danger"])
         messagebox.showerror("로그인", reason)
+
+    def _on_blogger_signed_out(self):
+        self._login_busy = False
+        self._shown_account = ""
+        self._blogger_signed_out_noted = True
+        self._set_login_button("다시 인식", enabled=True)
+        self._apply_state(self.session.state)
 
     def _apply_state(self, state: SessionState):
         account = (state.account or "").strip()
@@ -1461,6 +2666,7 @@ class BloggerApp:
         self._merge_progress(state.blogs)
         self._merge_blog_meta(state.blogs)
         self._remember_blog_meta(state.blogs)
+        self._fill_program_records(state.blogs)
         self._schedule_dashboard()
 
     def _any_busy(self) -> bool:
@@ -1472,6 +2678,7 @@ class BloggerApp:
                 self._settings_busy,
                 self._naver_busy,
                 self._create_busy,
+                getattr(self, "_index_busy", False),
             )
         )
 
@@ -1708,12 +2915,29 @@ class BloggerApp:
         visible = self._filter_blogs(blogs)
         fp = self._dashboard_fingerprint(blogs, visible)
         if fp == self._dashboard_fp:
+            if getattr(self, "_main_tab", "") == "색인 확인":
+                self._refresh_index_tab()
+            return
+        tab = getattr(self, "_main_tab", "")
+        self._blog_dirty = tab != "블로그"
+        self._record_dirty = tab != "기록"
+        self._index_dirty = tab != "색인 확인"
+        self._queue_side_lists()
+        if tab == "기록":
+            self._render_record_rows()
+            return
+        if tab == "색인 확인":
+            self._refresh_index_tab()
+            return
+        if tab != "블로그":
             return
         self._dashboard_fp = fp
+        self._blog_dirty = False
         self._refreshing = True
         try:
             self._render_blog_summary(blogs)
             self._render_blogs(blogs, all_blogs=blogs)
+            self._refresh_index_tab()
         finally:
             self._refreshing = False
 
@@ -1748,6 +2972,7 @@ class BloggerApp:
             child.destroy()
         self._blog_buttons.clear()
         self._blog_row_frames.clear()
+        self._stale_blog_rows = set()
         self._index_labels = []
         source = all_blogs if all_blogs is not None else blogs
         self._shown_blog_keys = [
@@ -1779,6 +3004,7 @@ class BloggerApp:
             if not source:
                 self.blog_var.set("")
             self._render_blog_detail()
+            self._render_record_rows()
             return
 
         known = {blog.id for blog in source}
@@ -1791,10 +3017,10 @@ class BloggerApp:
         for blog in source:
             blog._search_text = self._blog_search_text(blog)
             self._render_blog_row(parent, blog)
-        self._paint_blog_rows()
         self._update_sel_count()
         self._render_blog_detail()
         self._apply_blog_visibility()
+        self._render_record_rows()
         if getattr(self, "_scroll_blog_id", ""):
             self._scroll_blog_id = ""
             self.root.after(80, self._scroll_blog_list_to_end)
@@ -1867,12 +3093,23 @@ class BloggerApp:
         return var
 
     def _set_visible_checks(self, value: bool) -> None:
-        for blog in self._filter_blogs(self._dashboard_blogs()):
-            self._ensure_check(blog.id).set(value)
+        changed: list[str] = []
+        self._checks_batch = True
+        try:
+            for blog in self._filter_blogs(self._dashboard_blogs()):
+                var = self._ensure_check(blog.id)
+                if bool(var.get()) == value:
+                    continue
+                var.set(value)
+                changed.append(blog.id)
+        finally:
+            self._checks_batch = False
         self._update_sel_count()
-        self._paint_blog_rows()
-        self._render_blog_detail()
-        self._refresh_write_count()
+        for blog_id in changed:
+            self._paint_rows_for(blog_id)
+        if getattr(self, "_main_tab", "") == "블로그":
+            self._render_blog_detail()
+        self._schedule_write_count()
 
     def _checked_count(self) -> int:
         return sum(1 for var in self._blog_check_vars.values() if var.get())
@@ -1884,9 +3121,11 @@ class BloggerApp:
         self.sel_count_label.configure(text=f"{n}개 선택")
 
     def _on_blog_checked(self, blog_id: str) -> None:
+        if getattr(self, "_checks_batch", False):
+            return
         self._update_sel_count()
-        self._paint_blog_rows()
-        self._refresh_write_count()
+        self._paint_rows_for(blog_id)
+        self._schedule_write_count()
 
     def _toggle_blog_check(self, blog_id: str) -> None:
         var = self._ensure_check(blog_id)
@@ -2005,6 +3244,7 @@ class BloggerApp:
             self._save_progress()
         except Exception:
             pass
+        self._queue_sheet_sync([blog_id], "블로그 삭제", drop=True)
 
     def _delete_blogs_done(self) -> None:
         self._settings_busy = False
@@ -2019,27 +3259,44 @@ class BloggerApp:
 
     def _row_look(self, blog_id: str) -> tuple[str, str, int]:
         if self._ensure_check(blog_id).get():
-            return COLORS["row_checked"], COLORS["row_checked_border"], 3
+            return COLORS["row_checked"], COLORS["row_checked_border"], 2
         if blog_id == self.blog_var.get():
-            return COLORS["row_focus"], COLORS["row_focus_border"], 3
-        return COLORS["card"], COLORS["card_border"], 1
+            return COLORS["row_focus"], COLORS["row_focus_border"], 2
+        return COLORS["card"], COLORS["card_border"], 2
 
     def _paint_row_widget(self, widget, bg: str, border: str, width: int) -> None:
-        try:
-            widget.configure(fg_color=bg, border_color=border, border_width=width)
+        signature = (bg, border, width)
+        if getattr(widget, "_paint_sig", None) == signature:
             return
-        except Exception:
-            pass
+        mode = getattr(widget, "_paint_mode", None)
         try:
-            widget.configure(fg_color=bg)
-        except Exception:
-            try:
+            if mode == "ctk-border":
+                widget.configure(fg_color=bg, border_color=border, border_width=width)
+            elif mode == "ctk-fill":
+                widget.configure(fg_color=bg)
+            elif mode == "tk-border":
                 widget.configure(bg=bg, highlightbackground=border, highlightthickness=width)
-            except Exception:
+            elif mode == "tk-fill":
+                widget.configure(bg=bg)
+            else:
                 try:
-                    widget.configure(bg=bg)
+                    widget.configure(fg_color=bg, border_color=border, border_width=width)
+                    mode = "ctk-border"
                 except Exception:
-                    pass
+                    try:
+                        widget.configure(fg_color=bg)
+                        mode = "ctk-fill"
+                    except Exception:
+                        try:
+                            widget.configure(bg=bg, highlightbackground=border, highlightthickness=width)
+                            mode = "tk-border"
+                        except Exception:
+                            widget.configure(bg=bg)
+                            mode = "tk-fill"
+                widget._paint_mode = mode
+        except Exception:
+            return
+        widget._paint_sig = signature
 
     def _render_blog_row(self, parent, blog: BlogInfo) -> None:
         bg, border, width = self._row_look(blog.id)
@@ -2164,25 +3421,89 @@ class BloggerApp:
         return "break"
 
     def _select_blog(self, blog_id: str) -> None:
-        if self.blog_var.get() == blog_id:
+        prev = self.blog_var.get()
+        if prev == blog_id:
             return
         self.blog_var.set(blog_id)
-        self._paint_blog_rows()
-        self._render_blog_detail()
-        self._refresh_write_count()
+        self._paint_rows_for(prev)
+        self._paint_rows_for(blog_id)
+        if getattr(self, "_main_tab", "") == "블로그":
+            self._render_blog_detail()
+        else:
+            self._detail_dirty = True
+        self._schedule_write_count()
 
     def _on_blog_selected(self) -> None:
-        self._paint_blog_rows()
-        self._render_blog_detail()
+        self._paint_rows_for(self.blog_var.get())
+        if getattr(self, "_main_tab", "") == "블로그":
+            self._render_blog_detail()
+
+    def _paint_rows_for(self, blog_id: str) -> None:
+        if not blog_id:
+            return
+        tab = getattr(self, "_main_tab", "")
+        blog_row = (getattr(self, "_blog_row_frames", {}) or {}).get(blog_id)
+        index_row = (getattr(self, "_index_row_frames", {}) or {}).get(blog_id)
+        if tab == "색인 확인":
+            self._paint_row_frame(index_row, blog_id)
+            self._mark_row_stale("blog", blog_id)
+        elif tab == "블로그":
+            self._paint_row_frame(blog_row, blog_id)
+            self._mark_row_stale("index", blog_id)
+        else:
+            self._mark_row_stale("blog", blog_id)
+            self._mark_row_stale("index", blog_id)
+
+    def _mark_row_stale(self, kind: str, blog_id: str) -> None:
+        name = "_stale_blog_rows" if kind == "blog" else "_stale_index_rows"
+        stale = getattr(self, name, None)
+        if stale is None:
+            stale = set()
+            setattr(self, name, stale)
+        stale.add(blog_id)
+
+    def _flush_stale_rows(self, kind: str) -> None:
+        name = "_stale_blog_rows" if kind == "blog" else "_stale_index_rows"
+        stale = getattr(self, name, None) or set()
+        if not stale:
+            return
+        frames = self._blog_row_frames if kind == "blog" else getattr(self, "_index_row_frames", {})
+        for blog_id in list(stale):
+            self._paint_row_frame((frames or {}).get(blog_id), blog_id)
+        stale.clear()
+
+    def _paint_row_frame(self, row, blog_id: str) -> None:
+        if not self._widget_alive(row):
+            return
+        bg, border, width = self._row_look(blog_id)
+        parts = getattr(row, "_paint_parts", None) or [row]
+        for part in parts:
+            if not self._widget_alive(part):
+                continue
+            self._paint_row_widget(part, bg, border, width if part is row else 0)
+            if part is row:
+                continue
+            for child in part.winfo_children():
+                if child is getattr(row, "_status_pill", None):
+                    continue
+                if not isinstance(child, (tk.Label, tk.Checkbutton)):
+                    continue
+                try:
+                    child.configure(bg=bg, activebackground=bg)
+                except Exception:
+                    try:
+                        child.configure(bg=bg)
+                    except Exception:
+                        pass
 
     def _paint_blog_rows(self) -> None:
-        for blog_id, row in self._blog_row_frames.items():
-            bg, border, width = self._row_look(blog_id)
-            parts = getattr(row, "_paint_parts", None) or [row]
-            for part in parts:
-                self._paint_row_widget(part, bg, border, width if part is row else 0)
+        ids = set(getattr(self, "_blog_row_frames", {}) or {})
+        ids.update(getattr(self, "_index_row_frames", {}) or {})
+        for blog_id in ids:
+            self._paint_rows_for(blog_id)
 
     def _render_blog_detail(self) -> None:
+        self._detail_dirty = False
         wrap = self.blog_detail_wrap
         for child in wrap.winfo_children():
             child.destroy()
@@ -2346,46 +3667,47 @@ class BloggerApp:
             pass
 
     def _restore_naver_if_open(self):
-        if self._naver_login_busy or not self.naver.chrome_running():
+        if self._naver_login_busy:
             return
+        self._naver_login_busy = True
+        self._set_naver_login_button("인식 중...", enabled=False)
         threading.Thread(target=self._naver_restore_worker, daemon=True).start()
 
     def _naver_restore_worker(self):
         try:
-            if self.naver.reattach() and self.naver.state.logged_in:
-                try:
-                    self.naver.count_sites()
-                except Exception:
-                    pass
+            state = self.naver.recognize()
+            if state.logged_in:
                 self.root.after(0, lambda: self._on_naver_logged_in(self.naver.state))
+            elif self.naver.chrome_running():
+                self.root.after(0, self._on_naver_signed_out)
+            else:
+                self.root.after(0, lambda: self._set_naver_login_button("서치어드바이저 로그인", enabled=True))
+                self._naver_login_busy = False
         except Exception as exc:
             self.log(f"서치어드바이저 자동 재연결 실패: {exc}")
+            self._naver_login_busy = False
+            self.root.after(0, lambda: self._set_naver_login_button("서치어드바이저 로그인", enabled=True))
 
     def on_naver_login(self):
         if self._naver_login_busy:
             return
-        if self.naver.is_alive() and self.naver.state.logged_in:
-            self.log("서치어드바이저가 이미 로그인되어 있습니다. 사이트 수를 다시 읽습니다.")
-            threading.Thread(target=self._naver_count_worker, daemon=True).start()
-            return
         self._naver_login_busy = True
-        self._set_naver_login_button("로그인 대기 중...", enabled=False)
-        self._set_naver_status("서치어드바이저 창에서 로그인해 주세요", COLORS["warning"])
+        self._set_naver_login_button("인식 중...", enabled=False)
+        self._set_naver_status("서치어드바이저 창의 아이디를 읽는 중", COLORS["warning"])
         threading.Thread(target=self._naver_login_worker, daemon=True).start()
 
     def _naver_login_worker(self):
         try:
-            self.naver.start_login()
-            state = self.naver.wait_until_logged_in()
-            if not self.naver.is_alive():
+            state = self.naver.recognize()
+            if not self.naver.chrome_running():
                 self.root.after(0, self._on_naver_closed)
                 return
             if not state.logged_in:
-                self.root.after(0, lambda: self._naver_login_failed("서치어드바이저 로그인을 확인하지 못했습니다."))
+                self.root.after(0, self._on_naver_signed_out)
                 return
             self.root.after(0, lambda: self._on_naver_logged_in(state))
         except Exception as exc:
-            self.log(f"서치어드바이저 로그인 오류: {exc}")
+            self.log(f"서치어드바이저 인식 오류: {exc}")
             self.root.after(0, lambda: self._naver_login_failed(str(exc)))
 
     def _naver_count_worker(self):
@@ -2397,7 +3719,9 @@ class BloggerApp:
 
     def _on_naver_logged_in(self, state):
         self._naver_login_busy = False
-        self._set_naver_login_button("사이트 수 다시 읽기", enabled=True)
+        self._naver_signed_out_noted = False
+        self._shown_naver_account = (state.account or "").strip()
+        self._set_naver_login_button("다시 인식", enabled=True)
         self._apply_naver_state(state)
         count = state.site_count
         extra = f" / 사이트 {count}개" if count is not None else ""
@@ -2409,6 +3733,13 @@ class BloggerApp:
         self._set_naver_login_button("서치어드바이저 로그인", enabled=True)
         self._set_naver_status("서치어드바이저: 로그인 실패", COLORS["danger"])
         messagebox.showerror("서치어드바이저", reason)
+
+    def _on_naver_signed_out(self):
+        self._naver_login_busy = False
+        self._naver_signed_out_noted = True
+        self._shown_naver_account = ""
+        self._set_naver_login_button("다시 인식", enabled=True)
+        self._apply_naver_state(self.naver.state)
 
     def _apply_naver_state(self, state) -> None:
         if state.logged_in:
@@ -2816,6 +4147,7 @@ class BloggerApp:
             self.root.after(0, lambda m=detail: messagebox.showerror("글 삭제", m))
         finally:
             self.root.after(0, self._write_done)
+            self._queue_sheet_sync([blog_id], "글 삭제")
 
     def _forget_deleted_post(self, blog_id: str, url: str) -> None:
         key = (url or "").strip().rstrip("/").lower()
@@ -2887,6 +4219,7 @@ class BloggerApp:
             self.root.after(0, lambda m=detail: messagebox.showerror("네이버 최초 HTML 코드 넣기", m))
         finally:
             self.root.after(0, self._naver_apply_done)
+            self._queue_sheet_sync([blog_id for blog_id, _address in jobs], "HTML 코드")
 
     def _naver_first_worker(self, plan: list[tuple[str, str, list[str], int]]):
         warnings: list[str] = []
@@ -2949,6 +4282,7 @@ class BloggerApp:
             self.root.after(0, lambda m=detail: messagebox.showerror("네이버 최초 수집", m))
         finally:
             self.root.after(0, self._naver_apply_done)
+            self._queue_sheet_sync([blog_id for blog_id, _address, _posts, _steps in plan], "최초 수집")
 
     def _naver_blog_worker(self, jobs: list[tuple[str, str]], title: str = "블로그 수집요청"):
         warnings: list[str] = []
@@ -2984,6 +4318,7 @@ class BloggerApp:
             self.root.after(0, lambda m=detail, t=title: messagebox.showerror(t, m))
         finally:
             self.root.after(0, self._naver_apply_done)
+            self._queue_sheet_sync([blog_id for blog_id, _address in jobs], title)
 
     def _naver_post_worker(self, jobs: list[tuple[str, str, list[str]]]):
         warnings: list[str] = []
@@ -3035,6 +4370,7 @@ class BloggerApp:
             self.root.after(0, lambda m=detail: messagebox.showerror("글페이지 수집요청", m))
         finally:
             self.root.after(0, self._naver_apply_done)
+            self._queue_sheet_sync([blog_id for blog_id, _address, _posts in jobs], "글 수집")
 
     def _naver_one_post_worker(self, blog_id: str, address: str, url: str, recrawl: bool):
         title = "이글 재수집" if recrawl else "이글 수집"
@@ -3068,6 +4404,7 @@ class BloggerApp:
             self.root.after(0, lambda m=detail: messagebox.showerror(title, m))
         finally:
             self.root.after(0, self._naver_apply_done)
+            self._queue_sheet_sync([blog_id], title)
 
     def _count_value(self, raw) -> int:
         try:
@@ -3249,6 +4586,7 @@ class BloggerApp:
             self.root.after(0, lambda m=detail: messagebox.showerror("설정 적용", m))
         finally:
             self.root.after(0, self._settings_done)
+            self._queue_sheet_sync([blog_id for blog_id, _description, _favicon in jobs], "설정 적용")
 
     def _on_settings_progress(self, step: int, total: int, label_text: str) -> None:
         self.root.after(0, lambda: self._set_progress(step, total, label_text))
@@ -3396,8 +4734,9 @@ class BloggerApp:
                     self.log(f"블로그 주소를 몰라 폴더를 만들지 못했습니다: {item.get('title') or address or '?'}")
             for item in failed:
                 name = item.get("title") or "?"
-                warnings.append(f"{name}: 생성 결과를 확인하지 못했습니다.")
-                self.log(f"블로그 생성 확인 실패: {name}")
+                detail = str(item.get("error") or "생성 결과를 확인하지 못했습니다")
+                warnings.append(f"{name}: {detail}")
+                self.log(f"블로그 생성 실패: {name} · {detail}")
             created_ids = [str(item.get("id") or "") for item in made if item.get("id")]
             created_titles = [
                 str(item.get("title") or "")
@@ -3459,6 +4798,7 @@ class BloggerApp:
         self._show_main_tab("블로그")
         self._dashboard_fp = None
         self._schedule_dashboard()
+        self._schedule_sheet_sync(picked, "블로그 생성", new_ids=picked)
 
     def _scroll_blog_list_to_end(self) -> None:
         widget = getattr(self, "blog_list", None)
@@ -3525,20 +4865,46 @@ class BloggerApp:
         shutil.move(path, dest)
         return dest
 
+    def _schedule_write_count(self) -> None:
+        job = getattr(self, "_write_count_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._write_count_job = self.root.after(200, self._flush_write_count)
+
+    def _flush_write_count(self) -> None:
+        self._write_count_job = None
+        self._refresh_write_count()
+
+    def _manuscript_file_count(self, folder: str) -> int:
+        if not folder or not os.path.isdir(folder):
+            return 0
+        try:
+            stamp = os.path.getmtime(folder)
+        except OSError:
+            stamp = 0
+        cached = getattr(self, "_manuscript_count_cache", None)
+        key = (folder, stamp)
+        if cached and cached[0] == key:
+            return cached[1]
+        try:
+            count = len(self._manuscript_files(folder))
+        except Exception:
+            count = 0
+        self._manuscript_count_cache = (key, count)
+        return count
+
     def _refresh_write_count(self) -> None:
         widget = getattr(self, "write_count_label", None)
         if not self._widget_alive(widget):
             return
-        blogs = self._checked_blogs() if hasattr(self, "blog_var") else []
+        blog_count = self._checked_count() if hasattr(self, "_blog_check_vars") else 0
+        if blog_count == 0 and hasattr(self, "blog_var") and self.blog_var.get().strip():
+            blog_count = 1
         folder = self.manuscript_var.get().strip() if hasattr(self, "manuscript_var") else ""
-        files: list[str] = []
-        if folder and os.path.isdir(folder):
-            try:
-                files = self._manuscript_files(folder)
-            except Exception:
-                files = []
-        blog_count = len(blogs)
-        file_count = len(files)
+        file_count = self._manuscript_file_count(folder)
         raw = self.write_count_var.get().strip() if hasattr(self, "write_count_var") else ""
         count = int(raw) if raw.isdigit() and int(raw) >= 1 else 0
         if count == 0:
@@ -3726,6 +5092,7 @@ class BloggerApp:
             self.root.after(0, lambda m=detail: messagebox.showerror("글 작성", m))
         finally:
             self.root.after(0, self._write_done)
+            self._queue_sheet_sync([blog.id for blog, _path, _folder in jobs], "글 작성")
 
     def _write_done(self):
         self._post_busy = False
@@ -3749,37 +5116,65 @@ class BloggerApp:
         self._watch()
 
     def _watch(self):
-        busy = self._any_busy()
-        if not busy:
-            if self.session.driver is not None and not self.session.chrome_running():
-                self._on_browser_closed()
-            naver_dead = self.naver.driver is not None and not self.naver.chrome_running()
-            naver_missing = self.naver.driver is None and self.naver.chrome_running()
-            if naver_dead or naver_missing:
-                if self.naver.chrome_running() and self.naver.reattach():
-                    self._apply_naver_state(self.naver.state)
-                elif not self.naver.chrome_running():
-                    self._on_naver_closed()
-            if (
-                self.session.driver is not None
-                and self.session.chrome_running()
-                and not self._watch_detect_running
-                and not self._catalog_running
-            ):
-                self._watch_detect_running = True
-                threading.Thread(target=self._watch_detect_worker, daemon=True).start()
-        self._watch_id = self.root.after(3000, self._watch)
+        if (
+            not self._any_busy()
+            and not self._watch_detect_running
+            and not self._catalog_running
+        ):
+            self._watch_detect_running = True
+            threading.Thread(target=self._watch_detect_worker, daemon=True).start()
+        self._watch_id = self.root.after(6000, self._watch)
 
     def _watch_detect_worker(self):
         try:
-            if self._any_busy() or self._catalog_running or self.session.driver is None:
+            if self._any_busy() or self._catalog_running:
+                return
+            blogger_up = self.session.driver is not None and self.session.chrome_running()
+            if self.session.driver is not None and not blogger_up:
+                self.root.after(0, self._on_browser_closed)
+                return
+            naver_should_probe = self.naver.driver is not None or bool(getattr(self.naver.state, "logged_in", False))
+            if naver_should_probe:
+                naver_up = self.naver.chrome_running()
+                if self.naver.driver is not None and not naver_up:
+                    self.root.after(0, self._on_naver_closed)
+                elif self.naver.driver is None and naver_up and self.naver.reattach():
+                    self.root.after(0, lambda: self._apply_naver_state(self.naver.state))
+                elif self.naver.driver is not None and naver_up:
+                    naver_url = self.naver._url()
+                    if self.naver._on_naver_login_page(naver_url):
+                        if not getattr(self, "_naver_signed_out_noted", False):
+                            self.naver.state.logged_in = False
+                            self.naver.state.account = ""
+                            self.naver.state.url = naver_url
+                            self.root.after(0, self._on_naver_signed_out)
+                    elif self.naver._on_advisor_console():
+                        account = self.naver.read_account()
+                        shown = getattr(self, "_shown_naver_account", "")
+                        if account and account != shown:
+                            self._shown_naver_account = account
+                            self._naver_signed_out_noted = False
+                            self.root.after(0, lambda: self._apply_naver_state(self.naver.state))
+            if not blogger_up:
                 return
             state = self.session.detect()
+            url = state.url or ""
+            signed_out = self.session._on_google_login_page(url)
+            if signed_out:
+                self.session.state = SessionState(url=url, title=state.title)
+                if not getattr(self, "_blogger_signed_out_noted", False):
+                    self.root.after(0, self._on_blogger_signed_out)
+                return
             if not state.logged_in:
                 return
+            self._blogger_signed_out_noted = False
+            account = (state.account or "").strip()
+            if account and account != (self._shown_account or ""):
+                self.root.after(0, lambda found=state: self._apply_state(found))
             current = [
                 (
                     blog.id,
+                    blog.name,
                     blog.address,
                     tuple(str(item.get("url") or "") for item in blog.posts),
                     tuple(sorted(blog.done)),
@@ -3788,7 +5183,7 @@ class BloggerApp:
             ]
             if current and current != self._shown_session_keys:
                 self._shown_session_keys = current
-                self.root.after(0, lambda: self._apply_state(state))
+                self.root.after(0, lambda found=state: self._apply_state(found))
         except Exception:
             pass
         finally:
@@ -3808,9 +5203,6 @@ class BloggerApp:
         self.log("블로그스팟 창이 닫혔습니다. 다시 로그인하면 Chrome 창이 열립니다.")
 
     def _on_naver_closed(self):
-        if self.naver.chrome_running():
-            self.log("서치어드바이저 Chrome이 아직 열려 있어 연결을 유지합니다.")
-            return
         self._naver_login_busy = False
         self._naver_busy = False
         self.naver.close()
@@ -3823,20 +5215,28 @@ class BloggerApp:
         self.log("서치어드바이저 창이 닫혔습니다. 다시 로그인하면 창이 열립니다.")
 
     def _restore_blogger_if_open(self):
-        if self._login_busy or not self.session.chrome_running():
+        if self._login_busy:
             return
+        self._login_busy = True
+        self._set_login_button("인식 중...", enabled=False)
         threading.Thread(target=self._blogger_restore_worker, daemon=True).start()
 
     def _blogger_restore_worker(self):
         try:
-            if not self.session.reattach():
-                return
-            self._merge_blog_meta(self.session.state.blogs)
-            state = self.session.state
-            self.root.after(0, lambda: self._on_logged_in(state))
-            self._catalog_worker()
+            state = self.session.recognize()
+            if state.logged_in:
+                self._merge_blog_meta(state.blogs)
+                self.root.after(0, lambda: self._on_logged_in(state))
+                self._catalog_worker()
+            elif self.session.chrome_running():
+                self.root.after(0, self._on_blogger_signed_out)
+            else:
+                self._login_busy = False
+                self.root.after(0, lambda: self._set_login_button("블로그스팟 로그인", enabled=True))
         except Exception as exc:
             self.log(f"블로그스팟 자동 재연결 실패: {exc}")
+            self._login_busy = False
+            self.root.after(0, lambda: self._set_login_button("블로그스팟 로그인", enabled=True))
 
     def _start_code_watch(self):
         if self._code_watch_started or is_frozen():
@@ -3902,6 +5302,7 @@ class BloggerApp:
             "post_image": self.post_image_var.get() if hasattr(self, "post_image_var") else "",
             "write_count": self.write_count_var.get() if hasattr(self, "write_count_var") else "1",
             "memo": self.memo_var.get() if hasattr(self, "memo_var") else "",
+            "sheet_url": self.sheet_url_var.get() if hasattr(self, "sheet_url_var") else "",
             "log": "",
         }
         box = getattr(self, "log_box", None)
@@ -3950,6 +5351,11 @@ class BloggerApp:
             self.write_count_var.set(str(data.get("write_count") or "1"))
         if "memo" in data and hasattr(self, "memo_var"):
             self.memo_var.set(str(data.get("memo") or ""))
+        if hasattr(self, "sheet_url_var"):
+            url = str(data.get("sheet_url") or "").strip()
+            if not url:
+                url = self._settings_text("sheet_url").strip()
+            self.sheet_url_var.set(url or DEFAULT_SHEET_URL)
         text = data.get("log") or ""
         if text and hasattr(self, "log_box"):
             if ctk:
@@ -3964,7 +5370,7 @@ class BloggerApp:
                 self.log_box.configure(state=tk.DISABLED)
 
     def _clear_input_traces(self) -> None:
-        for name in ("blog_query", "post_query"):
+        for name in ("blog_query", "post_query", "index_query"):
             var = getattr(self, name, None)
             if var is None:
                 continue
@@ -3996,6 +5402,47 @@ class BloggerApp:
                 pass
             self._dash_after = None
         self._clear_input_traces()
+        self._index_row_frames = {}
+        self._index_fp = None
+        self._tab_stacked = False
+        self._tabs_stacked = False
+        self._tab_raise_ready = False
+        self._painted_tab = None
+        paint_job = getattr(self, "_tab_paint_job", None)
+        if paint_job is not None:
+            try:
+                self.root.after_cancel(paint_job)
+            except Exception:
+                pass
+            self._tab_paint_job = None
+        job = getattr(self, "_sheet_sync_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+            self._sheet_sync_job = None
+        job = getattr(self, "_tab_refresh_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+            self._tab_refresh_job = None
+        job = getattr(self, "_write_count_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+            self._write_count_job = None
+        job = getattr(self, "_side_list_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+            self._side_list_job = None
         for child in list(self.root.winfo_children()):
             try:
                 child.destroy()
@@ -4021,6 +5468,11 @@ class BloggerApp:
             snapshot = self._snapshot_inputs()
             import importlib
 
+            importlib.invalidate_caches()
+            import sheet_sync
+            import naver_index_check
+            importlib.reload(sheet_sync)
+            importlib.reload(naver_index_check)
             import blogger_session
             import naver_advisor_session
             import paths
@@ -4044,12 +5496,13 @@ class BloggerApp:
             self._build()
             self._restore_inputs(snapshot)
             self._refresh_dashboard()
-            if self.session.state.logged_in:
+            if self.session.state.logged_in or self.session.chrome_running():
                 self._set_login_button("다시 인식", enabled=True)
+            if self.session.state.logged_in:
                 self._apply_state(self.session.state)
                 self._start_watch()
-            if getattr(self.naver.state, "logged_in", False):
-                self._set_naver_login_button("사이트 수 다시 읽기", enabled=True)
+            if getattr(self.naver.state, "logged_in", False) or self.naver.chrome_running():
+                self._set_naver_login_button("다시 인식", enabled=True)
                 self._apply_naver_state(self.naver.state)
             self.log("코드를 반영했습니다. 프로그램과 로그인은 그대로입니다.")
             self._schedule_text_save()

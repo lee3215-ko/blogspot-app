@@ -57,6 +57,36 @@ def frame(parent, bg=None, **kwargs):
     return tk.Frame(parent, bg=bg)
 
 
+def light_scroll(parent, height: int, bg=None):
+    bg = bg or COLORS["card"]
+    wrap = tk.Frame(parent, bg=bg)
+    canvas = tk.Canvas(wrap, bg=bg, highlightthickness=0, height=height, borderwidth=0)
+    bar = tk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+    inner = tk.Frame(canvas, bg=bg)
+    inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+    window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+    def _fit(event):
+        canvas.itemconfigure(window, width=max(1, event.width))
+
+    canvas.bind("<Configure>", _fit)
+    canvas.configure(yscrollcommand=bar.set)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    bar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _wheel(event, target=wrap, view=canvas):
+        node = target.winfo_containing(event.x_root, event.y_root)
+        while node is not None:
+            if node is target:
+                view.yview_scroll(int(-event.delta / 120), "units")
+                return
+            node = getattr(node, "master", None)
+
+    wrap.bind_all("<MouseWheel>", _wheel, add="+")
+    wrap.inner = inner
+    return wrap
+
+
 def scrollable(parent, height: int, bg=None):
     bg = bg or COLORS["card"]
     if ctk:

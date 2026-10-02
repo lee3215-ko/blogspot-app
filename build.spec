@@ -31,6 +31,8 @@ hiddenimports = [
     "blogger_session",
     "updater",
     "update_ui",
+    "sheet_sync",
+    "naver_index_check",
 ]
 
 for pkg in ("customtkinter", "selenium", "webdriver_manager"):

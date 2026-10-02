@@ -1,9 +1,9 @@
-"""???롪퍔?δ빳????뺢퀗???"""
+"""???濡ろ뜑?灌鍮????類????"""
 import os
 import sys
 
 APP_NAME = "BloggerSpot"
-APP_VERSION = "1.2.12"
+APP_VERSION = "1.2.13"
 UPDATE_VERSION_URL = (
     "https://raw.githubusercontent.com/lee3215-ko/blogspot-app/main/version.json"
 )

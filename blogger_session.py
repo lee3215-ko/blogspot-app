@@ -232,17 +232,14 @@ function visibleEl(el) {
 }
 function openMenus() {
   return [...document.querySelectorAll(".OA0qNb, [role='listbox']")].filter((menu) => {
-    const r = menu.getBoundingClientRect();
-    if (r.height < 80 || r.width < 80) return false;
-    return menu.querySelectorAll('[role="option"]').length >= 2;
+    const rect = menu.getBoundingClientRect();
+    if (rect.width < 80 || rect.height < 40) return false;
+    const visible = [...menu.querySelectorAll('[role="option"]')].filter(visibleEl);
+    return visible.length >= 2;
   });
 }
 function menuOpen() {
-  return openMenus().some((menu) => {
-    return [...menu.querySelectorAll('[role="option"]')].some((el) => {
-      return el.getAttribute("data-value") === "0" || /새 블로그|New blog/.test(el.textContent || "");
-    });
-  });
+  return openMenus().length > 0;
 }
 function closedTrigger() {
   const open = openMenus();
@@ -813,18 +810,17 @@ class BloggerSession:
         return f"https://www.blogger.com{prefix}/blog/{section}/{blog_id}"
 
     def start_incognito(self) -> None:
-        self.start_browser()
+        self.ensure_window()
 
     def start_browser(self) -> None:
+        self.ensure_window()
+
+    def ensure_window(self) -> None:
+        """저장된 프로필의 Chrome을 유지한다. 로그아웃은 하지 않는다."""
         with self._lock:
             if self.driver is not None:
                 try:
                     _ = self.driver.current_url
-                    self.log("이미 열려 있는 블로그스팟 Chrome 창을 앞으로 가져옵니다.")
-                    try:
-                        self.driver.switch_to.window(self.driver.current_window_handle)
-                    except Exception:
-                        pass
                     return
                 except Exception:
                     self.driver = None
@@ -833,9 +829,9 @@ class BloggerSession:
             profile = self.profile_dir()
             self._chrome_user_dir = profile
             if self.chrome_running():
-                self.log("기존 블로그스팟 Chrome에 다시 연결합니다.")
+                self.log("열려 있는 블로그스팟 창에 연결합니다.")
             else:
-                self.log("블로그스팟 Chrome 창을 여는 중...")
+                self.log("저장된 블로그스팟 창을 엽니다. 로그인 상태는 그 창에 남아 있습니다.")
                 cmd = [
                     chrome,
                     f"--remote-debugging-port={BLOGGER_DEBUG_PORT}",
@@ -854,6 +850,7 @@ class BloggerSession:
             options.add_experimental_option("debuggerAddress", f"127.0.0.1:{BLOGGER_DEBUG_PORT}")
             service = Service(ChromeDriverManager().install())
             driver = webdriver.Chrome(service=service, options=options)
+            driver.quit = lambda *args, **kwargs: None
             try:
                 driver.execute_cdp_cmd(
                     "Page.addScriptToEvaluateOnNewDocument",
@@ -864,11 +861,65 @@ class BloggerSession:
             except Exception:
                 pass
             self.driver = driver
-            self.state = SessionState()
 
-        self.log("실제 Chrome 창에 연결했습니다. 직접 로그인해 주세요.")
+    def _on_google_login_page(self, url: str) -> bool:
+        text = url or ""
+        return any(part in text for part in ("ServiceLogin", "/signin", "AccountChooser", "accounts.google.com/v3/signin"))
 
-    def detect(self) -> SessionState:
+    def _show_saved_blogger(self) -> None:
+        """이미 로그인된 탭을 찾는다. 로그인 화면이면 다른 주소로 보내지 않는다."""
+        self._focus_open_window()
+        try:
+            current = self.driver.current_window_handle
+        except Exception:
+            current = ""
+        try:
+            handles = list(self.driver.window_handles)
+        except Exception:
+            handles = []
+        for handle in handles:
+            try:
+                self.driver.switch_to.window(handle)
+                url = self.driver.current_url or ""
+            except Exception:
+                continue
+            if "blogger.com" in url and not self._on_google_login_page(url):
+                return
+        if current:
+            try:
+                self.driver.switch_to.window(current)
+            except Exception:
+                pass
+        try:
+            url = self.driver.current_url or ""
+        except Exception:
+            url = ""
+        if self._on_google_login_page(url):
+            return
+        if "blogger.com" in url:
+            return
+        self.log("저장된 로그인으로 블로그스팟을 엽니다.")
+        self.driver.get(BLOGGER_HOME)
+
+    def recognize(self) -> SessionState:
+        """창을 새로 로그인시키지 않고, 그 창에 있는 계정을 읽는다."""
+        self.ensure_window()
+        self._show_saved_blogger()
+        state = self.detect(fresh=True)
+        for _ in range(8):
+            if state.logged_in or self._on_google_login_page(state.url):
+                break
+            time.sleep(0.45)
+            state = self.detect(fresh=True)
+        if state.logged_in:
+            self.log(f"블로그스팟 계정을 인식했습니다: {state.account or '-'}")
+        else:
+            self.state = SessionState(url=state.url, title=state.title)
+            state = self.state
+            self.log("이 블로그스팟 창에는 로그인된 계정이 없습니다. 창에서 로그인한 뒤 다시 인식을 눌러 주세요.")
+        return state
+
+    def detect(self, fresh: bool = False) -> SessionState:
         if self.driver is None or not self.chrome_running():
             return SessionState()
         if not self._lock.acquire(timeout=0.05):
@@ -876,7 +927,7 @@ class BloggerSession:
         try:
             raw = self.driver.execute_script(_DETECT_JS)
         except WebDriverException:
-            return SessionState()
+            return self.state
         finally:
             try:
                 self._lock.release()
@@ -923,7 +974,7 @@ class BloggerSession:
                     done=set(old.done) if old else set(),
                 )
             )
-        if not blogs and previous:
+        if not blogs and previous and not fresh:
             blogs = [blog for blog in previous.values() if blog.id not in gone]
         state = SessionState(
             account=str((raw or {}).get("account") or ""),
@@ -1914,16 +1965,12 @@ class BloggerSession:
         before = {blog.id for blog in self.state.blogs}
         with self._lock:
             self._ensure_blogger_shell()
-            self._close_open_dialogs()
-            self._open_blog_menu()
-            self._click_new_blog_option()
-            try:
-                dialog = self._wait_dialog("블로그 이름", timeout=8)
-            except Exception:
-                dialog = self._wait_dialog(timeout=8)
+            dialog = self._open_create_dialog()
             self._fill_create_title(dialog, title)
             self._click_create_next(dialog)
+            self._raise_if_create_refused()
             saved_slug = self._complete_create_wizard(title, slug)
+            self._raise_if_create_refused()
             created = self._wait_created_blog(before, title)
             if saved_slug:
                 created["address"] = f"{saved_slug}.blogspot.com"
@@ -1938,8 +1985,35 @@ class BloggerSession:
                 extra += f" · {created.get('id')}"
             self.log(f"블로그를 만들었습니다: {title}{extra}")
         else:
-            self.log(f"블로그 생성 결과를 확인하지 못했습니다: {title}")
+            detail = str(created.get("error") or "블로그 생성 결과를 확인하지 못했습니다")
+            self.log(f"{detail}: {title}")
         return created
+
+    def _create_refused_message(self) -> str:
+        try:
+            text = self.driver.execute_script(
+                """
+                const body = document.body ? (document.body.innerText || "") : "";
+                const needles = [
+                  "블로그를 생성할 수 없습니다",
+                  "블로그를 만들 수 없습니다",
+                  "Couldn't create a blog",
+                  "Can't create a blog",
+                ];
+                for (const needle of needles) {
+                  if (body.includes(needle)) return needle.endsWith(".") ? needle : needle + ".";
+                }
+                return "";
+                """
+            )
+        except Exception:
+            return ""
+        return str(text or "").strip()
+
+    def _raise_if_create_refused(self) -> None:
+        message = self._create_refused_message()
+        if message:
+            raise RuntimeError(message)
 
     def _ensure_blogger_shell(self) -> None:
         self._focus_open_window()
@@ -2047,19 +2121,21 @@ class BloggerSession:
         option = self.driver.execute_script(
             _FIND_BLOG_MENU_JS
             + """
-            const menus = openMenus();
-            let hit = null;
+            const isNew = (el) => /새 블로그|New blog/.test((el.textContent || "").replace(/\\s+/g, " "));
+            const menus = openMenus().sort((a, b) => b.getBoundingClientRect().height - a.getBoundingClientRect().height);
             for (const menu of menus) {
-              hit = menu.querySelector('[role="option"][data-value="0"]');
-              if (!hit) {
-                hit = [...menu.querySelectorAll('[role="option"], [jsname="wQNmvb"]')].find((el) => {
-                  return /새 블로그|New blog/.test((el.textContent || "").replace(/\\s+/g, " "));
-                }) || null;
-              }
+              const hit = [...menu.querySelectorAll('[role="option"], [jsname="wQNmvb"]')].find((el) => {
+                return isNew(el) && el.getBoundingClientRect().height > 8;
+              });
               if (!hit) continue;
-              const scroller = menu;
-              scroller.scrollTop = scroller.scrollHeight;
-              hit.scrollIntoView({block: "nearest"});
+              const box = menu.getBoundingClientRect();
+              let item = hit.getBoundingClientRect();
+              if (item.bottom > box.bottom - 4 || item.top < box.top + 4) {
+                menu.scrollTop += item.top - box.top - 48;
+                item = hit.getBoundingClientRect();
+              }
+              if (!visibleEl(hit)) hit.scrollIntoView({block: "nearest"});
+              if (!visibleEl(hit)) continue;
               return hit;
             }
             return null;
@@ -2068,14 +2144,87 @@ class BloggerSession:
         if option is None:
             raise RuntimeError(f"새 블로그... 항목을 찾지 못했습니다. {self._menu_probe()}")
         self.log("새 블로그... 를 클릭합니다.")
-        self._click_jsaction(option)
-        self._tick(0.25)
+        self._trusted_click(option)
+        self._tick(0.4)
+
+    def _open_create_dialog(self):
+        last_error = "새 블로그 제목 입력란을 찾지 못했습니다."
+        for attempt in range(3):
+            self.control.checkpoint()
+            self._close_open_dialogs()
+            if attempt:
+                self.log("제목 입력란이 보이지 않아 새 블로그 창을 다시 엽니다.")
+                self._tick(0.4)
+            try:
+                self._open_blog_menu()
+                self._click_new_blog_option()
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+            dialog = self._wait_create_title_dialog(timeout=6)
+            if dialog is not None:
+                return dialog
+        raise RuntimeError(last_error)
+
+    def _create_title_input(self):
+        try:
+            return self.driver.execute_script(
+                """
+                function shown(el) {
+                  if (!el) return false;
+                  const rect = el.getBoundingClientRect();
+                  const style = getComputedStyle(el);
+                  if (rect.width < 8 || rect.height < 8) return false;
+                  if (style.visibility === "hidden" || style.display === "none") return false;
+                  if (Number(style.opacity) === 0) return false;
+                  return true;
+                }
+                const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(shown);
+                const selectors = [
+                  'input[aria-label="제목"]',
+                  'input[aria-label="Title"]',
+                  'input[aria-label*="제목"]',
+                  'input[aria-label*="Title"]',
+                ];
+                for (const dialog of dialogs) {
+                  for (const selector of selectors) {
+                    for (const field of dialog.querySelectorAll(selector)) {
+                      if (shown(field)) return field;
+                    }
+                  }
+                  for (const field of dialog.querySelectorAll('input.whsOnd, input[type="text"]')) {
+                    if (shown(field)) return field;
+                  }
+                }
+                return null;
+                """
+            )
+        except Exception:
+            return None
+
+    def _wait_create_title_dialog(self, timeout: float = 6):
+        try:
+            field = self._wait(timeout).until(lambda d: self._create_title_input() or False)
+        except Exception:
+            return None
+        if not field:
+            return None
+        try:
+            dialog = self.driver.execute_script(
+                "return arguments[0].closest('[role=\"dialog\"]') || arguments[0];",
+                field,
+            )
+        except Exception:
+            dialog = None
+        return dialog or self._visible_dialog()
 
     def _fill_create_title(self, dialog, title: str) -> None:
         field = None
         for selector in (
             'input[aria-label="제목"]',
             'input[aria-label="Title"]',
+            'input[aria-label*="제목"]',
+            'input[aria-label*="Title"]',
             "input.whsOnd",
             'input[type="text"]',
         ):
@@ -2088,6 +2237,8 @@ class BloggerSession:
                     continue
             if field is not None:
                 break
+        if field is None:
+            field = self._create_title_input()
         if field is None:
             raise RuntimeError("새 블로그 제목 입력란을 찾지 못했습니다.")
         self._set_text(field, title)
@@ -2378,10 +2529,20 @@ class BloggerSession:
             return False
 
     def _complete_create_wizard(self, title: str, slug: str) -> str:
-        self._wait(15).until(lambda d: self._deep_find("address") is not None)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            self.control.checkpoint()
+            self._raise_if_create_refused()
+            if self._deep_find("address") is not None:
+                break
+            self._tick(0.25)
+        else:
+            self._raise_if_create_refused()
+            raise RuntimeError("블로그 주소 입력란을 찾지 못했습니다.")
         self.log("블로그 주소 입력란을 찾았습니다.")
         for attempt in range(8):
             self.control.checkpoint()
+            self._raise_if_create_refused()
             if not self._address_step_open():
                 dialog = self._visible_dialog()
                 if dialog is not None and self._dialog_visible_input(dialog, "제목") is not None:
@@ -2435,6 +2596,9 @@ class BloggerSession:
     def _wait_created_blog(self, before: set[str], title: str) -> dict:
         new_id = ""
         for _ in range(12):
+            refused = self._create_refused_message()
+            if refused:
+                return {"ok": False, "title": title, "id": "", "error": refused}
             self._tick(0.35)
             state = self.detect()
             after = {blog.id for blog in state.blogs}
@@ -2449,7 +2613,10 @@ class BloggerSession:
             if len(after) > len(before):
                 new_id = next(iter(after - before))
                 break
-        return {"ok": bool(new_id) or self._visible_dialog() is None, "title": title, "id": new_id}
+        refused = self._create_refused_message()
+        if refused:
+            return {"ok": False, "title": title, "id": "", "error": refused}
+        return {"ok": bool(new_id), "title": title, "id": new_id}
 
     def inject_theme_head(self, blog_id: str, snippet: str) -> None:
         if not self.is_alive():
@@ -3178,16 +3345,26 @@ class BloggerSession:
             raise RuntimeError(f"설정 항목을 찾지 못했습니다: {label}")
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         self._tick()
+        self._trusted_click(el)
+
+    def _is_page_chrome_dialog(self, dialog) -> bool:
         try:
-            el.click()
+            label = (dialog.get_attribute("aria-label") or "").strip().lower()
+            if "navigational drawer" in label or "navigation drawer" in label:
+                return True
+            class_name = dialog.get_attribute("class") or ""
+            if "UMrnmb" in class_name:
+                return True
         except Exception:
-            self.driver.execute_script("arguments[0].click();", el)
+            return False
+        return False
 
     def _visible_dialog(self):
         for dialog in self.driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]'):
             try:
-                if dialog.is_displayed():
-                    return dialog
+                if not dialog.is_displayed() or self._is_page_chrome_dialog(dialog):
+                    continue
+                return dialog
             except Exception:
                 continue
         return None
@@ -3196,7 +3373,7 @@ class BloggerSession:
         def found(driver):
             for dialog in driver.find_elements(By.CSS_SELECTOR, '[role="dialog"]'):
                 try:
-                    if not dialog.is_displayed():
+                    if not dialog.is_displayed() or self._is_page_chrome_dialog(dialog):
                         continue
                     if title_hint and title_hint not in (dialog.text or ""):
                         continue
@@ -3387,6 +3564,7 @@ class BloggerSession:
                 options.add_experimental_option("debuggerAddress", f"127.0.0.1:{BLOGGER_DEBUG_PORT}")
                 service = Service(ChromeDriverManager().install())
                 self.driver = webdriver.Chrome(service=service, options=options)
+                self.driver.quit = lambda *args, **kwargs: None
         self.detect()
         if self.state.logged_in:
             self.log("블로그스팟 로그인을 유지한 채로 연결했습니다.")

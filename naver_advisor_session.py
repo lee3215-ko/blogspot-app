@@ -23,7 +23,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
-from blogger_session import RunControl, StopRequested, _find_chrome, _wait_debug_port
+from blogger_session import RunControl, StopRequested, _find_chrome, _release_driver, _wait_debug_port
 from paths import get_data_dir
 
 BOARD = "https://searchadvisor.naver.com/console/board"
@@ -287,6 +287,7 @@ class NaverAdvisorSession:
             options.add_experimental_option("debuggerAddress", f"127.0.0.1:{NAVER_DEBUG_PORT}")
             service = Service(ChromeDriverManager().install())
             self.driver = webdriver.Chrome(service=service, options=options)
+            self.driver.quit = lambda *args, **kwargs: None
             if self._on_advisor_console():
                 self.state.logged_in = True
                 self.state.error = ""
@@ -303,12 +304,6 @@ class NaverAdvisorSession:
     def start_login(self) -> None:
         with self._lock:
             if self.driver is not None and self.is_alive():
-                self.log("이미 열려 있는 서치어드바이저 창을 앞으로 가져옵니다.")
-                try:
-                    self.driver.switch_to.window(self.driver.current_window_handle)
-                    self._goto_board()
-                except Exception:
-                    pass
                 return
 
             chrome = _find_chrome()
@@ -317,7 +312,7 @@ class NaverAdvisorSession:
                 self.log("기존 서치어드바이저 Chrome에 다시 연결합니다.")
                 self._owns_chrome = False
             else:
-                self.log("서치어드바이저 Chrome 창을 여는 중...")
+                self.log("저장된 서치어드바이저 창을 엽니다. 로그인 상태는 그 창에 남아 있습니다.")
                 cmd = [
                     chrome,
                     f"--remote-debugging-port={NAVER_DEBUG_PORT}",
@@ -337,6 +332,7 @@ class NaverAdvisorSession:
             options.add_experimental_option("debuggerAddress", f"127.0.0.1:{NAVER_DEBUG_PORT}")
             service = Service(ChromeDriverManager().install())
             driver = webdriver.Chrome(service=service, options=options)
+            driver.quit = lambda *args, **kwargs: None
             try:
                 driver.execute_cdp_cmd(
                     "Page.addScriptToEvaluateOnNewDocument",
@@ -345,11 +341,8 @@ class NaverAdvisorSession:
             except Exception:
                 pass
             self.driver = driver
-            self.state = NaverState()
 
-        if not self._on_advisor_console():
-            self._goto_board()
-        self.log("서치어드바이저 창에 연결했습니다. 직접 로그인해 주세요.")
+        self._show_saved_advisor()
 
     def wait_until_logged_in(self, poll_sec: float = 1.0, timeout: float | None = None) -> NaverState:
         started = time.time()
@@ -385,11 +378,6 @@ class NaverAdvisorSession:
             on_board = "/console/board" in url
             if not on_board or force_reload:
                 self._goto_board()
-            else:
-                try:
-                    self.driver.refresh()
-                except Exception:
-                    self._goto_board()
             self._tick(1.2)
             self._accept_consent()
             count = 0
@@ -1361,6 +1349,72 @@ class NaverAdvisorSession:
             self._on_progress(step, total, label)
         self.log(f"[{step}/{total}] {label}")
 
+    def ensure_window(self) -> None:
+        """저장된 프로필의 Chrome을 유지한다. 로그아웃은 하지 않는다."""
+        self.start_login()
+
+    def _on_naver_login_page(self, url: str) -> bool:
+        text = url or ""
+        return "nid.naver.com" in text or "oauth2.0/authorize" in text
+
+    def _show_saved_advisor(self) -> None:
+        if self._on_advisor_console():
+            return
+        try:
+            current = self.driver.current_window_handle
+        except Exception:
+            current = ""
+        try:
+            handles = list(self.driver.window_handles)
+        except Exception:
+            handles = []
+        for handle in handles:
+            try:
+                self.driver.switch_to.window(handle)
+            except Exception:
+                continue
+            if self._on_advisor_console():
+                return
+        if current:
+            try:
+                self.driver.switch_to.window(current)
+            except Exception:
+                pass
+        url = self._url()
+        if self._on_naver_login_page(url):
+            return
+        self.log("저장된 로그인으로 서치어드바이저를 엽니다.")
+        self._goto_board()
+
+    def recognize(self) -> NaverState:
+        """창을 새로 로그인시키지 않고, 그 창에 있는 아이디를 읽는다."""
+        self.ensure_window()
+        self._show_saved_advisor()
+        url = self._url()
+        if self._on_naver_login_page(url):
+            self.state.logged_in = False
+            self.state.account = ""
+            self.state.site_count = None
+            self.state.url = url
+            self.log("이 서치어드바이저 창에는 로그인된 아이디가 없습니다. 창에서 로그인한 뒤 다시 인식을 눌러 주세요.")
+            return self.state
+        if not self._on_advisor_console():
+            self.state.logged_in = False
+            self.state.account = ""
+            self.state.url = url
+            self.log("이 서치어드바이저 창에는 로그인된 아이디가 없습니다. 창에서 로그인한 뒤 다시 인식을 눌러 주세요.")
+            return self.state
+        self.state.logged_in = True
+        self.state.error = ""
+        self.read_account()
+        try:
+            self.count_sites(force_reload=False)
+        except Exception:
+            pass
+        account = self.state.account or "-"
+        self.log(f"서치어드바이저 아이디를 인식했습니다: {account}")
+        return self.state
+
     def close(self, kill_chrome: bool = False) -> None:
         with self._lock:
             driver = self.driver
@@ -1368,12 +1422,7 @@ class NaverAdvisorSession:
             self.state = NaverState()
             proc = self._chrome_proc
             self._chrome_proc = None
-        if driver is not None:
-            try:
-                if kill_chrome or not _debug_port_open(NAVER_DEBUG_PORT):
-                    driver.quit()
-            except Exception:
-                pass
+        _release_driver(driver, kill_browser=kill_chrome)
         if kill_chrome and proc is not None:
             try:
                 proc.terminate()
@@ -1383,4 +1432,6 @@ class NaverAdvisorSession:
                     proc.kill()
                 except Exception:
                     pass
-        self.log("서치어드바이저 연결을 종료했습니다. Chrome 프로필은 유지됩니다.")
+            self.log("서치어드바이저 브라우저를 종료했습니다. Chrome 프로필은 유지됩니다.")
+        elif _debug_port_open(NAVER_DEBUG_PORT):
+            self.log("서치어드바이저 연결만 끊습니다. Chrome 로그인은 그대로 둡니다.")
