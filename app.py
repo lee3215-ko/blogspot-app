@@ -12,7 +12,7 @@ import time
 import tkinter as tk
 import webbrowser
 from datetime import datetime, timedelta
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from blogger_session import (
     SETTING_ITEMS,
@@ -26,12 +26,15 @@ from blogger_session import (
     normalize_post_url,
     insert_meta_under_head,
     normalize_posts,
+    posts_for_address,
 )
+import home_records as hr
 from naver_advisor_session import NaverAdvisorSession, OwnershipPending
 from naver_index_check import DEFAULT_DELAY_SEC, check_naver_index
 from paths import APP_VERSION, data_path, get_app_dir, is_frozen
 from sheet_sync import (
     DEFAULT_SHEET_URL,
+    HEADERS,
     RECORD_FIELDS,
     STATUS_OPTIONS,
     index_status_label,
@@ -42,7 +45,22 @@ from sheet_sync import (
     sheet_tab_url,
     spreadsheet_id,
 )
-from ui_theme import COLORS, FONTS, HoverPopup, button, card, frame, label, light_scroll, pill, scrollable
+from ui_theme import (
+    COLORS,
+    FONTS,
+    HoverPopup,
+    button,
+    card,
+    flat_button,
+    frame,
+    install_wheel_dispatch,
+    label,
+    light_scroll,
+    pill,
+    scrollable,
+    set_pill_tone,
+    tk_pill,
+)
 
 try:
     import customtkinter as ctk
@@ -50,7 +68,10 @@ except ImportError:
     ctk = None
 
 IMAGE_EXTS = {".ico", ".jpg", ".jpeg", ".gif", ".png", ".bmp", ".tif", ".tiff", ".webp"}
-PROGRAM_STATUSES = {"생성만", "설정완료", "수집요청", "재수집요청"}
+# 기록 표에서 구글 이메일별로 줄 배경을 나누는 색. 이메일 탭도 같은 색을 쓴다.
+RECORD_EMAIL_PALETTE = ("#eef2ff", "#ecfdf5", "#fff7ed", "#f0f9ff", "#fdf4ff", "#fef2f2", "#f7fee7", "#ecfeff")
+RECORD_NO_EMAIL = hr.NO_EMAIL
+HOME_STATE_FILE = "home_records.json"
 SETTINGS_DONE_KEYS = {"description", "search_desc", "timezone", "robots", "headers"}
 SETTINGS_FILE = "settings.json"
 PROGRESS_FILE = "blog_progress.json"
@@ -58,6 +79,20 @@ BLOG_META_FILE = "blog_meta.json"
 LOG_FILE = "app.log"
 _LOG_MAX = 1_500_000
 SETUP_KEYS = tuple(key for key, _name in SETTING_ITEMS if key not in {"collect", "collect_post"})
+SETTINGS_APPLY_KEYS = ("description", "search_desc", "timezone", "robots", "headers")
+FIRST_COLLECT_KEYS = ("naver_verify", "theme_head", "crawl_fast", "naver_robots", "sitemap", "collect", "collect_post")
+SETTING_NAME = {key: name for key, name in SETTING_ITEMS}
+RECORD_VIEW_COLS = (
+    ("blog", "블로그", 160),
+    ("created", "생성일", 72),
+    ("keyword", "키워드", 90),
+    ("settings", "설정적용", 210),
+    ("collect", "최초수집", 230),
+    ("index", "색인확인", 150),
+    ("shown", "노출", 130),
+    ("recrawl", "재수집", 90),
+    ("note", "메모", 240),
+)
 BLOG_FILTERS = (
     ("all", "전체"),
     ("blog_pending", "블로그 미수집"),
@@ -88,14 +123,13 @@ class BloggerApp:
         self._catalog_running = False
         self._watch_id = None
         self._watch_detect_running = False
-        self._dash_after = None
+        self._after_jobs: dict[str, str] = {}
         self.blog_var = tk.StringVar(value="")
         self.favicon_var = tk.StringVar(value="")
         self.manuscript_var = tk.StringVar(value="")
         self.post_image_var = tk.StringVar(value="")
         self.blog_folder_var = tk.StringVar(value=os.path.join(get_app_dir(), "블로그"))
         self.write_count_var = tk.StringVar(value="1")
-        self.write_count_var.trace_add("write", lambda *_: self._refresh_write_count())
         self._blog_buttons: list = []
         self._blog_check_vars: dict[str, tk.BooleanVar] = {}
         self._blog_row_frames: dict[str, object] = {}
@@ -104,7 +138,6 @@ class BloggerApp:
         self._shown_session_keys: list[tuple] = []
         self._dashboard_fp = None
         self._refreshing = False
-        self._query_after = None
         self._blog_filter = "all"
         self.blog_query = tk.StringVar(value="")
         self._run_control = RunControl()
@@ -119,7 +152,6 @@ class BloggerApp:
         self._code_reload_pending = False
         self._reloading = False
         self._text_cache: dict[str, str] = {}
-        self._text_save_job = None
         self._html_codes: list[dict] = [{"name": "A코드", "html": ""}]
         self._html_code_index = 0
         self.memo_var = tk.StringVar(value="")
@@ -129,18 +161,21 @@ class BloggerApp:
         self._sheet_sync_new: set[str] = set()
         self._sheet_sync_drop: set[str] = set()
         self._sheet_sync_reason = ""
-        self._sheet_sync_job = None
         self._sheet_sync_again = False
-        self._record_vars: dict[str, dict[str, tk.StringVar]] = {}
-        self._record_row_frames: dict[str, object] = {}
         self._records_rendering = False
         self._record_fp: tuple | None = None
-        self._meta_save_job = None
+        self._record_editor: dict | None = None
+        self._record_sort: tuple[str, bool] | None = None
+        self._record_click_col = 0
+        self._record_mode = "main"
+        self._home_state: dict = {"email_order": [], "program_order": {}, "program_order_time": {}, "events": []}
         self._memo_parts = ["", "", "", ""]
         self._index_labels: list = []
+        self._blog_index_btns: list = []
 
         self._build()
         self._load_local_settings()
+        self._bind_copy_shortcuts()
         self._refresh_dashboard()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(80, self._fit_window)
@@ -155,7 +190,6 @@ class BloggerApp:
             self.post_image_var = tk.StringVar(value="")
         if not hasattr(self, "write_count_var"):
             self.write_count_var = tk.StringVar(value="1")
-            self.write_count_var.trace_add("write", lambda *_: self._refresh_write_count())
         if not hasattr(self, "blog_folder_var"):
             self.blog_folder_var = tk.StringVar(value=os.path.join(get_app_dir(), "블로그"))
         if self.manuscript_var.get().strip() or self.post_image_var.get().strip():
@@ -176,9 +210,63 @@ class BloggerApp:
             saved_count = str(data.get("write_count") or "").strip()
             self.write_count_var.set(saved_count if saved_count.isdigit() else "1")
 
+    # ----- 타이머 / 이벤트 뼈대 -------------------------------------------------
+    # 디바운스용 after는 전부 이름을 붙여 여기로 모은다. 화면을 다시 만들 때 한 번에 취소할 수 있고,
+    # 같은 이름을 다시 걸면 이전 것이 자동으로 취소되므로 중복 실행이 생기지 않는다.
+
+    def _after_once(self, key: str, ms: int, fn) -> None:
+        jobs = self.__dict__.setdefault("_after_jobs", {})
+        old = jobs.pop(key, None)
+        if old is not None:
+            try:
+                self.root.after_cancel(old)
+            except Exception:
+                pass
+
+        def run():
+            jobs.pop(key, None)
+            fn()
+
+        try:
+            jobs[key] = self.root.after(max(0, int(ms)), run)
+        except Exception:
+            pass
+
+    def _cancel_after(self, key: str) -> None:
+        jobs = self.__dict__.setdefault("_after_jobs", {})
+        old = jobs.pop(key, None)
+        if old is not None:
+            try:
+                self.root.after_cancel(old)
+            except Exception:
+                pass
+
+    def _cancel_all_afters(self) -> None:
+        jobs = self.__dict__.setdefault("_after_jobs", {})
+        for key in list(jobs):
+            self._cancel_after(key)
+
+    def _trace_var(self, var, fn) -> None:
+        """우리가 건 추적만 기록해 둔다. CTkEntry가 textvariable에 거는 내부 추적은 건드리지 않는다."""
+        ids = self.__dict__.setdefault("_var_trace_ids", [])
+        try:
+            ids.append((var, var.trace_add("write", fn)))
+        except Exception:
+            pass
+
+    def _bind_var_traces(self) -> None:
+        """StringVar는 화면을 다시 만들어도 살아 있으므로, 우리 추적은 지우고 다시 건다."""
+        self._clear_input_traces()
+        self._trace_var(self.memo_var, lambda *_: self._schedule_memo_refresh())
+        self._trace_var(self.write_count_var, lambda *_: self._schedule_write_count())
+        self._trace_var(self.blog_query, self._on_blog_query_changed)
+        self._trace_var(self.post_query, self._on_post_query_changed)
+
     def _build(self):
         self._install_centered_dialogs()
         self._ensure_write_folders()
+        install_wheel_dispatch(self.root, on_wheel=self._hover.hide)
+        self._bind_var_traces()
         shell = frame(self.root, COLORS["bg"])
         shell.pack(fill=tk.BOTH, expand=True, padx=20, pady=16)
         self._outer = shell
@@ -219,7 +307,6 @@ class BloggerApp:
             )
             btn.pack(side=tk.LEFT, padx=(0, 4))
             self._memo_copy_btns.append(btn)
-        self.memo_var.trace_add("write", lambda *_: self._schedule_memo_refresh())
         self.status_label = label(title_wrap, "로그인 전", "body_bold", COLORS["text"])
         self.status_label.pack(anchor="w", pady=(2, 0))
         self.account_label = label(title_wrap, "계정: -", "body", COLORS["text_muted"])
@@ -361,7 +448,6 @@ class BloggerApp:
         else:
             self.blog_search = tk.Entry(blog_inner, textvariable=self.blog_query, font=FONTS["body"])
         self.blog_search.pack(fill=tk.X, pady=(8, 0))
-        self.blog_query.trace_add("write", self._on_blog_query_changed)
 
         filter_wrap = frame(blog_inner, COLORS["card"])
         filter_wrap.pack(fill=tk.X, pady=(8, 0))
@@ -414,14 +500,20 @@ class BloggerApp:
             height=28,
             command=self.on_delete_blogs,
         )
-        self.blog_delete_btn.pack(side=tk.LEFT)
+        self.blog_delete_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.blog_records_btn = button(
+            tool_wrap,
+            "기록보기",
+            variant="ghost",
+            width=84,
+            height=28,
+            command=self.on_open_record_view,
+        )
+        self.blog_records_btn.pack(side=tk.RIGHT)
 
         self.blog_list = scrollable(blog_inner, height=420, bg=COLORS["card"])
         self.blog_list.pack(fill=tk.BOTH, expand=True)
-        for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            self.blog_list.bind(event, lambda _e: self._hover.hide(), add="+")
-        host = getattr(self.blog_list, "inner", self.blog_list)
-        self._blog_list_inner = frame(host, COLORS["card"])
+        self._blog_list_inner = tk.Frame(self.blog_list.inner, bg=COLORS["card"])
         self._blog_list_inner.pack(fill=tk.X)
 
         right_card = card(body)
@@ -453,12 +545,10 @@ class BloggerApp:
         else:
             self.post_search = tk.Entry(right, textvariable=self.post_query, font=FONTS["body"])
         self.post_search.pack(fill=tk.X, pady=(8, 0))
-        self.post_query.trace_add("write", self._on_post_query_changed)
 
         self.posts_list = scrollable(right, height=420, bg=COLORS["card"])
         self.posts_list.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        posts_host = getattr(self.posts_list, "inner", self.posts_list)
-        self.blog_detail_wrap = frame(posts_host, COLORS["card"])
+        self.blog_detail_wrap = tk.Frame(self.posts_list.inner, bg=COLORS["card"])
         self.blog_detail_wrap.pack(fill=tk.X)
 
         setup_page = frame(self.tab_body, COLORS["bg"])
@@ -467,7 +557,7 @@ class BloggerApp:
         setup_card.pack(fill=tk.BOTH, expand=True)
         setup_scroll = scrollable(setup_card, 420, COLORS["card"])
         setup_scroll.pack(fill=tk.BOTH, expand=True)
-        setup_inner = setup_scroll if ctk else setup_scroll.inner
+        setup_inner = setup_scroll.inner
         label(setup_inner, "블로그 생성", "heading", COLORS["text"]).pack(anchor="w", padx=16, pady=(16, 0))
         label(
             setup_inner,
@@ -561,7 +651,7 @@ class BloggerApp:
         label(html_inner, "HTML 편집", "heading", COLORS["text"]).pack(anchor="w")
         label(
             html_inner,
-            "코드를 여러 개 저장할 수 있습니다. 탭을 더블클릭하면 이름을 바꿀 수 있고, 바꾼 이름은 블로그 기록과 시트에도 반영됩니다. 선택한 코드만 네이버 최초 HTML 코드 넣기에 사용합니다.",
+            "코드를 여러 개 저장할 수 있습니다. 탭을 더블클릭하면 이름을 바꿀 수 있고, 바꾼 이름은 블로그 기록에도 반영됩니다. 선택한 코드만 네이버 최초 HTML 코드 넣기에 사용합니다.",
             "body",
             COLORS["text_muted"],
             wraplength=720,
@@ -577,17 +667,7 @@ class BloggerApp:
             code_bar, "코드 추가", variant="primary", width=100, height=36, command=self.on_add_html_code,
         )
         self.html_add_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        if ctk:
-            self.html_code_list = ctk.CTkScrollableFrame(
-                code_bar,
-                orientation="horizontal",
-                height=44,
-                fg_color=COLORS["card"],
-                corner_radius=0,
-                border_width=0,
-            )
-        else:
-            self.html_code_list = frame(code_bar, COLORS["card"])
+        self.html_code_list = scrollable(code_bar, 44, COLORS["card"], orientation="horizontal")
         self.html_code_list.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
         if not isinstance(getattr(self, "_html_codes", None), list) or not self._html_codes:
             self._html_codes = [{"name": "A코드", "html": ""}]
@@ -630,8 +710,12 @@ class BloggerApp:
         self._build_index_page()
         self._show_main_tab("블로그")
         self._fit_window()
-        self.root.after(350, self._warm_hidden_lists)
-        self.root.bind("<Configure>", self._on_root_configured, add="+")
+        self._bind_copy_shortcuts()
+        try:
+            self.root.unbind("<Configure>")
+        except Exception:
+            pass
+        self.root.bind("<Configure>", self._on_root_configured)
         self.root.after(200, self._install_drag_hook)
 
     def _on_root_configured(self, event) -> None:
@@ -857,7 +941,7 @@ class BloggerApp:
         else:
             self.index_search = tk.Entry(inner, textvariable=self.index_query, font=FONTS["body"])
         self.index_search.pack(fill=tk.X, pady=(8, 0))
-        self.index_query.trace_add("write", self._on_index_query_changed)
+        self._trace_var(self.index_query, self._on_index_query_changed)
         actions = frame(inner, COLORS["card"])
         actions.pack(fill=tk.X, pady=(8, 0))
         self.index_check_btn = button(
@@ -898,6 +982,12 @@ class BloggerApp:
         ):
             if self._widget_alive(widget):
                 widget.configure(state="normal" if enabled else "disabled")
+        for widget in list(getattr(self, "_blog_index_btns", []) or []):
+            if self._widget_alive(widget):
+                try:
+                    widget.configure(state="disabled" if running else "normal")
+                except Exception:
+                    pass
 
     def _index_fingerprint(self, blogs: list[BlogInfo]) -> tuple:
         rows = []
@@ -952,13 +1042,7 @@ class BloggerApp:
         self._render_index_rows(blogs)
 
     def _on_index_query_changed(self, *_args) -> None:
-        after_id = getattr(self, "_index_query_after", None)
-        if after_id is not None:
-            try:
-                self.root.after_cancel(after_id)
-            except Exception:
-                pass
-        self._index_query_after = self.root.after(120, self._apply_index_visibility)
+        self._after_once("index_query", 120, self._apply_index_visibility)
 
     def _index_search_text(self, blog: BlogInfo) -> str:
         status, _tone, extra = self._index_status_view(blog)
@@ -971,7 +1055,6 @@ class BloggerApp:
         return query in text
 
     def _apply_index_visibility(self) -> None:
-        self._index_query_after = None
         rows = getattr(self, "_index_row_frames", None) or {}
         listed = getattr(self, "_listed_index_blogs", None) or []
         if not rows or not listed:
@@ -1021,21 +1104,9 @@ class BloggerApp:
 
     def _paint_index_status(self, row, blog: BlogInfo) -> None:
         status, tone, extra = self._index_status_view(blog)
-        tones = {
-            "ok": (COLORS["success"], COLORS["ok_bg"]),
-            "wait": ("#b45309", COLORS["wait_bg"]),
-            "off": (COLORS["text_muted"], COLORS["chip_bg"]),
-        }
-        fg, bg = tones.get(tone, tones["off"])
         pill_widget = getattr(row, "_status_pill", None)
         if self._widget_alive(pill_widget):
-            try:
-                pill_widget.configure(text=status, text_color=fg, fg_color=bg)
-            except Exception:
-                try:
-                    pill_widget.configure(text=status, fg=fg, bg=bg)
-                except Exception:
-                    pass
+            set_pill_tone(pill_widget, text=status, tone=tone)
         extra_widget = getattr(row, "_extra_label", None)
         if self._widget_alive(extra_widget):
             extra_widget.configure(text=extra)
@@ -1059,20 +1130,45 @@ class BloggerApp:
             opener.bind("<Double-Button-1>", lambda event, url=sample: self._open_index_sample(event, url))
             row._sample_url = sample
 
+    def _paint_blog_index_chip(self, row, blog: BlogInfo) -> None:
+        status, tone, extra = self._index_status_view(blog)
+        pill_widget = getattr(row, "_index_status_pill", None)
+        if self._widget_alive(pill_widget):
+            set_pill_tone(pill_widget, text=status, tone=tone)
+        extra_widget = getattr(row, "_index_extra_label", None)
+        if self._widget_alive(extra_widget):
+            extra_widget.configure(text=extra)
+            try:
+                if extra:
+                    extra_widget.pack(side=tk.LEFT, padx=(4, 0))
+                else:
+                    extra_widget.pack_forget()
+            except Exception:
+                pass
+
     def _sync_index_row(self, blog_id: str) -> None:
         blog = next((item for item in self._dashboard_blogs() if item.id == blog_id), None)
         row = (getattr(self, "_index_row_frames", {}) or {}).get(blog_id)
-        if blog is None or not self._widget_alive(row):
+        if blog is not None and self._widget_alive(row):
+            self._paint_index_status(row, blog)
+            blog._index_search_text = self._index_search_text(blog)
+            listed = getattr(self, "_listed_index_blogs", None) or []
+            self._apply_index_visibility()
+            self._update_index_summary(listed)
+            self._index_fp = self._index_fingerprint(self._dashboard_blogs())
+        else:
             self._index_fp = None
             if getattr(self, "_main_tab", "") == "색인 확인":
                 self._refresh_index_tab(force=True)
-            return
-        self._paint_index_status(row, blog)
-        blog._index_search_text = self._index_search_text(blog)
-        listed = getattr(self, "_listed_index_blogs", None) or []
-        self._apply_index_visibility()
-        self._update_index_summary(listed)
-        self._index_fp = self._index_fingerprint(self._dashboard_blogs())
+        blog_row = (getattr(self, "_blog_row_frames", {}) or {}).get(blog_id)
+        if blog is not None and self._widget_alive(blog_row):
+            self._paint_blog_index_chip(blog_row, blog)
+        # 색인 확인 결과를 기록 상태로 확정 (시트 API 'check'와 같다)
+        try:
+            self._record_index_result(blog_id)
+        except Exception as exc:
+            self.log(f"기록 반영 오류: {_exc_text(exc)}")
+        self._refresh_record_tree_item(blog_id)
 
     def _render_index_rows(self, blogs: list[BlogInfo]) -> None:
         host = getattr(self, "_index_list_inner", None)
@@ -1119,14 +1215,7 @@ class BloggerApp:
         name.pack(side=tk.LEFT, padx=(6, 8))
         self._bind_row_focus(name, blog.id)
         status, tone, extra = self._index_status_view(blog)
-        status_fg, status_bg = {
-            "ok": (COLORS["success"], COLORS["ok_bg"]),
-            "wait": ("#b45309", COLORS["wait_bg"]),
-            "off": (COLORS["text_muted"], COLORS["chip_bg"]),
-        }.get(tone, (COLORS["text_muted"], COLORS["chip_bg"]))
-        status_pill = tk.Label(
-            top, text=status, font=FONTS["small"], fg=status_fg, bg=status_bg, padx=8, pady=2,
-        )
+        status_pill = tk_pill(top, status, tone)
         status_pill.pack(side=tk.LEFT, padx=(0, 6))
         self._bind_row_focus(status_pill, blog.id)
         extra_label = tk.Label(top, text=extra, font=FONTS["small"], fg=COLORS["text_muted"], bg=bg)
@@ -1189,11 +1278,25 @@ class BloggerApp:
             else:
                 self._set_index_progress("확인할 주소가 있는 블로그가 없습니다.")
             return
+        scope = "선택한" if selected else ("검색된" if query else "등록된")
+        self._start_index_check(ready, skipped, f"{scope} 블로그 {len(ready)}개 확인을 시작합니다.")
+
+    def on_blog_row_index_check(self, blog_id: str) -> None:
+        if getattr(self, "_index_busy", False):
+            return
+        blog = next((item for item in self._dashboard_blogs() if item.id == blog_id), None)
+        if blog is None or not (blog.address or "").strip():
+            self.log("색인 확인할 주소가 없습니다.")
+            return
+        self._select_blog(blog_id)
+        name = blog.name or blog.address or blog.id
+        self._start_index_check([blog], 0, f"{name} 색인 확인을 시작합니다.")
+
+    def _start_index_check(self, ready: list[BlogInfo], skipped: int, progress: str) -> None:
         self._index_busy = True
         self._index_stop = threading.Event()
         self._set_index_buttons(True)
-        scope = "선택한" if selected else ("검색된" if query else "등록된")
-        self._set_index_progress(f"{scope} 블로그 {len(ready)}개 확인을 시작합니다.")
+        self._set_index_progress(progress)
         threading.Thread(
             target=self._index_check_worker,
             args=(ready, skipped),
@@ -1266,68 +1369,301 @@ class BloggerApp:
         self._main_pages["기록"] = page
         card_wrap = card(page)
         card_wrap.pack(fill=tk.BOTH, expand=True)
-        inner = frame(card_wrap, COLORS["card"])
-        inner.pack(fill=tk.BOTH, expand=True, padx=16, pady=14)
-        label(inner, "기록 시트", "heading", COLORS["text"]).pack(anchor="w")
-        label(
-            inner,
-            "블로그마다 한 줄로 정리합니다. 구글 이메일은 로그인한 계정이 들어가고, 제목·주소·글·수집·색인 아이디도 프로그램이 채웁니다. 핵심키워드, 검색결과, 노출, 한줄 메모는 직접 입력합니다.",
-            "body",
-            COLORS["text_muted"],
-            wraplength=980,
-            justify="left",
-        ).pack(anchor="w", pady=(4, 8))
-        if ctk:
-            self.sheet_url_entry = ctk.CTkEntry(
-                inner,
-                textvariable=self.sheet_url_var,
-                height=36,
+        inner = tk.Frame(card_wrap, bg=COLORS["card"])
+        inner.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
+
+        # 제목 줄: 왼쪽 제목, 오른쪽 개수
+        title_row = tk.Frame(inner, bg=COLORS["card"])
+        title_row.pack(fill=tk.X)
+        tk.Label(title_row, text="기록", font=FONTS["heading"], fg=COLORS["text"], bg=COLORS["card"]).pack(side=tk.LEFT)
+        self._record_count_label = tk.Label(title_row, text="", font=FONTS["small"], fg=COLORS["text_muted"], bg=COLORS["card"])
+        self._record_count_label.pack(side=tk.RIGHT)
+
+        # 이메일 탭: 구글 이메일별로 묶어서 본다. 줄이 넘치면 다음 줄로 접힌다.
+        self._record_tab_host = tk.Frame(inner, bg=COLORS["card"])
+        self._record_tab_host.pack(fill=tk.X, pady=(6, 2))
+        self._record_tab_host.bind("<Configure>", lambda _e: self._after_once("record_tabs_reflow", 30, self._reflow_record_tabs))
+        self._record_tab_btns: dict[str, tk.Label] = {}
+        self._record_tab_sig: tuple = ()
+        if not hasattr(self, "_record_email_filter"):
+            self._record_email_filter = ""
+
+        # 찾기 줄
+        tools = tk.Frame(inner, bg=COLORS["card"])
+        tools.pack(fill=tk.X, pady=(2, 6))
+        tk.Label(tools, text="찾기", font=FONTS["small_bold"], fg=COLORS["text_muted"], bg=COLORS["card"]).pack(side=tk.LEFT)
+        if not hasattr(self, "record_query"):
+            self.record_query = tk.StringVar(value="")
+        self._trace_var(self.record_query, self._on_record_query_changed)
+        search = tk.Entry(
+            tools, textvariable=self.record_query, font=FONTS["body"], width=28,
+            bg=COLORS["input_bg"], fg=COLORS["text"], relief="flat",
+            highlightthickness=1, highlightbackground=COLORS["border"], highlightcolor=COLORS["accent"],
+        )
+        search.pack(side=tk.LEFT, padx=(6, 6), ipady=3)
+        flat_button(tools, "지우기", variant="ghost", command=lambda: self.record_query.set("")).pack(side=tk.LEFT)
+        self._record_log_btn = flat_button(tools, "변경 로그", variant="ghost", command=self._toggle_record_log)
+        self._record_log_btn.pack(side=tk.RIGHT)
+        flat_button(tools, "계정상태 동기화", variant="ghost", command=self.on_home_sync_accounts).pack(side=tk.RIGHT, padx=(0, 6))
+        flat_button(tools, "본표 정렬", variant="ghost", command=self.on_home_sort).pack(side=tk.RIGHT, padx=(0, 6))
+        tk.Label(
+            tools, text="상태: " + " · ".join(hr.STATUS_LIST), font=FONTS["caption"],
+            fg=COLORS["text_light"], bg=COLORS["card"],
+        ).pack(side=tk.RIGHT, padx=(0, 10))
+
+        fold_row = tk.Frame(inner, bg=COLORS["card"])
+        fold_row.pack(fill=tk.X, pady=(0, 4))
+        self._record_fold_host = fold_row
+        self._record_status_fold_btn = flat_button(fold_row, "현재상태 요약 ▸", variant="ghost", command=lambda: self._toggle_record_fold("status"))
+        self._record_status_fold_btn.pack(side=tk.LEFT)
+        self._record_flow_fold_btn = flat_button(fold_row, "처음수집~전체흐름 ▸", variant="ghost", command=lambda: self._toggle_record_fold("flow"))
+        self._record_flow_fold_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        wrap = tk.Frame(inner, bg=COLORS["card"])
+        wrap.pack(fill=tk.BOTH, expand=True)
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
+        style = ttk.Style(wrap)
+        try:
+            style.configure(
+                "Record.Treeview",
                 font=FONTS["body"],
-                fg_color=COLORS["input_bg"],
-                border_color=COLORS["border"],
-                text_color=COLORS["text"],
-                placeholder_text="구글 스프레드시트 주소",
+                rowheight=28,
+                background=COLORS["card"],
+                fieldbackground=COLORS["card"],
+                foreground=COLORS["text"],
+                borderwidth=0,
             )
-        else:
-            self.sheet_url_entry = tk.Entry(inner, textvariable=self.sheet_url_var, font=FONTS["body"])
-        self.sheet_url_entry.pack(fill=tk.X)
-        actions = frame(inner, COLORS["card"])
-        actions.pack(fill=tk.X, pady=(8, 0))
-        actions_more = frame(inner, COLORS["card"])
-        actions_more.pack(fill=tk.X)
-        for host, items in (
-            (
-                actions,
-                (
-                    ("이 시트 사용", "primary", 110, self.on_sheet_create),
-                    ("주소 저장", "ghost", 90, self.on_sheet_save_url),
-                    ("시트 열기", "ghost", 90, self.on_sheet_open),
-                    ("가져오기", "ghost", 90, self.on_sheet_pull),
-                    ("올리기", "success", 90, self.on_sheet_push),
-                ),
-            ),
-            (
-                actions_more,
-                (("선택에 메모 이메일", "ghost", 160, self.on_sheet_apply_memo_email),),
-            ),
+            style.configure("Record.Treeview.Heading", font=FONTS["small_bold"], padding=(6, 4))
+            style.map("Record.Treeview", background=[("selected", "#c7d2fe")], foreground=[("selected", COLORS["text"])])
+        except Exception:
+            pass
+        tree = ttk.Treeview(
+            wrap,
+            columns=list(hr.HOME_HEADERS),
+            show="headings",
+            selectmode="browse",
+            style="Record.Treeview",
+        )
+        self._record_tree = tree
+        self._record_mode = "main"
+        self._apply_record_columns(hr.HOME_HEADERS)
+        ybar = tk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+        xbar = tk.Scrollbar(wrap, orient="horizontal", command=tree.xview)
+
+        def on_yscroll(first, last):
+            ybar.set(first, last)
+            self._reposition_record_editor()
+
+        def on_xscroll(first, last):
+            xbar.set(first, last)
+            self._reposition_record_editor()
+
+        tree.configure(yscrollcommand=on_yscroll, xscrollcommand=on_xscroll)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+        for index, color in enumerate(RECORD_EMAIL_PALETTE):
+            tree.tag_configure(f"email{index}", background=color)
+        # 시트 조건부서식: 노출됨·잘림·삭제됨은 행 전체를 칠한다
+        for state, (bg, fg) in hr.ROW_HIGHLIGHT.items():
+            options = {"background": bg}
+            if fg:
+                options["foreground"] = fg
+            tree.tag_configure(f"st_{state}", **options)
+        # 묶음 경계: 이메일이 바뀌면 굵은 줄, 같은 이메일에서 키워드가 바뀌면 중간 줄
+        tree.tag_configure("grp_email", background="#1f2937", foreground="#ffffff", font=FONTS["small_bold"])
+        tree.tag_configure("grp_keyword", background="#e5e7eb", foreground="#374151", font=FONTS["small_bold"])
+        tree.tag_configure("log_row", background=COLORS["card"])
+        tree.bind("<<TreeviewSelect>>", self._on_record_tree_select)
+        tree.bind("<Button-1>", self._on_record_tree_click)
+        tree.bind("<Button-3>", self._on_record_tree_menu)
+        tree.bind("<Double-1>", self._on_record_tree_double)
+        tree.bind("<Return>", self._on_record_tree_enter)
+        tree.bind("<F2>", self._on_record_tree_enter)
+        tree.bind("<space>", self._on_record_tree_space)
+        tree.bind("<Configure>", lambda _e: self._reposition_record_editor())
+
+        self._record_menu = tk.Menu(tree, tearoff=0, font=FONTS["small"])
+        for item in (
+            ("확인 결과 기록 · 오늘확인", lambda: self._menu_record_action("check")),
+            ("재수집요청 기록", lambda: self._menu_record_action("recrawl")),
+            ("삭제됨 기록", lambda: self._menu_record_action("deleted")),
+            ("완전 삭제 · 삭제됨 행만", lambda: self._menu_record_action("purge")),
+            None,
+            ("계정상태 동기화", self.on_home_sync_accounts),
         ):
-            for title, variant, width, command in items:
-                button(host, title, variant=variant, width=width, height=32, command=command).pack(
-                    side=tk.LEFT, padx=(0, 6), pady=(0, 4)
-                )
-        label(
+            if item is None:
+                self._record_menu.add_separator()
+            else:
+                self._record_menu.add_command(label=item[0], command=item[1])
+
+        self._record_detail_label = tk.Label(
             inner,
-            "상태: " + " · ".join(STATUS_OPTIONS),
-            "small",
-            COLORS["text_muted"],
-            wraplength=980,
+            text="탭으로 이메일을 고릅니다. 핵심키워드 옆에 계정 생성상태가 바로 붙습니다. 현재상태 요약·처음수집~전체흐름은 접고 펼 수 있습니다. 현재상태를 고른 뒤 오늘확인을 체크해야 확정됩니다. Space=오늘확인 · 우클릭=재수집요청/삭제됨 · 본표 정렬=시트 순서로 되돌리기",
+            font=FONTS["small"],
+            fg=COLORS["text_muted"],
+            bg=COLORS["card"],
+            anchor="w",
             justify="left",
-        ).pack(anchor="w", pady=(4, 6))
-        self.records_list = light_scroll(inner, height=420, bg=COLORS["card"])
-        self.records_list.pack(fill=tk.BOTH, expand=True)
-        host = getattr(self.records_list, "inner", self.records_list)
-        self._record_list_inner = tk.Frame(host, bg=COLORS["card"])
-        self._record_list_inner.pack(fill=tk.X)
+            wraplength=980,
+        )
+        self._record_detail_label.pack(fill=tk.X, pady=(6, 0))
+        self.records_list = wrap
+        self._record_list_inner = wrap
+        self._record_editor = None
+        self._record_all_iids = []
+        self._record_sort = None
+        self._log_email: dict[str, str] = {}
+        self._after_once("home_tick", 60_000, self._home_tick)
+
+    def _record_headers(self) -> list[str]:
+        return list(hr.LOG_HEADERS) if getattr(self, "_record_mode", "main") == "log" else list(hr.HOME_HEADERS)
+
+    def _record_col_index_at(self, tree, x) -> int:
+        col = tree.identify_column(x)
+        if not col or col == "#0":
+            return -1
+        try:
+            n = int(str(col).replace("#", "")) - 1
+        except ValueError:
+            return -1
+        shown = self._record_display_headers()
+        headers = self._record_headers()
+        if 0 <= n < len(shown) and shown[n] in headers:
+            return headers.index(shown[n])
+        if 0 <= n < len(headers):
+            return n
+        return -1
+
+    def _record_fold_state(self) -> dict:
+        home = self.__dict__.setdefault("_home_state", {})
+        state = home.get("record_folds")
+        if not isinstance(state, dict):
+            state = getattr(self, "_record_folds", None)
+            if not isinstance(state, dict):
+                state = {"status": False, "flow": False}
+            home["record_folds"] = state
+        state.setdefault("status", False)
+        state.setdefault("flow", False)
+        self._record_folds = state
+        return state
+
+    def _record_display_headers(self) -> list[str]:
+        headers = self._record_headers()
+        if getattr(self, "_record_mode", "main") != "main":
+            return headers
+        folds = self._record_fold_state()
+        hidden = set(getattr(hr, "HIDDEN_TAB_COLS", ("로그인 이메일",)))
+        if not folds.get("status"):
+            hidden.update(getattr(hr, "STATUS_SUMMARY_COLS", (
+                "현재 검색결과", "현재 작업", "현재 노출키워드", "최근 확인", "한줄 특이사항",
+            )))
+        if not folds.get("flow"):
+            hidden.update(getattr(hr, "FLOW_COLS", (
+                "처음수집", "첫색인확인", "핵심노출", "핵심마지막", "잘림시작",
+                "재수집요청최근", "재수집요청이력", "색인 소요일", "노출 유지일", "전체흐름",
+            )))
+        return [name for name in headers if name not in hidden]
+
+    def _toggle_record_fold(self, key: str) -> None:
+        if getattr(self, "_record_mode", "main") != "main":
+            return
+        folds = self._record_fold_state()
+        folds[key] = not bool(folds.get(key))
+        self._record_shown_cols = None
+        self._close_record_edit(True)
+        self._schedule_home_save()
+        self._apply_record_column_folds()
+
+    def _paint_record_fold_btns(self) -> None:
+        folds = self._record_fold_state()
+        log_mode = getattr(self, "_record_mode", "main") == "log"
+        host = getattr(self, "_record_fold_host", None)
+        wrap = getattr(self, "records_list", None)
+        if self._widget_alive(host):
+            if log_mode:
+                host.pack_forget()
+            elif wrap is not None and str(host.winfo_manager() or "") != "pack":
+                host.pack(fill=tk.X, pady=(0, 4), before=wrap)
+        status_btn = getattr(self, "_record_status_fold_btn", None)
+        flow_btn = getattr(self, "_record_flow_fold_btn", None)
+        if self._widget_alive(status_btn):
+            mark = "▾" if folds.get("status") else "▸"
+            status_btn.configure(text=f"현재상태 요약 {mark}")
+        if self._widget_alive(flow_btn):
+            mark = "▾" if folds.get("flow") else "▸"
+            flow_btn.configure(text=f"처음수집~전체흐름 {mark}")
+
+    def _apply_record_column_folds(self) -> None:
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree):
+            return
+        shown = self._record_display_headers()
+        prev = getattr(self, "_record_shown_cols", None)
+        if prev == tuple(shown):
+            self._paint_record_fold_btns()
+            return
+        self._record_shown_cols = tuple(shown)
+        try:
+            tree.configure(displaycolumns=shown)
+        except Exception:
+            pass
+        for name in shown:
+            try:
+                tree.column(name, width=self._record_col_px(name), minwidth=48, stretch=False, anchor="w")
+            except Exception:
+                pass
+        self._paint_record_fold_btns()
+
+    def _apply_record_columns(self, headers: list[str]) -> None:
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree):
+            return
+        tree.configure(columns=list(headers))
+        heading_text = {"계정 생성상태": "계정생성"}
+        for name in headers:
+            tree.heading(name, text=heading_text.get(name, name), anchor="w", command=lambda n=name: self._sort_record_tree(n))
+        self._record_shown_cols = None
+        self._apply_record_column_folds()
+
+    def _toggle_record_log(self) -> None:
+        """표를 본표(A:AD) ↔ 변경 로그(AE:AK)로 바꾼다."""
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree):
+            return
+        self._close_record_edit(True)
+        self._record_mode = "log" if getattr(self, "_record_mode", "main") == "main" else "main"
+        self._record_sort = None
+        try:
+            tree.delete(*tree.get_children(""))
+        except Exception:
+            pass
+        for iid in list(getattr(self, "_record_all_iids", None) or []):
+            try:
+                if tree.exists(iid):
+                    tree.delete(iid)
+            except Exception:
+                pass
+        self._record_all_iids = []
+        self._record_fp = None
+        self._apply_record_columns(self._record_headers())
+        btn = getattr(self, "_record_log_btn", None)
+        if self._widget_alive(btn):
+            btn.configure(text="본표로" if self._record_mode == "log" else "변경 로그")
+        self._render_record_rows(force=True)
+
+    def _home_tick(self) -> None:
+        """시트의 1시간 트리거(오늘확인 10시간 정리)를 1분마다 가볍게 확인한다."""
+        try:
+            changed = hr.expire_today_checks(self._blog_meta, datetime.now())
+            if changed:
+                self._schedule_meta_save()
+                for blog_id in changed:
+                    self._refresh_record_tree_item(blog_id)
+        except Exception:
+            pass
+        self._after_once("home_tick", 60_000, self._home_tick)
 
     def _sheet_day(self, raw: str = "") -> str:
         value = (raw or "").strip()
@@ -1340,53 +1676,302 @@ class BloggerApp:
         return f"{dt.month}/{dt.day}"
 
     def _schedule_meta_save(self) -> None:
-        job = getattr(self, "_meta_save_job", None)
-        if job is not None:
+        self._after_once("meta_save", 400, self._save_blog_meta)
+
+    # ----- HOME 기록: 저장 / 확정 ---------------------------------------------------
+    # 시트 Apps Script의 onEdit·confirmCurrentState_·API를 프로그램 안에서 그대로 수행한다.
+    # 규칙 자체는 home_records.py에 있고, 여기서는 화면·저장·동기화만 잇는다.
+
+    def _home_events(self) -> list:
+        state = self.__dict__.setdefault("_home_state", {})
+        events = state.get("events")
+        if not isinstance(events, list):
+            events = []
+            state["events"] = events
+        return events
+
+    def _load_home_state(self) -> None:
+        path = data_path(HOME_STATE_FILE)
+        prev_gone = [str(item).strip() for item in ((self.__dict__.get("_home_state") or {}).get("gone_ids") or []) if str(item).strip()]
+        prev_folds = (self.__dict__.get("_home_state") or {}).get("record_folds")
+        state = {"email_order": [], "program_order": {}, "program_order_time": {}, "events": [], "gone_ids": [], "record_folds": {"status": False, "flow": False}}
+        loaded_folds = False
+        if os.path.isfile(path):
             try:
-                self.root.after_cancel(job)
+                with open(path, "r", encoding="utf-8") as handle:
+                    raw = json.load(handle) or {}
+                if isinstance(raw.get("email_order"), list):
+                    state["email_order"] = [str(item) for item in raw["email_order"] if str(item or "").strip()]
+                if isinstance(raw.get("program_order"), dict):
+                    state["program_order"] = {str(k): [str(d) for d in v] for k, v in raw["program_order"].items() if isinstance(v, list)}
+                if isinstance(raw.get("program_order_time"), dict):
+                    state["program_order_time"] = {str(k): str(v) for k, v in raw["program_order_time"].items()}
+                if isinstance(raw.get("events"), list):
+                    state["events"] = [item for item in raw["events"] if isinstance(item, dict)]
+                if isinstance(raw.get("gone_ids"), list):
+                    state["gone_ids"] = [str(item) for item in raw["gone_ids"] if str(item or "").strip()]
+                if isinstance(raw.get("record_folds"), dict):
+                    state["record_folds"] = {
+                        "status": bool(raw["record_folds"].get("status")),
+                        "flow": bool(raw["record_folds"].get("flow")),
+                    }
+                    loaded_folds = True
             except Exception:
                 pass
-        try:
-            self._meta_save_job = self.root.after(400, self._save_blog_meta)
-        except Exception:
-            self._meta_save_job = None
+        if not loaded_folds and isinstance(prev_folds, dict):
+            state["record_folds"] = {
+                "status": bool(prev_folds.get("status")),
+                "flow": bool(prev_folds.get("flow")),
+            }
+        for blog_id in prev_gone:
+            if blog_id not in state["gone_ids"]:
+                state["gone_ids"].append(blog_id)
+        self._home_state = state
+        self._record_folds = state.get("record_folds")
+        self._apply_gone_ids()
 
-    def _set_record_field(self, blog_id: str, key: str, value: str) -> None:
-        if not blog_id or key not in RECORD_FIELDS:
+    def _save_home_state(self) -> None:
+        try:
+            with open(data_path(HOME_STATE_FILE), "w", encoding="utf-8") as handle:
+                json.dump(self.__dict__.get("_home_state") or {}, handle, ensure_ascii=False, indent=1)
+        except Exception as exc:
+            self.log(f"기록 상태 저장 오류: {_exc_text(exc)}")
+
+    def _schedule_home_save(self) -> None:
+        self._after_once("home_save", 500, self._save_home_state)
+
+    def _apply_gone_ids(self) -> None:
+        gone = {str(item).strip() for item in ((self.__dict__.get("_home_state") or {}).get("gone_ids") or []) if str(item).strip()}
+        session = getattr(self, "session", None)
+        if session is None:
+            return
+        current = getattr(session, "_gone_ids", None)
+        if current is None:
+            session._gone_ids = set()
+            current = session._gone_ids
+        current.update(gone)
+        if current:
+            home = self.__dict__.setdefault("_home_state", {})
+            saved = home.setdefault("gone_ids", [])
+            extra = [item for item in sorted(current) if item not in saved]
+            if extra:
+                saved.extend(extra)
+                if len(saved) > 400:
+                    home["gone_ids"] = saved[-400:]
+                self._schedule_home_save()
+        if session.state.blogs:
+            session.state.blogs = [blog for blog in session.state.blogs if blog.id not in current]
+
+    def _remember_gone_id(self, blog_id: str) -> None:
+        blog_id = str(blog_id or "").strip()
+        if not blog_id:
+            return
+        session = getattr(self, "session", None)
+        if session is not None:
+            gone = getattr(session, "_gone_ids", None)
+            if gone is None:
+                session._gone_ids = set()
+                gone = session._gone_ids
+            gone.add(blog_id)
+        home = self.__dict__.setdefault("_home_state", {})
+        saved = home.setdefault("gone_ids", [])
+        if blog_id not in saved:
+            saved.append(blog_id)
+            if len(saved) > 400:
+                home["gone_ids"] = saved[-400:]
+        self._save_home_state()
+
+    def _record_domain(self, blog_id: str) -> str:
+        blog = next((item for item in self._dashboard_blogs() if item.id == blog_id), None)
+        meta = self._blog_meta.get(blog_id) or {}
+        return str((blog.address if blog else "") or meta.get("address") or "").strip()
+
+    def _remember_email_order(self, email: str) -> None:
+        email = str(email or "").strip().lower()
+        if not email:
+            return
+        order = self._home_state.setdefault("email_order", [])
+        if email not in order:
+            order.append(email)
+            self._schedule_home_save()
+
+    def _after_record_change(self, blog_ids, regroup: bool = False) -> None:
+        """저장·시트 동기화·화면 갱신을 한 번에."""
+        ids = [blog_id for blog_id in blog_ids if blog_id]
+        self._schedule_meta_save()
+        self._schedule_home_save()
+        for blog_id in ids:
+            self._refresh_record_tree_item(blog_id)
+        if regroup:
+            self._record_fp = None
+            self._after_once("record_rerender", 40, lambda: self._render_record_rows(force=getattr(self, "_main_tab", "") == "기록"))
+        self._schedule_record_view_refresh()
+
+    def _confirm_record(self, blog_id: str, state: str, *, source: str = "수동", note: str = "", when: datetime | None = None, quiet: bool = False, check_today: bool = False) -> bool:
+        """상태 확정. 시트의 confirmCurrentState_ + 변경 로그."""
+        if not blog_id:
+            return False
+        cur = self._blog_meta.setdefault(blog_id, {})
+        stamp = when or datetime.now()
+        result = hr.confirm_state(
+            cur, state, stamp,
+            blog_id=blog_id, domain=self._record_domain(blog_id), source=source, note=note, events=self._home_events(),
+        )
+        if not result["ok"]:
+            if not quiet:
+                if result["reason"] == "exposure_required":
+                    messagebox.showwarning("기록", "별도키워드노출은 현재노출키워드를 먼저 적어 주세요.")
+                else:
+                    messagebox.showwarning("기록", f"알 수 없는 상태입니다: {state}")
+            return False
+        if check_today:
+            cur["today_checked"] = True
+            cur["check_ts"] = stamp.isoformat(timespec="seconds")
+        self._remember_email_order(cur.get("google_email"))
+        regroup = result["changed"] and hr.normalize_status(state) == "삭제됨"
+        self._after_record_change([blog_id], regroup=regroup)
+        return True
+
+    def _set_record_field(self, blog_id: str, key: str, value) -> None:
+        """사람이 칸을 고쳤을 때 (시트 onEdit)."""
+        if not blog_id or key not in hr.HOME_FIELDS:
             return
         cur = self._blog_meta.setdefault(blog_id, {})
-        value = (value or "").strip()
-        old = str(cur.get(key) or "").strip()
-        if old == value:
+        if key == "today_checked":
+            self._toggle_today_check(blog_id)
             return
+        text = str(value or "").strip()
         if key == "sheet_status":
-            cur["prev_status"] = old
-            if value:
-                now = datetime.now()
-                stamp = f"{now.month}/{now.day}"
-                piece = f"{stamp} {value}"
-                flow = self._clean_status_flow(str(cur.get("status_flow") or ""))
-                if not flow.endswith(piece):
-                    cur["status_flow"] = f"{flow} → {piece}" if flow else piece
-                else:
-                    cur["status_flow"] = flow
-                cur["last_check"] = stamp
-        cur[key] = value
-        self._schedule_meta_save()
-        self._schedule_sheet_sync([blog_id], "기록 수정")
-
-    def _flush_record_vars(self) -> None:
-        if getattr(self, "_records_rendering", False):
+            old = hr.normalize_status(cur.get("sheet_status"))
+            state = hr.pending_edit(cur, text)
+            if not state or state == old:
+                self._refresh_record_tree_item(blog_id)
+                return
+            self._after_record_change([blog_id])
             return
-        for blog_id, fields in list(getattr(self, "_record_vars", {}).items()):
-            for key, var in fields.items():
-                try:
-                    value = var.get()
-                except Exception:
-                    continue
-                if key == "sheet_status" and value.strip() == "미정":
-                    value = ""
-                self._set_record_field(blog_id, key, value)
+        if key == "account_status":
+            if text and text not in hr.ACCOUNT_STATUS_LIST:
+                return
+            if str(cur.get("account_status") or "") == text:
+                return
+            cur["account_status"] = text
+            check = hr.ymd(datetime.now()) if text else str(cur.get("account_check") or "")
+            cur["account_check"] = check
+            changed = hr.sync_account_by_email(self._blog_meta, cur.get("google_email"), text, check)
+            self._after_record_change(set(changed) | {blog_id})
+            return
+        if key == "account_check":
+            day = hr.parse_day(text) if text else None
+            if text and day is None:
+                messagebox.showwarning("기록", "날짜는 10/6 또는 2026-10-06 형식으로 적어 주세요.")
+                self._refresh_record_tree_item(blog_id)
+                return
+            check = day.isoformat() if day else ""
+            if str(cur.get("account_check") or "") == check:
+                return
+            cur["account_check"] = check
+            changed = hr.sync_account_by_email(self._blog_meta, cur.get("google_email"), str(cur.get("account_status") or ""), check)
+            self._after_record_change(set(changed) | {blog_id})
+            return
+        old = str(cur.get(key) or "").strip()
+        if old == text:
+            return
+        cur[key] = text
+        if key == "google_email":
+            self._remember_email_order(text)
+            changed = hr.sync_all_accounts(self._blog_meta)
+            self._after_record_change(set(changed) | {blog_id}, regroup=True)
+            return
+        if key == "keyword":
+            self._after_record_change([blog_id], regroup=True)
+            return
+        self._after_record_change([blog_id])
+
+    def _toggle_today_check(self, blog_id: str) -> None:
+        """P 오늘확인. 체크하면 현재상태를 확정하고 로그를 남긴다. 해제하면 체크시각만 지운다."""
+        cur = self._blog_meta.setdefault(blog_id, {})
+        if cur.get("today_checked"):
+            cur["today_checked"] = False
+            cur["check_ts"] = ""
+            self._after_record_change([blog_id])
+            return
+        state = hr.normalize_status(cur.get("sheet_status")) or "생성만"
+        now = datetime.now()
+        if not self._confirm_record(blog_id, state, source="수동", when=now):
+            return
+        cur["today_checked"] = True
+        cur["check_ts"] = now.isoformat(timespec="seconds")
+        self._after_record_change([blog_id])
+
+    def _menu_record_action(self, action: str) -> None:
+        """우클릭 메뉴: 시트의 선택 행 메뉴와 같은 동작."""
+        blog_id = str(getattr(self, "_record_menu_target", "") or "")
+        if not blog_id or blog_id.startswith("__"):
+            return
+        cur = self._blog_meta.setdefault(blog_id, {})
+        current = hr.normalize_status(cur.get("confirmed_status") or cur.get("sheet_status"))
+        domain = self._record_domain(blog_id) or blog_id
+        if action == "check":
+            if cur.get("today_checked"):
+                cur["today_checked"] = False
+            self._toggle_today_check(blog_id)
+            return
+        if action == "recrawl":
+            if current == "삭제됨":
+                messagebox.showwarning("기록", "삭제된 블로그에는 재수집을 기록할 수 없습니다.")
+                return
+            self._confirm_record(blog_id, "재수집요청", source="수동", check_today=True)
+            return
+        if action == "deleted":
+            if not messagebox.askyesno("삭제 확인 기록", f"{domain}\n실제로 삭제된 블로그를 삭제됨으로 기록할까요?\n로그아웃·목록 누락만으로는 삭제됨을 기록하지 마세요."):
+                return
+            self._confirm_record(blog_id, "삭제됨", source="수동")
+            return
+        if action == "purge":
+            if current != "삭제됨":
+                messagebox.showwarning("기록", "삭제됨으로 기록된 행만 완전 삭제할 수 있습니다.")
+                return
+            if not messagebox.askyesno("기록 행 완전 삭제", f"{domain}\n이 기록 행을 완전히 삭제할까요?\n변경 로그는 보존됩니다. Blogger의 실제 블로그에는 작업하지 않습니다."):
+                return
+            self._blog_meta.pop(blog_id, None)
+            self._schedule_meta_save()
+            self._record_fp = None
+            self._render_record_rows(force=True)
+            self.log(f"기록 행을 삭제했습니다: {domain}")
+
+    def on_home_sync_accounts(self) -> None:
+        changed = hr.sync_all_accounts(self._blog_meta)
+        if changed:
+            self._after_record_change(changed)
+        self.log("같은 로그인 이메일의 계정 생성상태/마지막확인을 맞췄습니다.")
+
+    def on_home_sort(self) -> None:
+        """시트의 '본표 정렬 · 프로그램순서 우선'과 같다. 열 제목 정렬을 풀고 시트 순서로 되돌린다."""
+        self._record_sort = None
+        self._record_fp = None
+        self._render_record_rows(force=True)
+        self.log("기록을 시트와 같은 순서로 정렬했습니다.")
+
+    def _record_index_result(self, blog_id: str) -> None:
+        """색인 확인 결과를 시트 API 'check'처럼 상태로 반영한다."""
+        cur = self._blog_meta.get(blog_id) or {}
+        indexed = cur.get("naver_indexed")
+        if not isinstance(indexed, bool):
+            return
+        state = hr.index_check_state(cur, indexed)
+        count = int(cur.get("naver_index_count") or 0)
+        note = f"검색엔진: naver · 결과 {count}건" if count else "검색엔진: naver"
+        if state:
+            self._confirm_record(blog_id, state, source="프로그램", note=note, quiet=True, check_today=True)
+            return
+        current = hr.normalize_status(cur.get("confirmed_status") or cur.get("sheet_status"))
+        if current and current != "삭제됨":
+            self._home_events().append(hr.make_event(
+                cur, blog_id=blog_id, domain=self._record_domain(blog_id), old=current,
+                event=f"{current} 유지 · 색인 확인", when=datetime.now(), source="프로그램", note=note,
+            ))
+            self._schedule_home_save()
+            self._refresh_record_tree_item(blog_id)
 
     def _logged_google_email(self) -> str:
         account = str(getattr(getattr(self.session, "state", None), "account", "") or "").strip()
@@ -1408,111 +1993,103 @@ class BloggerApp:
         done.update(self._progress_map.get(blog.id) or [])
         count = self._count_value(meta.get("blog_crawl_count"))
         collected = "collect" in done or bool(str(meta.get("last_blog_crawl") or "").strip())
-        if collected and count < 1:
-            count = 1
-        if count > 1:
-            return "재수집요청"
-        if collected:
-            return "수집요청"
-        if SETTINGS_DONE_KEYS <= done:
-            return "설정완료"
-        return "생성만"
+        return hr.program_state(meta, collected=collected, collect_count=count)
 
-    def _fill_program_records(self, blogs: list[BlogInfo] | None = None) -> bool:
-        email = self._logged_google_email()
-        targets = list(blogs) if blogs is not None else self._dashboard_blogs()
+    def _migrate_home_meta(self, cur: dict) -> bool:
+        """옛 저장값(설정완료·확인전·잘림의심 등)을 시트의 새 상태 이름으로."""
         changed = False
-        for blog in targets:
-            cur = self._blog_meta.setdefault(blog.id, {})
-            if email and not str(cur.get("google_email") or "").strip():
-                cur["google_email"] = email
+        for key in ("sheet_status", "confirmed_status", "prev_status", "prev2_status"):
+            old = str(cur.get(key) or "").strip()
+            new = hr.normalize_status(old)
+            if new != old:
+                cur[key] = new
                 changed = True
-            flow = str(cur.get("status_flow") or "").strip()
-            cleaned = self._clean_status_flow(flow)
-            if cleaned != flow:
-                cur["status_flow"] = cleaned
-                changed = True
-            done = set(getattr(blog, "done", set()) or set())
-            done.update(self._progress_map.get(blog.id) or [])
-            if SETTINGS_DONE_KEYS <= done:
-                now = datetime.now()
-                piece = f"{now.month}/{now.day} 설정완료"
-                flow = self._clean_status_flow(str(cur.get("status_flow") or ""))
-                if piece not in [part.strip() for part in flow.split("→")]:
-                    cur["status_flow"] = f"{flow} → {piece}" if flow else piece
-                    cur["last_check"] = f"{now.month}/{now.day}"
-                    changed = True
-            status = str(cur.get("sheet_status") or "").strip()
-            if status in PROGRAM_STATUSES or not status:
-                derived = self._program_sheet_status(blog)
-                if derived and derived != status:
-                    if status:
-                        cur["prev_status"] = status
-                    now = datetime.now()
-                    stamp = f"{now.month}/{now.day}"
-                    piece = f"{stamp} {derived}"
-                    flow = self._clean_status_flow(str(cur.get("status_flow") or ""))
-                    if flow.endswith(piece):
-                        cur["status_flow"] = flow
-                    else:
-                        cur["status_flow"] = f"{flow} → {piece}" if flow else piece
-                    cur["last_check"] = stamp
-                    cur["sheet_status"] = derived
-                    changed = True
-        if changed:
-            self._schedule_meta_save()
+        flow = str(cur.get("status_flow") or "")
+        migrated = hr.migrate_flow_text(flow)
+        if migrated != flow:
+            cur["status_flow"] = migrated
+            changed = True
+        if not str(cur.get("confirmed_status") or "").strip() and str(cur.get("sheet_status") or "").strip():
+            cur["confirmed_status"] = hr.normalize_status(cur.get("sheet_status"))
+            changed = True
         return changed
 
-    def _sync_program_record_vars(self, blogs: list[BlogInfo]) -> None:
-        self._records_rendering = True
-        try:
-            for blog in blogs:
-                fields = (getattr(self, "_record_vars", {}) or {}).get(blog.id) or {}
-                meta = self._blog_meta.get(blog.id) or {}
-                email = fields.get("google_email")
-                stored_email = str(meta.get("google_email") or "").strip()
-                if email is not None and stored_email and not email.get().strip():
-                    email.set(stored_email)
-                status = fields.get("sheet_status")
-                stored_status = str(meta.get("sheet_status") or "").strip()
-                if status is None or not stored_status:
-                    continue
-                shown = status.get().strip()
-                if shown in {"", "미정"} or shown in PROGRAM_STATUSES:
-                    if shown != stored_status:
-                        status.set(stored_status)
-        finally:
-            self._records_rendering = False
+    def _fill_program_records(self, blogs: list[BlogInfo] | None = None) -> bool:
+        """프로그램이 아는 사실을 기록에 반영한다 (시트 API의 blog_created / recrawl에 해당)."""
+        email = self._logged_google_email()
+        targets = list(blogs) if blogs is not None else self._dashboard_blogs()
+        gone = self._gone_id_set()
+        changed = False
+        now = datetime.now()
+        events = self._home_events()
+        for blog in targets:
+            if blog.id in gone:
+                continue
+            cur = self._blog_meta.setdefault(blog.id, {})
+            if self._migrate_home_meta(cur):
+                changed = True
+            if email and not str(cur.get("google_email") or "").strip():
+                cur["google_email"] = email
+                self._remember_email_order(email)
+                changed = True
+            address = str(blog.address or cur.get("address") or "").strip()
+            title = str(blog.name or cur.get("name") or "")
+            if title and not str(cur.get("h1") or "").strip():
+                cur["h1"] = title
+                changed = True
+            if not str(cur.get("confirmed_status") or "").strip():
+                # 처음 보는 블로그 → 신규등록 · 생성만
+                hr.register_new(cur, now, blog_id=blog.id, domain=address, email=email, title=title, events=events)
+                changed = True
+            status = hr.normalize_status(cur.get("confirmed_status"))
+            if status in hr.PROGRAM_STATUSES:
+                derived = self._program_sheet_status(blog)
+                if derived and derived != status:
+                    out = hr.confirm_state(cur, derived, now, blog_id=blog.id, domain=address, source="프로그램", events=events)
+                    if out["ok"]:
+                        cur["today_checked"] = True
+                        cur["check_ts"] = now.isoformat(timespec="seconds")
+                    changed = changed or out["ok"]
+        if changed:
+            self._schedule_meta_save()
+            self._schedule_home_save()
+        return changed
 
-    def _sheet_record_dicts(self, only_ids: set[str] | None = None) -> list[dict]:
-        blogs = self._dashboard_blogs()
-        targets = blogs if only_ids is None else [blog for blog in blogs if blog.id in only_ids]
-        self._fill_program_records(targets)
+    def _sheet_record_dicts(self, only_ids: set[str] | None = None, blogs=None) -> list[dict]:
+        source = list(blogs) if blogs is not None else self._dashboard_blogs()
+        targets = source if only_ids is None else [blog for blog in source if blog.id in only_ids]
+        live_ids = {item.id for item in self._dashboard_blogs()}
+        self._fill_program_records([blog for blog in targets if blog.id in live_ids])
         records = []
-        for blog in blogs:
+        for blog in source:
             if only_ids is not None and blog.id not in only_ids:
                 continue
             meta = self._blog_meta.get(blog.id) or {}
             urls = [str(post.get("url") or "").strip() for post in (blog.posts or []) if str(post.get("url") or "").strip()]
+            if not urls:
+                urls = [str(item.get("url") or "").strip() for item in normalize_posts(meta.get("posts") or []) if str(item.get("url") or "").strip()]
             done = set(getattr(blog, "done", set()) or set())
             done.update(self._progress_map.get(blog.id) or [])
             collect_count = self._count_value(meta.get("blog_crawl_count"))
             if collect_count < 1 and ("collect" in done or str(meta.get("last_blog_crawl") or "").strip()):
                 collect_count = 1
+            email = str(meta.get("google_email") or "").strip()
+            if not email and blog.id in live_ids:
+                email = self._logged_google_email()
             records.append(
                 {
                     "id": blog.id,
                     "keyword": meta.get("keyword") or "",
-                    "google_email": str(meta.get("google_email") or "").strip() or self._logged_google_email(),
-                    "title": blog.name or "",
-                    "address": blog.address or "",
+                    "google_email": email,
+                    "title": blog.name or meta.get("name") or "",
+                    "address": blog.address or meta.get("address") or "",
                     "posts": " · ".join(urls),
                     "html_code": meta.get("html_code") or "",
                     "naver_id": meta.get("naver_id") or "",
                     "index_status": index_status_label(
                         meta.get("naver_indexed") if isinstance(meta.get("naver_indexed"), bool) else None,
                         str(meta.get("naver_index_checked_at") or ""),
-                        blog.address or "",
+                        blog.address or meta.get("address") or "",
                     ),
                     "sheet_status": meta.get("sheet_status") or "",
                     "search_result": meta.get("search_result") or "",
@@ -1523,282 +2100,1845 @@ class BloggerApp:
                     "first_collect": self._sheet_day(str(meta.get("blog_collect_at") or meta.get("last_blog_crawl") or "")),
                     "last_collect": self._sheet_day(str(meta.get("last_blog_crawl") or "")),
                     "collect_count": str(collect_count or ""),
-                    "last_post_collect": self._sheet_day(str(meta.get("last_post_crawl") or "")),
                     "first_index_at": meta.get("first_index_at") or "",
                     "trim_started_at": meta.get("trim_started_at") or "",
                     "status_flow": meta.get("status_flow") or "",
                     "prev_status": meta.get("prev_status") or "",
                     "folder": meta.get("folder") or "",
+                    "last_post_collect": self._sheet_day(str(meta.get("last_post_crawl") or "")),
                 }
             )
         return records
 
-    def _render_record_rows(self, force: bool = False) -> None:
-        parent = getattr(self, "_record_list_inner", None)
-        if parent is None or not self._widget_alive(parent):
-            return
-        if not force and getattr(self, "_main_tab", "") != "기록":
-            return
-        blogs = self._dashboard_blogs()
-        self._fill_program_records(blogs)
-        fp = tuple(
-            (
-                blog.id,
-                str((self._blog_meta.get(blog.id) or {}).get("google_email") or "").strip() or self._logged_google_email(),
-            )
-            for blog in blogs
+    def _offline_blog(self, blog_id: str, meta: dict) -> BlogInfo:
+        blog = BlogInfo(
+            id=blog_id,
+            name=str(meta.get("name") or meta.get("address") or blog_id[-6:]),
+            address=str(meta.get("address") or ""),
+            posts=normalize_posts(meta.get("posts") or []),
+            done=set(self._progress_map.get(blog_id) or []),
         )
-        if fp == getattr(self, "_record_fp", None) and parent.winfo_children():
-            self._record_dirty = False
-            self._sync_program_record_vars(blogs)
-            self._paint_record_rows()
-            return
-        self._flush_record_vars()
-        self._records_rendering = True
-        try:
-            for child in list(parent.winfo_children()):
-                child.destroy()
-            self._record_vars = {}
-            self._record_row_frames = {}
-            self._record_fp = fp
-            self._record_dirty = False
-            if not blogs:
-                label(parent, "로그인하면 블로그 기록이 여기에 나타납니다.", "body", COLORS["text_muted"]).pack(anchor="w", pady=8)
-                return
-            grouped: dict[str, list[BlogInfo]] = {}
-            order: list[str] = []
-            for blog in blogs:
-                email = str((self._blog_meta.get(blog.id) or {}).get("google_email") or "").strip() or self._logged_google_email() or "이메일 없음"
-                if email not in grouped:
-                    grouped[email] = []
-                    order.append(email)
-                grouped[email].append(blog)
-            palettes = ("#eef2ff", "#ecfdf5", "#fff7ed", "#f0f9ff", "#fdf4ff")
-            for index, email in enumerate(order):
-                items = grouped[email]
-                group_bg = palettes[index % len(palettes)]
-                wrap = tk.Frame(parent, bg=group_bg, highlightbackground=COLORS["card_border"], highlightthickness=1)
-                wrap.pack(fill=tk.X, pady=(0, 10))
-                head = tk.Frame(wrap, bg=group_bg)
-                head.pack(fill=tk.X, padx=8, pady=(8, 4))
-                tk.Label(
-                    head,
-                    text=email,
-                    font=FONTS["body_bold"],
-                    fg=COLORS["text"],
-                    bg=group_bg,
-                ).pack(side=tk.LEFT)
-                tk.Label(
-                    head,
-                    text=f"{len(items)}개",
-                    font=FONTS["small"],
-                    fg=COLORS["text_muted"],
-                    bg=group_bg,
-                ).pack(side=tk.LEFT, padx=(8, 0))
-                for blog in items:
-                    self._render_record_row(wrap, blog, group_bg)
-        finally:
-            self._records_rendering = False
-            self._paint_record_rows()
+        return blog
 
-    def _paint_record_rows(self) -> None:
-        selected = (self.blog_var.get() or "").strip() if hasattr(self, "blog_var") else ""
-        checked = set()
-        for blog_id, var in (getattr(self, "_blog_check_vars", {}) or {}).items():
-            try:
-                if var.get():
-                    checked.add(blog_id)
-            except Exception:
-                pass
-        for blog_id, row in list((getattr(self, "_record_row_frames", {}) or {}).items()):
-            if not self._widget_alive(row):
+    def _gone_id_set(self) -> set[str]:
+        gone = set()
+        session = getattr(self, "session", None)
+        if session is not None:
+            gone.update(str(item).strip() for item in (getattr(session, "_gone_ids", None) or set()) if str(item).strip())
+        home = (self.__dict__.get("_home_state") or {}).get("gone_ids") or []
+        gone.update(str(item).strip() for item in home if str(item).strip())
+        return gone
+
+    def _record_blogs(self) -> list[BlogInfo]:
+        live = {blog.id: blog for blog in self._dashboard_blogs()}
+        gone = self._gone_id_set()
+        logged = str(self._logged_google_email() or "").strip().lower()
+        account_live = bool(getattr(self.session.state, "logged_in", False) and live)
+        found: list[BlogInfo] = []
+        seen: set[str] = set()
+        for blog_id, meta in (self._blog_meta or {}).items():
+            if not isinstance(meta, dict):
                 continue
-            mark = getattr(row, "_record_mark", None)
-            if blog_id == selected:
-                bg, border, thick = "#c7d2fe", "#312e81", 4
-                cell_bg = "#e0e7ff"
-            elif blog_id in checked:
-                bg, border, thick = COLORS["row_checked"], COLORS["row_checked_border"], 2
-                cell_bg = "#dbeafe"
-            else:
-                bg = getattr(row, "_record_group_bg", COLORS["input_bg"])
-                border, thick, cell_bg = COLORS["border"], 1, COLORS["input_bg"]
-            try:
-                row.configure(bg=bg, highlightbackground=border, highlightcolor=border, highlightthickness=thick)
-            except Exception:
-                pass
-            bar = getattr(row, "_record_bar", None)
-            if self._widget_alive(bar):
-                try:
-                    bar.configure(bg=border if blog_id == selected else bg)
-                except Exception:
-                    pass
-            body = getattr(row, "_record_body", None)
-            if self._widget_alive(body):
-                self._set_record_bg(body, bg, cell_bg)
-            if self._widget_alive(mark):
-                if blog_id == selected:
-                    try:
-                        mark.pack(side=tk.RIGHT)
-                        mark.configure(text="선택됨")
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        mark.pack_forget()
-                    except Exception:
-                        pass
+            if blog_id in gone:
+                continue
+            if blog_id in live:
+                found.append(live[blog_id])
+                seen.add(blog_id)
+                continue
+            if account_live:
+                email = str(meta.get("google_email") or "").strip().lower()
+                if email and logged and email == logged:
+                    continue
+            if not (
+                meta.get("address")
+                or meta.get("name")
+                or meta.get("status_flow")
+                or meta.get("sheet_status")
+                or meta.get("google_email")
+                or meta.get("keyword")
+            ):
+                continue
+            found.append(self._offline_blog(blog_id, meta))
+            seen.add(blog_id)
+        for blog in live.values():
+            if blog.id not in seen and blog.id not in gone:
+                found.append(blog)
+        return found
 
-    def _set_record_bg(self, widget, bg: str, cell_bg: str | None = None) -> None:
-        kind = widget.winfo_class()
+    # ----- 기록 표: 편집 ---------------------------------------------------------
+    # 표(Treeview) 위에 입력칸 하나만 띄워서 수정한다. 줄마다 입력칸을 만들지 않으므로 기록이 수백 개여도 가볍다.
+
+    def _record_editable_indexes(self) -> list[int]:
+        if getattr(self, "_record_mode", "main") == "log":
+            return []
+        shown = set(self._record_display_headers())
+        return [index for index, name in enumerate(hr.HOME_HEADERS) if hr.EDITABLE.get(name) and name in shown]
+
+    def _record_tree_visible(self) -> list[str]:
+        """보이는 실제 기록 줄(묶음 머리글·로그 줄 제외)."""
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree):
+            return []
         try:
-            if kind in {"Entry"}:
-                widget.configure(bg=cell_bg or bg, highlightbackground=COLORS["accent"] if cell_bg == "#e0e7ff" else COLORS["border"])
-            elif kind == "TCombobox":
-                pass
-            else:
-                widget.configure(bg=bg)
+            return [iid for iid in tree.get_children("") if not str(iid).startswith("__")]
         except Exception:
-            if kind not in {"Entry", "TCombobox"}:
-                return
-        for child in widget.winfo_children():
-            self._set_record_bg(child, bg, cell_bg)
+            return []
 
-    def _select_record_row(self, blog_id: str) -> None:
-        if not blog_id:
+    def _close_record_edit(self, apply: bool = True) -> None:
+        editor = getattr(self, "_record_editor", None)
+        self._record_editor = None
+        if editor is None:
             return
-        self._select_blog(blog_id)
-
-    def _bind_record_select(self, widget, blog_id: str) -> None:
-        def on_pick(_event=None, bid=blog_id):
-            self._select_record_row(bid)
-
+        widget = editor.get("widget")
+        blog_id = str(editor.get("blog_id") or "")
+        key = str(editor.get("key") or "")
+        value = ""
+        if apply and widget is not None:
+            try:
+                value = widget.get()
+            except Exception:
+                value = ""
         try:
-            widget.bind("<Button-1>", on_pick, add="+")
-            widget.bind("<FocusIn>", on_pick, add="+")
+            if widget is not None:
+                widget.destroy()
         except Exception:
             pass
-        for child in widget.winfo_children():
-            self._bind_record_select(child, blog_id)
+        if apply and blog_id and key in hr.HOME_FIELDS:
+            self._set_record_field(blog_id, key, value)
+            self._refresh_record_tree_item(blog_id)
+            self._show_record_detail(blog_id, int(editor.get("index") or 0))
+        tree = getattr(self, "_record_tree", None)
+        if apply and self._widget_alive(tree):
+            try:
+                tree.focus_set()
+            except Exception:
+                pass
 
-    def _record_entry(self, parent, variable, width: int, placeholder: str):
-        box = tk.Frame(parent, bg=COLORS["input_bg"])
-        tk.Label(
-            box, text=placeholder, font=FONTS["caption"], fg=COLORS["text_muted"], bg=COLORS["input_bg"],
-        ).pack(anchor="w")
-        tk.Entry(
-            box,
-            textvariable=variable,
-            font=FONTS["small"],
-            width=max(10, width // 9),
-            bg=COLORS["input_bg"],
-            fg=COLORS["text"],
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=COLORS["border"],
-            highlightcolor=COLORS["accent"],
-        ).pack(anchor="w", pady=(2, 0))
-        return box
+    def _reposition_record_editor(self) -> None:
+        editor = getattr(self, "_record_editor", None)
+        tree = getattr(self, "_record_tree", None)
+        if editor is None or not self._widget_alive(tree):
+            return
+        widget = editor.get("widget")
+        if not self._widget_alive(widget):
+            self._record_editor = None
+            return
+        try:
+            name = self._record_headers()[int(editor["index"])]
+            bbox = tree.bbox(editor["blog_id"], name)
+        except Exception:
+            bbox = None
+        if not bbox:
+            try:
+                widget.place_forget()
+            except Exception:
+                pass
+            return
+        x, y, width, height = bbox
+        try:
+            widget.place(x=x, y=y, width=max(width, 80), height=max(height, 24))
+        except Exception:
+            pass
 
-    def _render_record_row(self, parent, blog: BlogInfo, group_bg: str | None = None) -> None:
-        meta = self._blog_meta.get(blog.id) or {}
-        bg = group_bg or COLORS["input_bg"]
-        row = tk.Frame(parent, bg=bg, highlightbackground=COLORS["border"], highlightthickness=1)
-        row.pack(fill=tk.X, padx=8, pady=3)
-        row._record_group_bg = bg
-        bar = tk.Frame(row, bg=bg, width=8)
-        bar.pack(side=tk.LEFT, fill=tk.Y)
-        bar.pack_propagate(False)
-        row._record_bar = bar
-        body = tk.Frame(row, bg=bg)
-        body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 8), pady=6)
-        row._record_body = body
-        self._record_row_frames[blog.id] = row
-        title_line = tk.Frame(body, bg=bg)
-        title_line.pack(fill=tk.X)
-        tk.Label(
-            title_line, text=blog.name or blog.address or blog.id, font=FONTS["body_bold"],
-            fg=COLORS["text"], bg=bg,
-        ).pack(side=tk.LEFT)
-        mark = tk.Label(
-            title_line, text="선택됨", font=FONTS["caption"],
-            fg="#ffffff", bg="#312e81", padx=8, pady=1,
-        )
-        row._record_mark = mark
-        tk.Label(
-            body, text=blog.address or "주소 없음", font=FONTS["small"],
-            fg=COLORS["text_muted"], bg=bg,
-        ).pack(anchor="w")
-        auto_bits = []
-        indexed = str(meta.get("naver_id") or "").strip()
-        if indexed:
-            auto_bits.append(f"색인 {indexed}")
-        collected = self._sheet_day(str(meta.get("last_blog_crawl") or meta.get("blog_collect_at") or ""))
-        if collected:
-            auto_bits.append(f"수집 {collected}")
-        posted = self._sheet_day(str(meta.get("last_post_crawl") or ""))
-        if posted:
-            auto_bits.append(f"글수집 {posted}")
-        code_name = str(meta.get("html_code") or "").strip()
-        if code_name:
-            auto_bits.append(f"HTML {code_name}")
-        if auto_bits:
-            tk.Label(
-                body, text=" · ".join(auto_bits), font=FONTS["small"],
-                fg=COLORS["text_muted"], bg=bg,
-            ).pack(anchor="w")
-        fields: dict[str, tk.StringVar] = {}
-
-        def bind(key: str, initial: str):
-            shown = initial
-            if key == "sheet_status":
-                shown = initial or "미정"
-            var = tk.StringVar(value=shown)
-            var.trace_add(
-                "write",
-                lambda *_args, bid=blog.id, field=key, target=var: self._on_record_var(bid, field, target),
+    def _edit_record_cell(self, iid: str, index: int) -> None:
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree) or not iid:
+            return
+        headers = self._record_headers()
+        if index < 0 or index >= len(headers) or str(iid).startswith("__"):
+            return
+        name = headers[index]
+        key = hr.EDITABLE.get(name) if getattr(self, "_record_mode", "main") == "main" else ""
+        self._record_click_col = index
+        self._close_record_edit(True)
+        if not key:
+            self._show_record_detail(iid, index)
+            return
+        if key == "today_checked":
+            self._toggle_today_check(iid)
+            self._show_record_detail(iid, index)
+            return
+        try:
+            if not tree.exists(iid):
+                return
+            tree.see(iid)
+            tree.update_idletasks()
+            bbox = tree.bbox(iid, name)
+        except Exception:
+            bbox = None
+        if not bbox:
+            return
+        x, y, width, height = bbox
+        values = tree.item(iid, "values")
+        current = values[index] if index < len(values) else ""
+        if key in ("sheet_status", "account_status"):
+            options = list(hr.STATUS_LIST) if key == "sheet_status" else ["", *hr.ACCOUNT_STATUS_LIST]
+            shown = current
+            if shown not in options:
+                options.append(shown)
+            widget = ttk.Combobox(tree, values=options, state="readonly", font=FONTS["body"])
+            widget.set(shown)
+        else:
+            widget = tk.Entry(
+                tree, font=FONTS["body"], bg="#fffbeb", fg=COLORS["text"], relief="flat",
+                highlightthickness=2, highlightbackground=COLORS["accent"], highlightcolor=COLORS["accent"],
             )
-            fields[key] = var
-            return var
+            widget.insert(0, current)
+            widget.select_range(0, tk.END)
+            widget.icursor(tk.END)
+        widget.place(x=x, y=y, width=max(width, 80), height=max(height, 24))
+        widget.focus_set()
+        self._record_editor = {"widget": widget, "blog_id": iid, "key": key, "index": index}
+        widget.bind("<Return>", lambda _e: (self._close_record_edit(True), "break")[1])
+        widget.bind("<KP_Enter>", lambda _e: (self._close_record_edit(True), "break")[1])
+        widget.bind("<Escape>", lambda _e: (self._close_record_edit(False), "break")[1])
+        widget.bind("<Tab>", lambda _e: self._record_edit_step(cols=1))
+        widget.bind("<Shift-Tab>", lambda _e: self._record_edit_step(cols=-1))
+        widget.bind("<ISO_Left_Tab>", lambda _e: self._record_edit_step(cols=-1))
+        widget.bind("<Down>", lambda _e: self._record_edit_step(rows=1))
+        widget.bind("<Up>", lambda _e: self._record_edit_step(rows=-1))
+        if key in ("sheet_status", "account_status"):
+            widget.bind("<<ComboboxSelected>>", lambda _e: self._close_record_edit(True))
+            widget.bind("<FocusOut>", lambda _e, w=widget: self._after_once("record_combo_blur", 150, lambda: self._combo_blur_check(w)))
+        else:
+            widget.bind("<FocusOut>", lambda _e: self._close_record_edit(True))
+        self._show_record_detail(iid, index)
 
-        line1 = tk.Frame(body, bg=bg)
-        line1.pack(fill=tk.X, pady=(6, 0))
-        keyword = bind("keyword", str(meta.get("keyword") or ""))
-        email = bind("google_email", str(meta.get("google_email") or "").strip() or self._logged_google_email())
-        status = bind("sheet_status", str(meta.get("sheet_status") or ""))
-        self._record_entry(line1, keyword, 160, "핵심키워드").pack(side=tk.LEFT, padx=(0, 6))
-        values = ["미정", *STATUS_OPTIONS]
-        current = status.get()
-        if current not in values:
-            values.append(current)
-        status_box = tk.Frame(line1, bg=bg)
-        status_box.pack(side=tk.LEFT, padx=(0, 6))
-        tk.Label(
-            status_box, text="상태", font=FONTS["caption"], fg=COLORS["text_muted"], bg=bg,
-        ).pack(anchor="w")
-        menu = ttk.Combobox(status_box, textvariable=status, values=values, width=14, state="readonly")
-        menu.pack(anchor="w", pady=(2, 0))
-        self._record_entry(line1, email, 220, "구글 이메일").pack(side=tk.LEFT)
-        line2 = tk.Frame(body, bg=bg)
-        line2.pack(fill=tk.X, pady=(4, 0))
-        note = bind("sheet_note", str(meta.get("sheet_note") or ""))
-        search = bind("search_result", str(meta.get("search_result") or ""))
-        work = bind("work", str(meta.get("work") or ""))
-        exposed = bind("exposed_keyword", str(meta.get("exposed_keyword") or ""))
-        self._record_entry(line2, note, 220, "한줄 메모").pack(side=tk.LEFT, padx=(0, 6))
-        self._record_entry(line2, search, 140, "검색결과").pack(side=tk.LEFT, padx=(0, 6))
-        self._record_entry(line2, work, 120, "현재작업").pack(side=tk.LEFT, padx=(0, 6))
-        self._record_entry(line2, exposed, 140, "노출키워드").pack(side=tk.LEFT)
-        self._record_vars[blog.id] = fields
-        self._bind_record_select(row, blog.id)
+    def _combo_blur_check(self, widget) -> None:
+        """콤보박스는 펼침 목록이 따로 뜨므로, 포커스가 정말 다른 곳으로 갔을 때만 닫는다."""
+        editor = getattr(self, "_record_editor", None)
+        if editor is None or editor.get("widget") is not widget:
+            return
+        try:
+            focus = self.root.focus_get()
+        except Exception:
+            return  # 펼침 목록(파이썬이 모르는 Tk 창)이 포커스를 가진 상태
+        if focus is widget:
+            return
+        self._close_record_edit(True)
 
-    def _on_record_var(self, blog_id: str, key: str, var: tk.StringVar) -> None:
+    def _record_edit_step(self, rows: int = 0, cols: int = 0):
+        """편집 중 Tab/Shift-Tab은 옆 칸으로, ↑↓는 같은 열의 윗줄·아랫줄로 옮긴다."""
+        editor = getattr(self, "_record_editor", None)
+        if editor is None:
+            return "break"
+        iid = str(editor.get("blog_id") or "")
+        index = int(editor.get("index") or 0)
+        self._close_record_edit(True)
+        editable = self._record_editable_indexes()
+        if cols and editable:
+            if index in editable:
+                pos = editable.index(index)
+            else:
+                pos = min(range(len(editable)), key=lambda i: abs(editable[i] - index))
+            index = editable[(pos + cols) % len(editable)]
+        if rows:
+            visible = self._record_tree_visible()
+            if iid in visible:
+                pos = visible.index(iid) + rows
+                if 0 <= pos < len(visible):
+                    iid = visible[pos]
+        if iid:
+            self._select_blog(iid)
+            self.root.after_idle(lambda: self._edit_record_cell(iid, index))
+        return "break"
+
+    def _show_record_detail(self, iid: str, index: int) -> None:
+        tree = getattr(self, "_record_tree", None)
+        label_widget = getattr(self, "_record_detail_label", None)
+        if not self._widget_alive(tree) or not self._widget_alive(label_widget):
+            return
+        try:
+            values = tree.item(iid, "values") if iid and tree.exists(iid) else ()
+        except Exception:
+            values = ()
+        headers = self._record_headers()
+        if not values or index < 0 or index >= len(headers) or str(iid).startswith("__grp"):
+            return
+        name = headers[index]
+        value = str(values[index] if index < len(values) else "").strip()
+        title_name = "도메인" if getattr(self, "_record_mode", "main") == "log" else "블로그제목(H1)"
+        title_col = headers.index(title_name) if title_name in headers else -1
+        title = str(values[title_col] if 0 <= title_col < len(values) else "").strip()
+        key = hr.EDITABLE.get(name) if getattr(self, "_record_mode", "main") == "main" else ""
+        if key == "today_checked":
+            tail = "더블클릭 또는 Space로 체크 · 체크하면 현재상태를 확정하고 기록합니다"
+        elif key == "sheet_status":
+            tail = "선택 후 오늘확인을 체크해야 확정됩니다"
+        elif key:
+            tail = "수정 가능 · 더블클릭 또는 Enter"
+        else:
+            tail = "프로그램이 채우는 칸"
+        text = f"[{title or iid}]  {name}: {value or '(비어 있음)'}    ({tail})"
+        try:
+            label_widget.configure(text=text, fg=COLORS["text"] if value else COLORS["text_muted"])
+        except Exception:
+            pass
+
+    def _on_record_tree_click(self, event) -> None:
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree):
+            return
+        if tree.identify_region(event.x, event.y) in ("heading", "separator"):
+            return
+        row = tree.identify_row(event.y)
+        index = self._record_col_index_at(tree, event.x)
+        if index >= 0:
+            self._record_click_col = index
+        if row and str(row).startswith("__grp"):
+            return "break"
+        if row and index >= 0:
+            self.root.after_idle(lambda: self._show_record_detail(row, index))
+
+    def _on_record_tree_menu(self, event):
+        tree = getattr(self, "_record_tree", None)
+        menu = getattr(self, "_record_menu", None)
+        if not self._widget_alive(tree) or menu is None or getattr(self, "_record_mode", "main") != "main":
+            return
+        row = tree.identify_row(event.y)
+        if not row or str(row).startswith("__"):
+            return
+        self._close_record_edit(True)
+        self._record_menu_target = row
+        self._select_blog(row)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+        return "break"
+
+    def _on_record_tree_space(self, _event=None):
+        """선택한 줄의 오늘확인을 토글한다."""
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree) or getattr(self, "_record_mode", "main") != "main":
+            return
+        selected = tree.selection()
+        if not selected or str(selected[0]).startswith("__"):
+            return "break"
+        self._close_record_edit(True)
+        self._toggle_today_check(selected[0])
+        if "오늘확인" in hr.HOME_HEADERS:
+            self._show_record_detail(selected[0], hr.HOME_HEADERS.index("오늘확인"))
+        return "break"
+
+    def _on_record_tree_enter(self, _event=None):
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree):
+            return
+        selected = tree.selection()
+        if not selected or str(selected[0]).startswith("__"):
+            return "break"
+        index = int(getattr(self, "_record_click_col", 0) or 0)
+        editable = self._record_editable_indexes()
+        if editable and index not in editable:
+            index = min(editable, key=lambda i: abs(i - index))
+        self._edit_record_cell(selected[0], index)
+        return "break"
+
+    # ----- 기록 표: 찾기 / 정렬 ----------------------------------------------------
+
+    def _on_record_query_changed(self, *_args) -> None:
+        self._after_once("record_query", 120, self._arrange_record_rows)
+
+    def _sort_record_tree(self, name: str) -> None:
+        current = getattr(self, "_record_sort", None)
+        if current is None or current[0] != name:
+            self._record_sort = (name, False)
+        elif current[1] is False:
+            self._record_sort = (name, True)
+        else:
+            self._record_sort = None
+        self._arrange_record_rows()
+
+    def _record_sort_key(self, value: str):
+        text = str(value or "").strip()
+        if not text:
+            return (2, 0, "")
+        try:
+            return (0, float(text.replace(",", "")), "")
+        except ValueError:
+            return (1, 0, text.lower())
+
+    def _arrange_record_rows(self) -> None:
+        """찾기와 정렬을 한 번에 반영한다. 줄을 다시 만들지 않고 붙였다 떼기만 한다."""
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree):
+            return
+        headers = self._record_headers()
+        log_mode = getattr(self, "_record_mode", "main") == "log"
+        # 이전 묶음 머리글은 모두 지우고 다시 만든다 (실제 기록 줄은 그대로 둔다)
+        for iid in list(tree.get_children("")):
+            if str(iid).startswith("__grp"):
+                try:
+                    tree.delete(iid)
+                except Exception:
+                    pass
+        all_iids = [iid for iid in (getattr(self, "_record_all_iids", None) or []) if tree.exists(iid)]
+        order = list(all_iids)
+        sort = getattr(self, "_record_sort", None)
+        heading_text = {"계정 생성상태": "계정생성"}
+        for name in (self._record_display_headers() if not log_mode else headers):
+            label = heading_text.get(name, name)
+            if sort and sort[0] == name:
+                label = f"{label} {'▼' if sort[1] else '▲'}"
+            try:
+                if str(tree.heading(name, "text") or "") != label:
+                    tree.heading(name, text=label)
+            except Exception:
+                pass
+        sorted_by_col = bool(sort and sort[0] in headers)
+        if sorted_by_col:
+            col = headers.index(sort[0])
+
+            def key_of(iid):
+                values = tree.item(iid, "values")
+                return self._record_sort_key(values[col] if col < len(values) else "")
+
+            order.sort(key=key_of, reverse=bool(sort[1]))
+        query = ""
+        if hasattr(self, "record_query"):
+            query = str(self.record_query.get() or "").strip().lower()
+        # 이메일 탭: 처음 나온 순서대로, 개수와 함께
+        counts: dict[str, int] = {}
+        for iid in all_iids:
+            email = self._record_row_email(iid)
+            counts[email] = counts.get(email, 0) + 1
+        self._rebuild_record_tabs(counts)
+        email_filter = str(getattr(self, "_record_email_filter", "") or "")
+        shown = 0
+        for iid in order:
+            values = tree.item(iid, "values")
+            if email_filter and self._record_row_email(iid) != email_filter:
+                try:
+                    tree.detach(iid)
+                except Exception:
+                    pass
+                continue
+            if query and query not in " ".join(str(v) for v in values).lower():
+                try:
+                    tree.detach(iid)
+                except Exception:
+                    pass
+                continue
+            try:
+                if tree.parent(iid) != "" or tree.index(iid) != shown:
+                    tree.move(iid, "", shown)
+            except Exception:
+                pass
+            shown += 1
+        count_label = getattr(self, "_record_count_label", None)
+        if self._widget_alive(count_label):
+            unit = "로그" if log_mode else "기록"
+            text = f"{unit} {len(all_iids)}개 · 이메일 {len(counts)}개"
+            if email_filter or query:
+                text += f" · 보이는 {shown}개"
+            count_label.configure(text=text)
+        self._paint_record_rows()
+
+    # ----- 기록 표: 이메일 탭 ------------------------------------------------------
+
+    def _record_row_email(self, iid: str) -> str:
+        tree = getattr(self, "_record_tree", None)
+        if getattr(self, "_record_mode", "main") == "log":
+            return str((getattr(self, "_log_email", None) or {}).get(iid) or "").strip() or RECORD_NO_EMAIL
+        headers = self._record_headers()
+        col = headers.index("로그인 이메일") if "로그인 이메일" in headers else -1
+        if col < 0 or not self._widget_alive(tree):
+            return RECORD_NO_EMAIL
+        try:
+            values = tree.item(iid, "values")
+        except Exception:
+            return RECORD_NO_EMAIL
+        return str(values[col] if col < len(values) else "").strip() or RECORD_NO_EMAIL
+
+    def _rebuild_record_tabs(self, counts: dict[str, int]) -> None:
+        host = getattr(self, "_record_tab_host", None)
+        if not self._widget_alive(host):
+            return
+        total = sum(counts.values())
+        saved = [str(item).strip() for item in ((self.__dict__.get("_home_state") or {}).get("email_order") or []) if str(item).strip()]
+        seen = {item.lower() for item in saved}
+        ordered: list[tuple[str, int]] = []
+        for email in saved:
+            match = next((key for key in counts if key != RECORD_NO_EMAIL and key.lower() == email.lower()), "")
+            if match:
+                ordered.append((match, counts[match]))
+        for email, count in counts.items():
+            if email == RECORD_NO_EMAIL or email.lower() in seen:
+                continue
+            ordered.append((email, count))
+            seen.add(email.lower())
+        if RECORD_NO_EMAIL in counts:
+            ordered.append((RECORD_NO_EMAIL, counts[RECORD_NO_EMAIL]))
+        sig = tuple(ordered)
+        btns = getattr(self, "_record_tab_btns", None) or {}
+        if sig == getattr(self, "_record_tab_sig", None) and btns and all(self._widget_alive(b) for b in btns.values()):
+            return
+        self._record_tab_sig = sig
+        for child in list(host.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        btns = {}
+        items = [("", f"전체  {total}")] + [(email, f"{email}  {count}") for email, count in ordered]
+        for key, text in items:
+            btn = tk.Label(host, text=text, font=FONTS["small_bold"], padx=12, pady=5, cursor="hand2")
+            btn._keep_bg = True
+            btn.bind("<Button-1>", lambda _e, k=key: self._set_record_email_filter(k))
+            btns[key] = btn
+        self._record_tab_btns = btns
+        if str(getattr(self, "_record_email_filter", "") or "") not in btns:
+            self._record_email_filter = ""
+        self._paint_record_tabs()
+        self._reflow_record_tabs()
+
+    def _paint_record_tabs(self) -> None:
+        current = str(getattr(self, "_record_email_filter", "") or "")
+        for key, btn in (getattr(self, "_record_tab_btns", None) or {}).items():
+            if not self._widget_alive(btn):
+                continue
+            if key == current:
+                bg, fg = COLORS["accent"], "#ffffff"
+            elif key == "":
+                bg, fg = COLORS["chip_bg"], COLORS["text"]
+            else:
+                tag = self._record_email_tag(key)
+                try:
+                    bg = RECORD_EMAIL_PALETTE[int(tag.replace("email", "")) % len(RECORD_EMAIL_PALETTE)]
+                except Exception:
+                    bg = COLORS["chip_bg"]
+                fg = COLORS["text"]
+            try:
+                btn.configure(bg=bg, fg=fg)
+            except Exception:
+                pass
+
+    def _reflow_record_tabs(self) -> None:
+        """탭이 한 줄에 다 안 들어가면 다음 줄로 접는다. 표를 가리지 않는다."""
+        host = getattr(self, "_record_tab_host", None)
+        if not self._widget_alive(host):
+            return
+        width = host.winfo_width()
+        if width <= 1:
+            width = 980
+        x = row = col = 0
+        for btn in (getattr(self, "_record_tab_btns", None) or {}).values():
+            if not self._widget_alive(btn):
+                continue
+            need = btn.winfo_reqwidth() + 6
+            if col and x + need > width:
+                row += 1
+                col = 0
+                x = 0
+            btn.grid(row=row, column=col, padx=(0, 6), pady=(0, 4), sticky="w")
+            x += need
+            col += 1
+
+    def _set_record_email_filter(self, key: str) -> None:
+        if str(getattr(self, "_record_email_filter", "") or "") == key:
+            return
+        self._record_email_filter = key
+        self._paint_record_tabs()
+        self._arrange_record_rows()
+
+    def _refresh_record_tree_item(self, blog_id: str) -> None:
+        if not blog_id:
+            return
+        blog = next((item for item in self._record_blogs() if item.id == blog_id), None)
+        if blog is None:
+            self._schedule_record_view_refresh()
+            return
+        tree = getattr(self, "_record_tree", None)
+        if self._widget_alive(tree) and getattr(self, "_record_mode", "main") != "log":
+            try:
+                if tree.exists(blog_id):
+                    record = self._home_record(blog)
+                    tree.item(blog_id, values=hr.record_values(record), tags=self._record_tags(record))
+            except Exception:
+                pass
+        view = getattr(self, "_record_view_tree", None)
+        if not self._widget_alive(view):
+            return
+        work = self._work_record(blog)
+        try:
+            if view.exists(blog_id):
+                view.item(blog_id, values=work["values"], tags=work["tags"])
+                self._record_view_fp = None
+            else:
+                self._schedule_record_view_refresh()
+        except Exception:
+            self._schedule_record_view_refresh()
+
+    def _home_record(self, blog: BlogInfo, last_events: dict[str, str] | None = None) -> dict:
+        meta = self._blog_meta.get(blog.id) or {}
+        if last_events is None:
+            last_events = self._last_event_map()
+        return hr.build_record(
+            meta, blog_id=blog.id, address=str(blog.address or meta.get("address") or ""),
+            title=str(blog.name or meta.get("name") or ""), last_event_ts=last_events.get(blog.id, ""),
+        )
+
+    def _last_event_map(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for event in self._home_events():
+            blog_id = str(event.get("blog_id") or "")
+            ts = str(event.get("ts") or "")
+            if blog_id and ts >= out.get(blog_id, ""):
+                out[blog_id] = ts
+        return out
+
+    def _record_tags(self, record: dict) -> tuple:
+        """줄 색: 노출됨·잘림·삭제됨은 시트 조건부서식, 그 외는 이메일 색."""
+        status = hr.normalize_status(record.get("현재상태"))
+        if status in hr.ROW_HIGHLIGHT:
+            return (f"st_{status}",)
+        email = str(record.get("로그인 이메일") or "").strip() or RECORD_NO_EMAIL
+        return (self._record_email_tag(email),)
+
+    def _record_email_tag(self, email: str) -> str:
+        tones = getattr(self, "_record_email_tones", None)
+        if not isinstance(tones, dict):
+            tones = {}
+            self._record_email_tones = tones
+        if email not in tones:
+            tones[email] = f"email{len(tones) % len(RECORD_EMAIL_PALETTE)}"
+        return tones[email]
+
+    def _on_record_tree_select(self, _event=None) -> None:
         if getattr(self, "_records_rendering", False):
             return
-        value = var.get()
-        if key == "sheet_status" and value.strip() == "미정":
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree):
+            return
+        selected = tree.selection()
+        if selected and not str(selected[0]).startswith("__"):
+            self._select_blog(selected[0])
+
+    def _on_record_tree_double(self, event):
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree):
+            return
+        if tree.identify_region(event.x, event.y) in ("heading", "separator"):
+            return
+        row = tree.identify_row(event.y)
+        index = self._record_col_index_at(tree, event.x)
+        if not row or index < 0 or str(row).startswith("__grp"):
+            return
+        if str(row).startswith("__log"):
+            self._show_record_detail(row, index)
+            return "break"
+        self._select_blog(row)
+        self._edit_record_cell(row, index)
+        return "break"
+
+    def _render_record_rows(self, force: bool = False) -> None:
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree):
+            return
+        if not force and getattr(self, "_main_tab", "") != "기록":
+            self._record_dirty = True
+            return
+        if getattr(self, "_record_mode", "main") == "log":
+            self._render_log_rows()
+            return
+        live = self._dashboard_blogs()
+        self._fill_program_records(live)
+        blogs = self._record_blogs()
+        last_events = self._last_event_map()
+        records = [self._home_record(blog, last_events) for blog in blogs]
+        fp = tuple(tuple(hr.record_values(record)) for record in records)
+        all_iids = getattr(self, "_record_all_iids", None) or []
+        if fp == getattr(self, "_record_fp", None) and all_iids and all(tree.exists(iid) for iid in all_iids):
+            self._record_dirty = False
+            self._paint_record_rows()
+            return
+        self._close_record_edit(True)
+        self._records_rendering = True
+        try:
+            self._record_fp = fp
+            self._record_dirty = False
+            self._record_email_tones = {}
+            # 시트의 sortMasterRows_: 삭제됨 뒤로 → 이메일 → 프로그램 목록 순서/키워드 우선순위 → 처음수집 → 첫색인 → 상태
+            state = self.__dict__.get("_home_state") or {}
+            ordered = hr.sort_records(records, state.get("email_order") or [], state.get("program_order") or {})
+            # 이미 있는 줄은 값만 바꾸고, 없어진 줄만 지우고, 새 줄만 넣는다. 전체를 지웠다 다시 만들지 않는다.
+            wanted = [str(record["_id"]) for record in ordered]
+            wanted_set = set(wanted)
+            existing = set(all_iids) | set(tree.get_children(""))
+            for iid in list(existing):
+                if iid not in wanted_set:
+                    try:
+                        tree.delete(iid)
+                    except Exception:
+                        pass
+            for record in ordered:
+                iid = str(record["_id"])
+                values = hr.record_values(record)
+                tags = self._record_tags(record)
+                try:
+                    if tree.exists(iid):
+                        tree.item(iid, values=values, tags=tags)
+                    else:
+                        tree.insert("", "end", iid=iid, values=values, tags=tags)
+                except Exception:
+                    pass
+            self._record_all_iids = wanted
+        finally:
+            self._records_rendering = False
+        self._arrange_record_rows()
+        self._fill_record_view()
+
+    def _render_log_rows(self) -> None:
+        """변경 로그(AE:AK) 보기. 최신이 위."""
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree):
+            return
+        events = list(self._home_events())
+        fp = ("log", len(events), str(events[-1].get("ts") if events else ""))
+        all_iids = getattr(self, "_record_all_iids", None) or []
+        if fp == getattr(self, "_record_fp", None) and all_iids and all(tree.exists(iid) for iid in all_iids):
+            return
+        self._close_record_edit(True)
+        self._records_rendering = True
+        try:
+            self._record_fp = fp
+            self._record_dirty = False
+            for iid in list(tree.get_children("")) + list(all_iids):
+                try:
+                    if tree.exists(iid):
+                        tree.delete(iid)
+                except Exception:
+                    pass
+            wanted = []
+            emails: dict[str, str] = {}
+            for pos, event in enumerate(reversed(events)):
+                iid = f"__log_{len(events) - pos}"
+                try:
+                    tree.insert("", "end", iid=iid, values=hr.log_values(event), tags=("log_row",))
+                except Exception:
+                    continue
+                wanted.append(iid)
+                emails[iid] = str(event.get("email") or "").strip()
+            self._record_all_iids = wanted
+            self._log_email = emails
+        finally:
+            self._records_rendering = False
+        self._arrange_record_rows()
+
+    def _paint_record_rows(self) -> None:
+        tree = getattr(self, "_record_tree", None)
+        if not self._widget_alive(tree):
+            return
+        selected = (self.blog_var.get() or "").strip() if hasattr(self, "blog_var") else ""
+        current = tree.selection()
+        busy = getattr(self, "_records_rendering", False)
+        self._records_rendering = True
+        try:
+            if selected and tree.exists(selected):
+                if current != (selected,):
+                    tree.selection_set(selected)
+                    tree.focus(selected)
+                    if getattr(self, "_main_tab", "") == "기록" and tree.parent(selected) == "" and selected in tree.get_children(""):
+                        tree.see(selected)
+            elif current:
+                tree.selection_remove(*current)
+        except Exception:
+            pass
+        finally:
+            if not busy:
+                self._records_rendering = False
+
+    def _record_col_px(self, name: str) -> int:
+        return max(56, int(hr.COL_CHARS.get(name, 10) * 8.2))
+
+    def on_open_record_view(self) -> None:
+        self._record_view_email = ""
+        self._record_view_fp = None
+        self._record_view_tab_sig = None
+        if hasattr(self, "record_view_query"):
+            try:
+                self.record_view_query.set("")
+            except Exception:
+                pass
+        win = getattr(self, "_record_view_win", None)
+        if self._widget_alive(win):
+            tree = getattr(self, "_record_view_tree", None)
+            cols = tuple(item[0] for item in RECORD_VIEW_COLS)
+            current = ()
+            try:
+                if self._widget_alive(tree):
+                    current = tuple(str(item) for item in (tree.cget("columns") or ()))
+            except Exception:
+                current = ()
+            if current == cols:
+                try:
+                    win.lift()
+                    win.focus_force()
+                except Exception:
+                    pass
+                self._fill_record_view()
+                self._reveal_blog_in_record_view(str(self.blog_var.get() or "").strip() if hasattr(self, "blog_var") else "")
+                return
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._record_view_win = None
+            self._record_view_tree = None
+        win = tk.Toplevel(self.root)
+        self._record_view_win = win
+        win.title("기록 보기")
+        win.configure(bg=COLORS["card"])
+        try:
+            win.minsize(980, 560)
+        except Exception:
+            pass
+        inner = tk.Frame(win, bg=COLORS["card"])
+        inner.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
+
+        title_row = tk.Frame(inner, bg=COLORS["card"])
+        title_row.pack(fill=tk.X)
+        tk.Label(title_row, text="작업 기록", font=FONTS["heading"], fg=COLORS["text"], bg=COLORS["card"]).pack(side=tk.LEFT)
+        self._record_view_count = tk.Label(title_row, text="", font=FONTS["small"], fg=COLORS["text_muted"], bg=COLORS["card"])
+        self._record_view_count.pack(side=tk.RIGHT)
+
+        tabs = tk.Frame(inner, bg=COLORS["card"])
+        tabs.pack(fill=tk.X, pady=(6, 2))
+        self._record_view_tab_host = tabs
+        self._record_view_tab_btns = {}
+        self._record_view_email = ""
+
+        tools = tk.Frame(inner, bg=COLORS["card"])
+        tools.pack(fill=tk.X, pady=(2, 4))
+        tk.Label(tools, text="찾기", font=FONTS["small_bold"], fg=COLORS["text_muted"], bg=COLORS["card"]).pack(side=tk.LEFT)
+        if not hasattr(self, "record_view_query"):
+            self.record_view_query = tk.StringVar(value="")
+            self._trace_var(self.record_view_query, lambda *_: self._after_once("record_view_query", 120, self._fill_record_view))
+        search = tk.Entry(
+            tools, textvariable=self.record_view_query, font=FONTS["body"], width=28,
+            bg=COLORS["input_bg"], fg=COLORS["text"], relief="flat",
+            highlightthickness=1, highlightbackground=COLORS["border"], highlightcolor=COLORS["accent"],
+        )
+        search.pack(side=tk.LEFT, padx=(6, 6), ipady=3)
+        flat_button(tools, "지우기", variant="ghost", command=lambda: self.record_view_query.set("")).pack(side=tk.LEFT)
+        tk.Label(
+            tools,
+            text="노출 칸을 누르면 노출/미노출 · 더블클릭하면 메모 · 아래는 날짜별 실행 로그",
+            font=FONTS["small"], fg=COLORS["text_muted"], bg=COLORS["card"],
+        ).pack(side=tk.RIGHT)
+
+        wrap = tk.Frame(inner, bg=COLORS["card"])
+        wrap.pack(fill=tk.BOTH, expand=True)
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
+        style = ttk.Style(wrap)
+        try:
+            style.configure(
+                "RecordView.Treeview",
+                font=FONTS["body"],
+                rowheight=28,
+                background=COLORS["card"],
+                fieldbackground=COLORS["card"],
+                foreground=COLORS["text"],
+                borderwidth=0,
+            )
+            style.configure("RecordView.Treeview.Heading", font=FONTS["small_bold"], padding=(6, 4))
+            style.map("RecordView.Treeview", background=[("selected", "#c7d2fe")], foreground=[("selected", COLORS["text"])])
+        except Exception:
+            pass
+        cols = [item[0] for item in RECORD_VIEW_COLS]
+        tree = ttk.Treeview(
+            wrap,
+            columns=cols,
+            show="headings",
+            selectmode="browse",
+            style="RecordView.Treeview",
+        )
+        self._record_view_tree = tree
+        ybar = tk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+        xbar = tk.Scrollbar(wrap, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+        detail_host = tk.Frame(inner, bg=COLORS["card"])
+        detail_host.pack(fill=tk.X, pady=(8, 0))
+        tk.Label(
+            detail_host, text="선택한 블로그 실행 로그", font=FONTS["small_bold"],
+            fg=COLORS["text_muted"], bg=COLORS["card"],
+        ).pack(anchor="w")
+        detail = tk.Text(
+            detail_host, font=FONTS["small"], wrap=tk.WORD, height=7,
+            bg=COLORS["input_bg"], fg=COLORS["text"], relief="flat",
+            highlightthickness=1, highlightbackground=COLORS["border"], highlightcolor=COLORS["accent"],
+            takefocus=0,
+        )
+        detail.pack(fill=tk.X, pady=(4, 0))
+        detail.configure(state="disabled")
+        self._record_view_detail = detail
+        for index, color in enumerate(RECORD_EMAIL_PALETTE):
+            tree.tag_configure(f"email{index}", background=color)
+        for state, (bg, fg) in hr.ROW_HIGHLIGHT.items():
+            options = {"background": bg}
+            if fg:
+                options["foreground"] = fg
+            tree.tag_configure(f"st_{state}", **options)
+        self._record_view_sort = None
+        self._record_view_autosized = False
+        self._apply_record_view_columns()
+        tree.bind("<<TreeviewSelect>>", self._on_record_view_select)
+        tree.bind("<ButtonRelease-1>", self._on_record_view_click)
+        tree.bind("<Double-1>", self._on_record_view_double)
+
+        def on_close() -> None:
+            self._record_view_win = None
+            self._record_view_tree = None
+            self._record_view_tab_host = None
+            self._record_view_tab_btns = {}
+            self._record_view_fp = None
+            self._record_view_detail = None
+            memo = getattr(self, "_work_memo_win", None)
+            if self._widget_alive(memo):
+                try:
+                    memo.destroy()
+                except Exception:
+                    pass
+            self._work_memo_win = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        self._place_record_view(win)
+        self._fill_record_view()
+        self._reveal_blog_in_record_view(str(self.blog_var.get() or "").strip() if hasattr(self, "blog_var") else "")
+        self._after_once("record_view_open", 80, lambda: self._reveal_blog_in_record_view(str(self.blog_var.get() or "").strip() if hasattr(self, "blog_var") else ""))
+
+    def _place_record_view(self, win) -> None:
+        try:
+            win.update_idletasks()
+            screen_w = win.winfo_screenwidth()
+            screen_h = win.winfo_screenheight()
+            max_w = max(980, int(screen_w * 0.92))
+            max_h = max(560, int(screen_h * 0.86))
+            width = min(max_w, max(1180, int(screen_w * 0.84)))
+            height = min(max_h, max(720, int(screen_h * 0.78)))
+            x = self.root.winfo_rootx() + 24
+            y = self.root.winfo_rooty() + 24
+            x = min(max(0, x), max(0, screen_w - width))
+            y = min(max(0, y), max(0, screen_h - height))
+            win.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
+            win.maxsize(max_w, max_h)
+        except Exception:
+            try:
+                win.geometry("1280x800")
+            except Exception:
+                pass
+
+    def _apply_record_view_columns(self) -> None:
+        tree = getattr(self, "_record_view_tree", None)
+        if not self._widget_alive(tree):
+            return
+        cols = [item[0] for item in RECORD_VIEW_COLS]
+        sort = getattr(self, "_record_view_sort", None)
+        try:
+            current = tuple(str(item) for item in (tree.cget("columns") or ()))
+        except Exception:
+            current = ()
+        if current != tuple(cols):
+            self._record_view_fp = None
+            try:
+                tree.configure(columns=cols, displaycolumns=cols, show="headings")
+            except Exception:
+                pass
+        for key, title, width in RECORD_VIEW_COLS:
+            label = title
+            if sort and sort[0] == key:
+                label = f"{title} {'▼' if sort[1] else '▲'}"
+            try:
+                tree.heading(key, text=label, anchor="w", command=lambda n=key: self._sort_record_view_col(n))
+                tree.column(key, width=width, minwidth=64, stretch=False, anchor="w")
+            except Exception:
+                pass
+
+    def _sort_record_view_home(self) -> None:
+        self._record_view_sort = None
+        self._fill_record_view()
+
+    def _sort_record_view_col(self, name: str) -> None:
+        current = getattr(self, "_record_view_sort", None)
+        if current is None or current[0] != name:
+            self._record_view_sort = (name, False)
+        elif current[1] is False:
+            self._record_view_sort = (name, True)
+        else:
+            self._record_view_sort = None
+        self._fill_record_view()
+
+    def _on_record_view_select(self, _event=None) -> None:
+        tree = getattr(self, "_record_view_tree", None)
+        if not self._widget_alive(tree):
+            return
+        selected = tree.selection()
+        pick = selected[0] if selected and not str(selected[0]).startswith("__") else ""
+        if getattr(self, "_syncing_record_pick", False):
+            if pick:
+                self._show_record_view_detail(pick)
+            return
+        if pick:
+            self._reveal_blog_in_list(pick)
+            self._show_record_view_detail(pick)
+
+    def _on_record_view_click(self, event) -> None:
+        tree = getattr(self, "_record_view_tree", None)
+        if not self._widget_alive(tree):
+            return
+        if tree.identify_region(event.x, event.y) in ("heading", "separator"):
+            return
+        row = tree.identify_row(event.y)
+        if row and not str(row).startswith("__"):
+            if getattr(self, "_syncing_record_pick", False):
+                self._show_record_view_detail(row)
+                return
+            self._reveal_blog_in_list(row)
+            self._show_record_view_detail(row)
+            if self._record_view_col_key(event.x) == "shown":
+                self._edit_work_shown(row)
+
+    def _on_record_view_double(self, event) -> None:
+        tree = getattr(self, "_record_view_tree", None)
+        if not self._widget_alive(tree):
+            return
+        if tree.identify_region(event.x, event.y) in ("heading", "separator"):
+            return
+        row = tree.identify_row(event.y)
+        if row and not str(row).startswith("__"):
+            if self._record_view_col_key(event.x) == "shown":
+                self._edit_work_shown(row)
+                return "break"
+            self._open_work_memo(row)
+            return "break"
+
+    def _record_view_col_key(self, x) -> str:
+        tree = getattr(self, "_record_view_tree", None)
+        if not self._widget_alive(tree):
+            return ""
+        col = tree.identify_column(x)
+        try:
+            index = int(str(col).replace("#", "")) - 1
+        except ValueError:
+            return ""
+        keys = [item[0] for item in RECORD_VIEW_COLS]
+        if 0 <= index < len(keys):
+            return keys[index]
+        return ""
+
+    def _work_shown_label(self, status: str) -> str:
+        if hr.normalize_status(status) in ("노출됨", "별도키워드노출"):
+            return "노출"
+        return "미노출"
+
+    def _close_work_shown_edit(self, apply: bool = True) -> None:
+        editor = getattr(self, "_work_shown_editor", None)
+        self._work_shown_editor = None
+        if not editor:
+            return
+        widget = editor.get("widget")
+        blog_id = str(editor.get("blog_id") or "")
+        value = ""
+        try:
+            value = str(widget.get() or "").strip()
+        except Exception:
             value = ""
-        self._set_record_field(blog_id, key, value)
+        try:
+            widget.destroy()
+        except Exception:
+            pass
+        if apply and blog_id and value in ("노출", "미노출"):
+            self._apply_work_shown(blog_id, value == "노출")
+
+    def _edit_work_shown(self, blog_id: str) -> None:
+        tree = getattr(self, "_record_view_tree", None)
+        if not self._widget_alive(tree) or not blog_id or str(blog_id).startswith("__"):
+            return
+        self._close_work_shown_edit(True)
+        try:
+            if not tree.exists(blog_id):
+                return
+            tree.see(blog_id)
+            tree.update_idletasks()
+            index = [item[0] for item in RECORD_VIEW_COLS].index("shown")
+            bbox = tree.bbox(blog_id, f"#{index + 1}")
+        except Exception:
+            bbox = None
+        if not bbox:
+            return
+        x, y, width, height = bbox
+        meta = self._blog_meta.get(blog_id) or {}
+        current = self._work_shown_label(meta.get("confirmed_status") or meta.get("sheet_status"))
+        widget = ttk.Combobox(tree, values=("노출", "미노출"), state="readonly", font=FONTS["body"])
+        widget.set(current)
+        widget.place(x=x, y=y, width=max(width, 90), height=max(height, 24))
+        widget.focus_set()
+        self._work_shown_editor = {"widget": widget, "blog_id": blog_id}
+        widget.bind("<<ComboboxSelected>>", lambda _e: self._close_work_shown_edit(True))
+        widget.bind("<Escape>", lambda _e: (self._close_work_shown_edit(False), "break")[1])
+        widget.bind("<FocusOut>", lambda _e, w=widget: self._after_once("work_shown_blur", 150, lambda: self._work_shown_blur(w)))
+
+    def _work_shown_blur(self, widget) -> None:
+        editor = getattr(self, "_work_shown_editor", None)
+        if editor is None or editor.get("widget") is not widget:
+            return
+        try:
+            focus = widget.winfo_toplevel().focus_get()
+        except Exception:
+            return
+        if focus is widget:
+            return
+        self._close_work_shown_edit(True)
+
+    def _apply_work_shown(self, blog_id: str, shown: bool) -> None:
+        cur = self._blog_meta.setdefault(blog_id, {})
+        current = hr.normalize_status(cur.get("confirmed_status") or cur.get("sheet_status"))
+        if shown:
+            if current == "노출됨":
+                return
+            self._confirm_record(blog_id, "노출됨", source="수동", check_today=True)
+            return
+        if current not in ("노출됨", "별도키워드노출"):
+            return
+        if cur.get("naver_indexed") is False:
+            nxt = "미색인"
+        elif cur.get("naver_indexed") is True or hr.has_index_history(cur):
+            nxt = "색인됨"
+        else:
+            nxt = "색인됨"
+        self._confirm_record(blog_id, nxt, source="수동", check_today=True)
+
+    def _step_label(self, done: set[str], keys: tuple[str, ...], *, done_text: str, empty_text: str) -> str:
+        finished = [key for key in keys if key in done]
+        pending = [SETTING_NAME.get(key, key) for key in keys if key not in done]
+        if not pending and finished:
+            return done_text
+        if not finished:
+            return empty_text
+        return f"{len(finished)}/{len(keys)} 완료 · {' · '.join(pending)} 남음"
+
+    def _step_marks(self, done: set[str], keys: tuple[str, ...]) -> str:
+        parts = []
+        for key in keys:
+            name = SETTING_NAME.get(key, key)
+            parts.append(f"완료 {name}" if key in done else f"남음 {name}")
+        return " · ".join(parts)
+
+    def _work_record(self, blog: BlogInfo) -> dict:
+        meta = self._blog_meta.get(blog.id) or {}
+        done = set(getattr(blog, "done", set()) or [])
+        done.update(self._progress_map.get(blog.id) or [])
+        created = hr.md(meta.get("created_date")) or "—"
+        settings_when = self._fmt_when(str(meta.get("settings_applied_at") or ""))
+        settings_done = "완료" + (f" · {settings_when}" if settings_when else "")
+        settings = self._step_label(done, SETTINGS_APPLY_KEYS, done_text=settings_done, empty_text="미적용")
+        first = str(meta.get("blog_collect_at") or meta.get("last_blog_crawl") or "")
+        first_when = self._fmt_when(first)
+        posts = len(blog.posts or [])
+        if "collect" in done and "collect_post" in done:
+            collect_done = "완료" + (f" · {first_when}" if first_when else "")
+            if posts:
+                collect_done += f" · 글 {posts}"
+        elif "collect" in done:
+            collect_done = "블로그수집" + (f" · {first_when}" if first_when else "") + " · 글 미수집"
+        else:
+            collect_done = "미수집"
+        collect = self._step_label(done, FIRST_COLLECT_KEYS, done_text=collect_done, empty_text="미수집")
+        if "collect" in done and "collect_post" not in done:
+            collect = collect_done
+        index_name, _tone, extra = self._index_status_view(blog)
+        index = index_name if not extra else f"{index_name} · {extra}"
+        status = hr.normalize_status(meta.get("confirmed_status") or meta.get("sheet_status"))
+        shown = self._work_shown_label(status)
+        if shown == "노출":
+            when = self._fmt_when(str(meta.get("first_core") or meta.get("last_core") or ""))
+            extra_kw = str(meta.get("exposed_keyword") or "").strip()
+            if status == "별도키워드노출" and extra_kw:
+                shown = f"노출 · {extra_kw}"
+            elif when:
+                shown = f"노출 · {when}"
+        recrawl_n = self._count_value(meta.get("blog_crawl_count"))
+        recrawl = f"{recrawl_n}회"
+        if recrawl_n:
+            last = self._fmt_when(str(meta.get("last_blog_crawl") or ""))
+            if last:
+                recrawl += f" · {last}"
+        note = " ".join(str(meta.get("sheet_note") or "").split())
+        title = str(blog.name or meta.get("name") or meta.get("h1") or blog.address or blog.id)
+        keyword = str(meta.get("keyword") or "")
+        values = (
+            title,
+            created,
+            keyword,
+            settings,
+            collect,
+            index,
+            shown,
+            recrawl,
+            note,
+        )
+        detail_lines = [
+            title,
+            f"생성일 {created}" + (f"  ·  키워드 {keyword}" if keyword else ""),
+            f"설정적용  {settings}",
+            f"  {self._step_marks(done, SETTINGS_APPLY_KEYS)}",
+            f"최초수집  {collect}",
+            f"  {self._step_marks(done, FIRST_COLLECT_KEYS)}",
+            f"색인확인  {index}",
+            f"노출  {shown}",
+            f"재수집  {recrawl}",
+        ]
+        if note:
+            detail_lines.append(f"메모  {note}")
+        flow = str(meta.get("status_flow") or "").strip()
+        if flow:
+            detail_lines.append(f"흐름  {flow}")
+        if status in hr.ROW_HIGHLIGHT:
+            tags = (f"st_{status}",)
+        else:
+            email = str(meta.get("google_email") or "").strip() or RECORD_NO_EMAIL
+            tags = (self._record_email_tag(email),)
+        return {
+            "_id": blog.id,
+            "email": str(meta.get("google_email") or "").strip() or RECORD_NO_EMAIL,
+            "values": values,
+            "tags": tags,
+            "search": " ".join(str(item) for item in values).lower(),
+            "status": status,
+            "detail": "\n".join(detail_lines),
+        }
+
+    def _schedule_record_view_refresh(self) -> None:
+        if not self._widget_alive(getattr(self, "_record_view_win", None)):
+            return
+        self._after_once("record_view", 80, self._fill_record_view)
+
+    def _work_sorted_rows(self) -> list[dict]:
+        live = self._dashboard_blogs()
+        self._fill_program_records(live)
+        blogs = self._record_blogs()
+        rows = [self._work_record(blog) for blog in blogs]
+        last_events = self._last_event_map()
+        home = [self._home_record(blog, last_events) for blog in blogs]
+        state = self.__dict__.get("_home_state") or {}
+        ordered_home = hr.sort_records(home, state.get("email_order") or [], state.get("program_order") or {})
+        work_map = {row["_id"]: row for row in rows}
+        ordered = [work_map[str(item.get("_id"))] for item in ordered_home if str(item.get("_id")) in work_map]
+        for blog_id, row in work_map.items():
+            if row not in ordered:
+                ordered.append(row)
+        sort = getattr(self, "_record_view_sort", None)
+        keys = [item[0] for item in RECORD_VIEW_COLS]
+        if sort and sort[0] in keys:
+            col = keys.index(sort[0])
+
+            def key_of(row):
+                values = row.get("values") or ()
+                return self._record_sort_key(values[col] if col < len(values) else "")
+
+            ordered.sort(key=key_of, reverse=bool(sort[1]))
+        return ordered
+
+    def _open_work_memo(self, blog_id: str) -> None:
+        blog_id = str(blog_id or "").strip()
+        if not blog_id:
+            return
+        meta = self._blog_meta.setdefault(blog_id, {})
+        title = str(meta.get("name") or meta.get("h1") or meta.get("address") or blog_id[-6:])
+        win = getattr(self, "_work_memo_win", None)
+        if self._widget_alive(win):
+            try:
+                win.lift()
+                win.focus_force()
+            except Exception:
+                pass
+        else:
+            parent = getattr(self, "_record_view_win", None)
+            win = tk.Toplevel(parent if self._widget_alive(parent) else self.root)
+            self._work_memo_win = win
+            win.title("메모")
+            win.configure(bg=COLORS["card"])
+            try:
+                win.minsize(420, 280)
+            except Exception:
+                pass
+            inner = tk.Frame(win, bg=COLORS["card"])
+            inner.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
+            self._work_memo_title = tk.Label(
+                inner, text="", font=FONTS["heading"], fg=COLORS["text"], bg=COLORS["card"], anchor="w",
+            )
+            self._work_memo_title.pack(fill=tk.X)
+            tk.Label(
+                inner, text="이 블로그에서 한 일을 적어 두면 기록보기에서 바로 보입니다.",
+                font=FONTS["small"], fg=COLORS["text_muted"], bg=COLORS["card"], anchor="w",
+            ).pack(fill=tk.X, pady=(2, 6))
+            text = tk.Text(
+                inner, font=FONTS["body"], wrap=tk.WORD, height=10,
+                bg=COLORS["input_bg"], fg=COLORS["text"], relief="flat",
+                highlightthickness=1, highlightbackground=COLORS["border"], highlightcolor=COLORS["accent"],
+            )
+            text.pack(fill=tk.BOTH, expand=True)
+            self._work_memo_text = text
+            btns = tk.Frame(inner, bg=COLORS["card"])
+            btns.pack(fill=tk.X, pady=(8, 0))
+            flat_button(btns, "저장", variant="primary", command=self._save_work_memo).pack(side=tk.RIGHT)
+            flat_button(btns, "닫기", variant="ghost", command=lambda: on_close()).pack(side=tk.RIGHT, padx=(0, 6))
+
+            def on_close() -> None:
+                self._work_memo_win = None
+                self._work_memo_text = None
+                self._work_memo_id = ""
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+
+            win.protocol("WM_DELETE_WINDOW", on_close)
+            try:
+                win.geometry("520x360")
+            except Exception:
+                pass
+        self._work_memo_id = blog_id
+        title_lbl = getattr(self, "_work_memo_title", None)
+        if self._widget_alive(title_lbl):
+            title_lbl.configure(text=title)
+        box = getattr(self, "_work_memo_text", None)
+        if self._widget_alive(box):
+            box.delete("1.0", tk.END)
+            box.insert("1.0", str(meta.get("sheet_note") or ""))
+            try:
+                box.focus_set()
+            except Exception:
+                pass
+
+    def _save_work_memo(self) -> None:
+        blog_id = str(getattr(self, "_work_memo_id", "") or "")
+        box = getattr(self, "_work_memo_text", None)
+        if not blog_id or not self._widget_alive(box):
+            return
+        try:
+            value = box.get("1.0", "end-1c")
+        except Exception:
+            value = ""
+        self._set_record_field(blog_id, "sheet_note", value)
+        self._schedule_record_view_refresh()
+        win = getattr(self, "_work_memo_win", None)
+        if self._widget_alive(win):
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self._work_memo_win = None
+        self._work_memo_text = None
+        self._work_memo_id = ""
+
+    def _reveal_blog_in_list(self, blog_id: str) -> None:
+        """기록보기에서 고른 줄의 블로그를 목록 가운데로 보여 준다."""
+        blog_id = str(blog_id or "").strip()
+        if not blog_id:
+            return
+        blog_id = self._live_blog_id(blog_id)
+        if not blog_id:
+            return
+        self._syncing_record_pick = True
+        try:
+            prev = str(self.blog_var.get() or "").strip() if hasattr(self, "blog_var") else ""
+            if prev != blog_id:
+                self._select_blog(blog_id)
+            else:
+                self._paint_rows_for(blog_id)
+            if self.blog_var.get() != blog_id:
+                self.blog_var.set(blog_id)
+                self._paint_rows_for(blog_id)
+        finally:
+            self._syncing_record_pick = False
+        wait = 40
+        if getattr(self, "_blog_filter", "all") != "all":
+            self._set_blog_filter("all")
+            wait = 120
+        if hasattr(self, "blog_query") and str(self.blog_query.get() or "").strip():
+            self.blog_query.set("")
+            wait = 120
+        self._vis_key = None
+        self._apply_blog_visibility()
+        was = str(getattr(self, "_main_tab", "") or "")
+        self._show_main_tab("블로그")
+        if was != "블로그":
+            wait = max(wait, 120)
+        if getattr(self, "_main_tab", "") == "블로그" and (getattr(self, "_detail_dirty", False) or prev != blog_id):
+            self._render_blog_detail()
+        self._scroll_blog_list_to(blog_id)
+        self._after_once("reveal_blog", wait, lambda: self._scroll_blog_list_to(blog_id, tries=8, wait=50))
+        win = getattr(self, "_record_view_win", None)
+        tree = getattr(self, "_record_view_tree", None)
+        if self._widget_alive(win):
+            try:
+                win.lift()
+            except Exception:
+                pass
+        if self._widget_alive(tree):
+            try:
+                tree.focus_set()
+            except Exception:
+                pass
+
+    def _reveal_blog_in_record_view(self, blog_id: str) -> None:
+        """목록에서 고른 블로그를 열린 작업 기록 창에서 보이게 한다."""
+        blog_id = str(blog_id or "").strip()
+        if not blog_id:
+            return
+        win = getattr(self, "_record_view_win", None)
+        tree = getattr(self, "_record_view_tree", None)
+        if not self._widget_alive(win) or not self._widget_alive(tree):
+            return
+        self._syncing_record_pick = True
+        try:
+            exists = False
+            try:
+                exists = bool(tree.exists(blog_id))
+            except Exception:
+                exists = False
+            if not exists:
+                changed = False
+                if str(getattr(self, "_record_view_email", "") or ""):
+                    self._record_view_email = ""
+                    changed = True
+                if hasattr(self, "record_view_query") and str(self.record_view_query.get() or "").strip():
+                    self.record_view_query.set("")
+                    changed = True
+                if changed:
+                    self._record_view_fp = None
+                    self._paint_record_view_tabs()
+                    self._fill_record_view()
+                try:
+                    exists = bool(tree.exists(blog_id))
+                except Exception:
+                    exists = False
+            if not exists:
+                return
+            try:
+                tree.selection_set(blog_id)
+                tree.focus(blog_id)
+                tree.see(blog_id)
+            except Exception:
+                pass
+            self._show_record_view_detail(blog_id)
+        finally:
+            self._syncing_record_pick = False
+
+    def _live_blog_id(self, blog_id: str) -> str:
+        """기록 줄 아이디를 지금 목록에 있는 블로그 아이디로 맞춘다."""
+        frames = getattr(self, "_blog_row_frames", None) or {}
+        if blog_id in frames and self._widget_alive(frames.get(blog_id)):
+            return blog_id
+        live = {blog.id: blog for blog in self._dashboard_blogs()}
+        if blog_id in live:
+            return blog_id
+        meta = self._blog_meta.get(blog_id) or {}
+        name = str(meta.get("name") or meta.get("h1") or "").strip()
+        address = str(meta.get("address") or "").strip().rstrip("/").lower()
+        if name:
+            for blog in live.values():
+                if str(blog.name or "").strip() == name:
+                    return blog.id
+        if address:
+            for blog in live.values():
+                if str(blog.address or "").strip().rstrip("/").lower() == address:
+                    return blog.id
+        return blog_id
+
+    def _scroll_blog_list_to(self, blog_id: str, tries: int = 0, wait: int = 40) -> None:
+        blog_id = self._live_blog_id(blog_id)
+        row = (getattr(self, "_blog_row_frames", None) or {}).get(blog_id)
+        host = getattr(self, "blog_list", None)
+        if not self._widget_alive(row) or not self._widget_alive(host):
+            if tries > 0:
+                if getattr(self, "_main_tab", "") == "블로그" and getattr(self, "_blog_dirty", False):
+                    self._refresh_dashboard()
+                self._after_once("reveal_blog", wait, lambda: self._scroll_blog_list_to(blog_id, tries - 1, wait))
+            return
+        if not row.winfo_ismapped():
+            try:
+                row.pack(fill=tk.X, pady=4, padx=2)
+            except Exception:
+                pass
+            if tries > 0:
+                self._after_once("reveal_blog", wait, lambda: self._scroll_blog_list_to(blog_id, tries - 1, wait))
+            return
+        if hasattr(host, "scroll_to_widget"):
+            host.scroll_to_widget(row)
+        self._paint_rows_for(blog_id)
+
+    def _record_sorted_rows(self) -> list[dict]:
+        live = self._dashboard_blogs()
+        self._fill_program_records(live)
+        blogs = self._record_blogs()
+        last_events = self._last_event_map()
+        records = [self._home_record(blog, last_events) for blog in blogs]
+        state = self.__dict__.get("_home_state") or {}
+        return hr.sort_records(records, state.get("email_order") or [], state.get("program_order") or {})
+
+    def _fill_record_view(self) -> None:
+        self._close_work_shown_edit(False)
+        tree = getattr(self, "_record_view_tree", None)
+        if not self._widget_alive(tree):
+            return
+        rows = self._work_sorted_rows()
+        query = ""
+        if hasattr(self, "record_view_query"):
+            query = str(self.record_view_query.get() or "").strip().lower()
+        counts: dict[str, int] = {}
+        for row in rows:
+            email = str(row.get("email") or "").strip() or RECORD_NO_EMAIL
+            counts[email] = counts.get(email, 0) + 1
+        self._rebuild_record_view_tabs(counts)
+        email_filter = str(getattr(self, "_record_view_email", "") or "")
+        if email_filter and email_filter not in counts:
+            self._record_view_email = ""
+            email_filter = ""
+            self._paint_record_view_tabs()
+        self._apply_record_view_columns()
+        visible = []
+        for row in rows:
+            email = str(row.get("email") or "").strip() or RECORD_NO_EMAIL
+            if email_filter and email != email_filter:
+                continue
+            if query and query not in str(row.get("search") or ""):
+                continue
+            iid = str(row.get("_id") or "")
+            if not iid:
+                continue
+            visible.append(row)
+        if not visible and rows and (email_filter or query):
+            self._record_view_email = ""
+            if hasattr(self, "record_view_query"):
+                self.record_view_query.set("")
+            email_filter = ""
+            query = ""
+            self._paint_record_view_tabs()
+            visible = [row for row in rows if str(row.get("_id") or "")]
+        fp = tuple((str(row["_id"]), tuple(row["values"]), tuple(row["tags"])) for row in visible)
+        if fp == getattr(self, "_record_view_fp", None):
+            count = getattr(self, "_record_view_count", None)
+            if self._widget_alive(count):
+                text = f"기록 {len(rows)}개 · 이메일 {len(counts)}개"
+                if email_filter or query:
+                    text += f" · 보이는 {len(visible)}개"
+                try:
+                    if str(count.cget("text") or "") != text:
+                        count.configure(text=text)
+                except Exception:
+                    pass
+            pick = ""
+            try:
+                sel = list(tree.selection())
+                pick = sel[0] if sel else ""
+            except Exception:
+                pick = ""
+            self._show_record_view_detail(pick)
+            return
+        self._record_view_fp = fp
+        try:
+            y0 = tree.yview()[0]
+        except Exception:
+            y0 = 0
+        try:
+            selected = list(tree.selection())
+        except Exception:
+            selected = []
+        wanted = [str(row["_id"]) for row in visible]
+        wanted_set = set(wanted)
+        try:
+            existing = list(tree.get_children(""))
+        except Exception:
+            existing = []
+        for iid in existing:
+            if iid not in wanted_set:
+                try:
+                    tree.delete(iid)
+                except Exception:
+                    pass
+        for row in visible:
+            iid = str(row["_id"])
+            try:
+                if tree.exists(iid):
+                    tree.item(iid, values=row["values"], tags=row["tags"])
+                else:
+                    tree.insert("", "end", iid=iid, values=row["values"], tags=row["tags"])
+            except Exception:
+                pass
+        try:
+            current = list(tree.get_children(""))
+            for index, iid in enumerate(wanted):
+                if index < len(current) and current[index] != iid and tree.exists(iid):
+                    tree.move(iid, "", index)
+                    current = list(tree.get_children(""))
+        except Exception:
+            pass
+        keep = [iid for iid in selected if iid in wanted_set]
+        current_blog = str(self.blog_var.get() or "").strip() if hasattr(self, "blog_var") else ""
+        if current_blog and current_blog in wanted_set:
+            keep = [current_blog]
+        try:
+            if keep:
+                was = getattr(self, "_syncing_record_pick", False)
+                self._syncing_record_pick = True
+                try:
+                    tree.selection_set(keep)
+                finally:
+                    self._syncing_record_pick = was
+            tree.yview_moveto(y0)
+        except Exception:
+            pass
+        count = getattr(self, "_record_view_count", None)
+        if self._widget_alive(count):
+            text = f"기록 {len(rows)}개 · 이메일 {len(counts)}개"
+            if email_filter or query:
+                text += f" · 보이는 {len(visible)}개"
+            count.configure(text=text)
+        self._autosize_record_view_columns(visible)
+        self._record_view_autosized = True
+        focus = ""
+        try:
+            if keep:
+                focus = keep[0]
+            elif selected:
+                focus = selected[0] if selected[0] in wanted_set else ""
+            elif wanted:
+                focus = wanted[0]
+        except Exception:
+            focus = wanted[0] if wanted else ""
+        self._show_record_view_detail(focus)
+
+    def _autosize_record_view_columns(self, rows: list[dict]) -> None:
+        if getattr(self, "_record_view_autosized", False):
+            return
+        tree = getattr(self, "_record_view_tree", None)
+        if not self._widget_alive(tree):
+            return
+        try:
+            body = tkfont.Font(font=FONTS["body"])
+            head = tkfont.Font(font=FONTS["small_bold"])
+        except Exception:
+            return
+        for index, (key, title, min_w) in enumerate(RECORD_VIEW_COLS):
+            width = head.measure(title) + 36
+            for row in rows:
+                values = row.get("values") or ()
+                text = str(values[index] if index < len(values) else "")
+                width = max(width, body.measure(text) + 24)
+            width = max(min_w, width)
+            try:
+                tree.column(key, width=width, minwidth=64, stretch=False, anchor="w")
+            except Exception:
+                pass
+
+    def _show_record_view_detail(self, blog_id: str = "") -> None:
+        box = getattr(self, "_record_view_detail", None)
+        if not self._widget_alive(box):
+            return
+        text = "줄을 누르면 그 블로그의 날짜별 실행 로그가 여기에 보입니다."
+        blog_id = str(blog_id or "").strip()
+        if blog_id and not blog_id.startswith("__"):
+            text = self._blog_execution_log(blog_id)
+        try:
+            box.configure(state="normal")
+            box.delete("1.0", tk.END)
+            box.insert("1.0", text)
+            box.configure(state="disabled")
+        except Exception:
+            pass
+        if getattr(self, "_work_shown_editor", None):
+            return
+        tree = getattr(self, "_record_view_tree", None)
+        if self._widget_alive(tree):
+            try:
+                tree.focus_set()
+            except Exception:
+                pass
+
+    def _event_when(self, raw) -> datetime | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", ""))
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(text[:10], fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _append_work_event(self, blog_id: str, text: str, *, source: str = "프로그램", note: str = "") -> None:
+        blog_id = str(blog_id or "").strip()
+        label = str(text or "").strip()
+        if not blog_id or not label:
+            return
+        cur = self._blog_meta.get(blog_id) or {}
+        self._home_events().append(
+            hr.make_event(
+                cur,
+                blog_id=blog_id,
+                domain=self._record_domain(blog_id),
+                old=hr.normalize_status(cur.get("confirmed_status") or cur.get("sheet_status")),
+                event=label,
+                when=datetime.now(),
+                source=source,
+                note=note,
+            )
+        )
+        self._schedule_home_save()
+        self._schedule_record_view_refresh()
+
+    def _blog_execution_log(self, blog_id: str) -> str:
+        blog_id = str(blog_id or "").strip()
+        items: list[tuple[datetime, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add(raw, text) -> None:
+            dt = self._event_when(raw)
+            label = " ".join(str(text or "").split())
+            if dt is None or not label:
+                return
+            key = (dt.strftime("%Y-%m-%d %H:%M"), label.split(" · ")[0])
+            if key in seen:
+                return
+            seen.add(key)
+            items.append((dt, label))
+
+        for event in self._home_events():
+            if str(event.get("blog_id") or "") != blog_id:
+                continue
+            add(event.get("ts"), event.get("event"))
+        meta = self._blog_meta.get(blog_id) or {}
+        add(meta.get("created_date"), "생성")
+        add(meta.get("settings_applied_at"), "설정 적용")
+        add(meta.get("blog_collect_at"), "최초 수집")
+        first = str(meta.get("blog_collect_at") or "")
+        last_blog = str(meta.get("last_blog_crawl") or "")
+        if last_blog and last_blog[:16] != first[:16]:
+            count = self._count_value(meta.get("blog_crawl_count"))
+            add(last_blog, f"재수집 · {count}회" if count else "재수집")
+        add(meta.get("last_post_crawl"), "글 수집")
+        checked = meta.get("naver_index_checked_at")
+        if checked:
+            indexed = meta.get("naver_indexed")
+            extra = "색인됨" if indexed is True else ("미색인" if indexed is False else "확인")
+            add(checked, f"색인 확인 · {extra}")
+        add(meta.get("first_core") or meta.get("last_core"), "노출")
+        if not items:
+            return "이 블로그의 실행 로그가 아직 없습니다."
+        items.sort(key=lambda item: item[0], reverse=True)
+        groups: dict[str, list[str]] = {}
+        order: list[str] = []
+        now_year = datetime.now().year
+        for dt, label in items:
+            day = f"{dt.year}.{dt.month}/{dt.day}" if dt.year != now_year else f"{dt.month}/{dt.day}"
+            if day not in groups:
+                groups[day] = []
+                order.append(day)
+            groups[day].append(f"  {dt.strftime('%H:%M')}  {label}")
+        lines: list[str] = []
+        for day in order:
+            lines.append(day)
+            lines.extend(groups[day])
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _rebuild_record_view_tabs(self, counts: dict[str, int]) -> None:
+        host = getattr(self, "_record_view_tab_host", None)
+        if not self._widget_alive(host):
+            return
+        total = sum(counts.values())
+        saved = [str(item).strip() for item in ((self.__dict__.get("_home_state") or {}).get("email_order") or []) if str(item).strip()]
+        seen = {item.lower() for item in saved}
+        ordered: list[tuple[str, int]] = []
+        for email in saved:
+            match = next((key for key in counts if key != RECORD_NO_EMAIL and key.lower() == email.lower()), "")
+            if match:
+                ordered.append((match, counts[match]))
+        for email, count in counts.items():
+            if email == RECORD_NO_EMAIL or email.lower() in seen:
+                continue
+            ordered.append((email, count))
+            seen.add(email.lower())
+        if RECORD_NO_EMAIL in counts:
+            ordered.append((RECORD_NO_EMAIL, counts[RECORD_NO_EMAIL]))
+        items = [("", f"전체  {total}")] + [(email, f"{email}  {count}") for email, count in ordered]
+        sig = tuple(items)
+        btns = getattr(self, "_record_view_tab_btns", None) or {}
+        if sig == getattr(self, "_record_view_tab_sig", None) and btns and all(self._widget_alive(b) for b in btns.values()):
+            self._paint_record_view_tabs()
+            return
+        self._record_view_tab_sig = sig
+        for child in list(host.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        btns = {}
+        x = row = col = 0
+        width = max(host.winfo_width(), 980)
+        for key, text in items:
+            btn = tk.Label(host, text=text, font=FONTS["small_bold"], padx=12, pady=5, cursor="hand2")
+            btn._keep_bg = True
+            btn.bind("<Button-1>", lambda _e, k=key: self._set_record_view_email(k))
+            need = btn.winfo_reqwidth() + 6 if btn.winfo_reqwidth() > 1 else len(text) * 8 + 30
+            if col and x + need > width:
+                row += 1
+                col = 0
+                x = 0
+            btn.grid(row=row, column=col, padx=(0, 6), pady=(0, 4), sticky="w")
+            x += need
+            col += 1
+            btns[key] = btn
+        self._record_view_tab_btns = btns
+        if str(getattr(self, "_record_view_email", "") or "") not in btns:
+            self._record_view_email = ""
+        self._paint_record_view_tabs()
+
+    def _paint_record_view_tabs(self) -> None:
+        current = str(getattr(self, "_record_view_email", "") or "")
+        for key, btn in (getattr(self, "_record_view_tab_btns", None) or {}).items():
+            if not self._widget_alive(btn):
+                continue
+            if key == current:
+                bg, fg = COLORS["accent"], "#ffffff"
+            elif key == "":
+                bg, fg = COLORS["chip_bg"], COLORS["text"]
+            else:
+                tag = self._record_email_tag(key)
+                try:
+                    bg = RECORD_EMAIL_PALETTE[int(tag.replace("email", "")) % len(RECORD_EMAIL_PALETTE)]
+                except Exception:
+                    bg = COLORS["chip_bg"]
+                fg = COLORS["text"]
+            try:
+                btn.configure(bg=bg, fg=fg)
+            except Exception:
+                pass
+
+    def _set_record_view_email(self, key: str) -> None:
+        if str(getattr(self, "_record_view_email", "") or "") == key:
+            return
+        self._record_view_email = key
+        self._paint_record_view_tabs()
+        self._fill_record_view()
 
     def _sheet_url_or_warn(self) -> str:
         url = self.sheet_url_var.get().strip() if hasattr(self, "sheet_url_var") else ""
@@ -1826,17 +3966,13 @@ class BloggerApp:
         if not blogs:
             messagebox.showwarning("기록 시트", "이메일을 넣을 블로그를 선택해 주세요.")
             return
-        self._records_rendering = True
-        try:
-            for blog in blogs:
-                cur = self._blog_meta.setdefault(blog.id, {})
-                cur["google_email"] = email
-                var = (self._record_vars.get(blog.id) or {}).get("google_email")
-                if var is not None:
-                    var.set(email)
-        finally:
-            self._records_rendering = False
+        for blog in blogs:
+            cur = self._blog_meta.setdefault(blog.id, {})
+            cur["google_email"] = email
         self._schedule_meta_save()
+        self._record_fp = None
+        for blog in blogs:
+            self._refresh_record_tree_item(blog.id)
         self._schedule_sheet_sync([blog.id for blog in blogs], "구글 이메일")
         self.log(f"선택한 {len(blogs)}개 블로그에 메모 이메일을 넣었습니다.")
 
@@ -1856,8 +3992,8 @@ class BloggerApp:
         url = self._sheet_url_or_warn()
         if not url or self._sheet_busy:
             return
-        self._flush_record_vars()
-        records = [program_row(item) for item in self._sheet_record_dicts()]
+        self._close_record_edit(True)
+        records = [program_row(item) for item in self._sheet_record_dicts(blogs=self._record_blogs())]
         if not records:
             messagebox.showwarning("기록 시트", "올릴 블로그가 없습니다. 로그인 후 블로그 목록이 보이면 다시 눌러 주세요.")
             return
@@ -1881,51 +4017,14 @@ class BloggerApp:
             self._sheet_busy = False
             self.root.after(0, self._sheet_sync_continue)
 
-    def _schedule_sheet_sync(
-        self,
-        blog_ids,
-        reason: str = "",
-        *,
-        new_ids=None,
-        drop: bool = False,
-    ) -> None:
-        ids = [str(item).strip() for item in blog_ids if str(item).strip()]
-        fresh = [str(item).strip() for item in (new_ids or []) if str(item).strip()]
-        if not ids and not fresh:
-            return
-        if drop:
-            self._sheet_sync_drop.update(ids)
-            self._sheet_sync_ids.difference_update(ids)
-            self._sheet_sync_new.difference_update(ids)
-        else:
-            self._sheet_sync_ids.update(ids)
-            self._sheet_sync_new.update(fresh)
-        if reason:
-            self._sheet_sync_reason = reason
-        job = getattr(self, "_sheet_sync_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-        try:
-            self._sheet_sync_job = self.root.after(1600, self._flush_sheet_sync)
-        except Exception:
-            self._sheet_sync_job = None
+    def _schedule_sheet_sync(self, blog_ids, reason: str = "", *, new_ids=None, drop: bool = False) -> None:
+        return
 
     def _queue_sheet_sync(self, blog_ids, reason: str, *, new_ids=None, drop: bool = False) -> None:
-        ids = [str(item).strip() for item in blog_ids if str(item).strip()]
-        fresh = [str(item).strip() for item in (new_ids or []) if str(item).strip()]
-        self.root.after(
-            0,
-            lambda: self._schedule_sheet_sync(ids, reason, new_ids=fresh, drop=drop),
-        )
+        return
 
     def _flush_sheet_sync(self) -> None:
-        self._sheet_sync_job = None
-        if self._sheet_busy:
-            self._sheet_sync_again = True
-            return
+        return
         ids = set(self._sheet_sync_ids)
         fresh = set(self._sheet_sync_new)
         drop_ids = set(self._sheet_sync_drop)
@@ -1941,7 +4040,7 @@ class BloggerApp:
             spreadsheet_id(url)
         except ValueError:
             return
-        self._flush_record_vars()
+        self._close_record_edit(True)
         records = [program_row(item) for item in self._sheet_record_dicts(ids)]
         self._sheet_busy = True
         threading.Thread(
@@ -1995,29 +4094,22 @@ class BloggerApp:
             by_id = {blog.id: blog for blog in blogs}
             by_address = {str(blog.address or "").strip().rstrip("/").lower(): blog for blog in blogs if blog.address}
             applied = 0
-            self._records_rendering = True
-            try:
-                for row in rows:
-                    blog = by_id.get(row.get("id") or "")
-                    if blog is None:
-                        blog = by_address.get(str(row.get("address") or "").strip().rstrip("/").lower())
-                    if blog is None:
+            self._close_record_edit(False)
+            for row in rows:
+                blog = by_id.get(row.get("id") or "")
+                if blog is None:
+                    blog = by_address.get(str(row.get("address") or "").strip().rstrip("/").lower())
+                if blog is None:
+                    continue
+                cur = self._blog_meta.setdefault(blog.id, {})
+                for key in RECORD_FIELDS:
+                    if key not in row:
                         continue
-                    cur = self._blog_meta.setdefault(blog.id, {})
-                    for key in RECORD_FIELDS:
-                        if key not in row:
-                            continue
-                        cur[key] = str(row.get(key) or "")
-                    vars_for_blog = self._record_vars.get(blog.id) or {}
-                    for key, var in vars_for_blog.items():
-                        value = str(cur.get(key) or "")
-                        if key == "sheet_status":
-                            value = value or "미정"
-                        var.set(value)
-                    applied += 1
-            finally:
-                self._records_rendering = False
+                    cur[key] = str(row.get(key) or "")
+                applied += 1
             self._save_blog_meta()
+            self._record_fp = None
+            self._render_record_rows()
             self.log(f"시트에서 {applied}개 블로그의 키워드·상태를 가져왔습니다.")
             messagebox.showinfo("기록 시트", f"{applied}개 블로그 기록을 가져왔습니다.")
         finally:
@@ -2058,8 +4150,7 @@ class BloggerApp:
             except Exception:
                 pass
         self._tab_raise_ready = True
-        if getattr(self, "_tab_paint_job", None) is None:
-            self._tab_paint_job = self.root.after(1, self._paint_tab_buttons_later)
+        self._after_once("tab_paint", 1, self._paint_main_tabs)
         if self._tab_needs_refresh(name):
             self._schedule_tab_refresh(name)
 
@@ -2075,10 +4166,6 @@ class BloggerApp:
             self._place_main_page(item)
         self._tabs_stacked = True
 
-    def _paint_tab_buttons_later(self) -> None:
-        self._tab_paint_job = None
-        self._paint_main_tabs()
-
     def _tab_needs_refresh(self, name: str) -> bool:
         if name == "글쓰기":
             return True
@@ -2088,32 +4175,25 @@ class BloggerApp:
                 or getattr(self, "_detail_dirty", False)
                 or getattr(self, "_stale_blog_rows", None)
             )
-        if name in ("기록", "색인 확인"):
-            return False
+        if name == "기록":
+            return bool(getattr(self, "_record_dirty", False) or getattr(self, "_record_fp", None) is None)
+        if name == "색인 확인":
+            return bool(
+                getattr(self, "_index_dirty", False)
+                or getattr(self, "_index_fp", None) is None
+                or getattr(self, "_stale_index_rows", None)
+            )
         return False
 
-    def _queue_side_lists(self) -> None:
-        job = getattr(self, "_side_list_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-        self._side_list_job = self.root.after(40, self._refresh_side_lists)
-
-    def _refresh_side_lists(self) -> None:
-        self._side_list_job = None
+    def _mark_hidden_tabs_dirty(self) -> None:
+        """보이지 않는 탭은 그리지 않고 표시만 해 둔다. 탭을 열 때 한 번만 그린다."""
         tab = getattr(self, "_main_tab", "")
         if tab != "기록":
-            self._render_record_rows(force=True)
+            self._record_dirty = True
         if tab != "색인 확인":
-            self._refresh_index_tab(force=True)
-
-    def _warm_hidden_lists(self) -> None:
-        if getattr(self, "_record_fp", None) is None:
-            self._render_record_rows(force=True)
-        if getattr(self, "_index_fp", None) is None:
-            self._refresh_index_tab(force=True)
+            self._index_dirty = True
+        if tab != "블로그":
+            self._blog_dirty = True
 
     def _place_main_page(self, page) -> None:
         if not self._widget_alive(page) or getattr(page, "_tab_placed", False):
@@ -2129,16 +4209,9 @@ class BloggerApp:
         page._tab_placed = True
 
     def _schedule_tab_refresh(self, name: str) -> None:
-        job = getattr(self, "_tab_refresh_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-        self._tab_refresh_job = self.root.after(16, lambda tab=name: self._refresh_visible_tab(tab))
+        self._after_once("tab_refresh", 16, lambda tab=name: self._refresh_visible_tab(tab))
 
     def _refresh_visible_tab(self, name: str) -> None:
-        self._tab_refresh_job = None
         if getattr(self, "_main_tab", "") != name:
             return
         if name == "글쓰기":
@@ -2151,6 +4224,7 @@ class BloggerApp:
                 self._render_blog_detail()
         elif name == "기록":
             self._render_record_rows()
+            self._apply_record_column_folds()
         elif name == "색인 확인":
             if getattr(self, "_index_dirty", False) or getattr(self, "_index_fp", None) is None:
                 self._refresh_index_tab()
@@ -2307,20 +4381,12 @@ class BloggerApp:
             pass
 
     def _schedule_text_save(self) -> None:
-        job = getattr(self, "_text_save_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-        try:
-            self._text_save_job = self.root.after(700, self._save_local_settings)
-        except Exception:
-            self._text_save_job = None
+        self._after_once("text_save", 700, self._save_local_settings)
 
     def _load_local_settings(self) -> None:
         self._load_progress()
         self._load_blog_meta()
+        self._load_home_state()
         path = data_path(SETTINGS_FILE)
         if not os.path.isfile(path):
             return
@@ -2415,8 +4481,11 @@ class BloggerApp:
                     "naver_index_sample": str(item.get("naver_index_sample") or ""),
                     "naver_index_count": self._count_value(item.get("naver_index_count")),
                     "naver_index_query": str(item.get("naver_index_query") or ""),
+                    "settings_applied_at": str(item.get("settings_applied_at") or ""),
                     **{key: str(item.get(key) or "") for key in RECORD_FIELDS},
+                    **hr.load_fields(item),
                 }
+                self._migrate_home_meta(self._blog_meta[str(blog_id)])
             self._fill_missing_post_crawls()
         except Exception:
             self._blog_meta = {}
@@ -2428,7 +4497,10 @@ class BloggerApp:
 
     def _remember_blog_meta(self, blogs: list[BlogInfo]) -> None:
         changed = False
+        gone = self._gone_id_set()
         for blog in blogs:
+            if blog.id in gone:
+                continue
             cur = self._blog_meta.setdefault(blog.id, {})
             if blog.name and cur.get("name") != blog.name:
                 cur["name"] = blog.name
@@ -2436,10 +4508,22 @@ class BloggerApp:
             if blog.address and cur.get("address") != blog.address:
                 cur["address"] = blog.address
                 changed = True
-            posts = normalize_posts(blog.posts)
-            if posts and cur.get("posts") != posts:
-                cur["posts"] = posts
-                changed = True
+            live = bool(getattr(blog, "posts_live", False))
+            posts = posts_for_address(blog.posts, blog.address or cur.get("address") or "")
+            if live:
+                if cur.get("posts") != posts:
+                    cur["posts"] = posts
+                    changed = True
+            elif posts:
+                merged = posts_for_address(normalize_posts([*(cur.get("posts") or []), *posts]), blog.address or cur.get("address") or "")
+                if cur.get("posts") != merged:
+                    cur["posts"] = merged
+                    changed = True
+            else:
+                cleaned = posts_for_address(cur.get("posts") or [], blog.address or cur.get("address") or "")
+                if cur.get("posts") != cleaned:
+                    cur["posts"] = cleaned
+                    changed = True
             if cur.pop("post_url", None) is not None or cur.pop("post_title", None) is not None:
                 changed = True
         if not changed:
@@ -2454,15 +4538,21 @@ class BloggerApp:
             meta = self._blog_meta.get(blog.id) or {}
             if not blog.address:
                 blog.address = str(meta.get("address") or "")
-            saved = normalize_posts(meta.get("posts") or [])
+            saved = posts_for_address(meta.get("posts") or [], blog.address or meta.get("address") or "")
             if not saved:
-                saved = normalize_posts(
-                    [{"url": meta.get("post_url"), "title": meta.get("post_title")}]
+                saved = posts_for_address(
+                    [{"url": meta.get("post_url"), "title": meta.get("post_title")}],
+                    blog.address or meta.get("address") or "",
                 )
+            if getattr(blog, "posts_live", False):
+                blog.posts = posts_for_address(blog.posts, blog.address)
+                continue
             if saved and not blog.posts:
                 blog.posts = saved
             elif saved and blog.posts:
-                blog.posts = normalize_posts([*blog.posts, *saved])
+                blog.posts = posts_for_address(normalize_posts([*blog.posts, *saved]), blog.address)
+            else:
+                blog.posts = posts_for_address(blog.posts, blog.address)
 
     def _save_local_settings(self) -> None:
         path = data_path(SETTINGS_FILE)
@@ -2570,16 +4660,9 @@ class BloggerApp:
         self.log(f"폴더 주소를 복사했습니다: {text}")
 
     def _schedule_memo_refresh(self) -> None:
-        job = getattr(self, "_memo_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-        self._memo_job = self.root.after(180, self._apply_memo_parts)
+        self._after_once("memo", 180, self._apply_memo_parts)
 
     def _apply_memo_parts(self) -> None:
-        self._memo_job = None
         parts = self._parse_memo(self.memo_var.get() if hasattr(self, "memo_var") else "")
         self._memo_parts = parts
         titles = ("이메일", "아이디", "비번", "이름")
@@ -2625,13 +4708,17 @@ class BloggerApp:
                 continue
             indexed = str(getattr(widget, "_fallback_index", "") or "").strip()
             caption = f"색인 {indexed}" if indexed else ""
+            color = COLORS["success"] if indexed else COLORS["text_muted"]
             try:
-                widget.configure(text=caption, text_color=COLORS["success"] if indexed else COLORS["text_muted"])
+                widget.configure(text=caption, fg=color)
             except Exception:
                 try:
-                    widget.configure(text=caption)
+                    widget.configure(text=caption, text_color=color)
                 except Exception:
-                    pass
+                    try:
+                        widget.configure(text=caption)
+                    except Exception:
+                        pass
             try:
                 if caption:
                     widget.pack(side=tk.LEFT, padx=(8, 0))
@@ -2689,6 +4776,90 @@ class BloggerApp:
             self.log(f"{title} 항목을 복사하지 못했습니다.")
             return
         self.log(f"{title} 항목을 복사했습니다.")
+
+    def _is_typing_widget(self, widget) -> bool:
+        cur = widget
+        for _ in range(10):
+            if cur is None:
+                return False
+            name = type(cur).__name__
+            cls = ""
+            try:
+                cls = str(cur.winfo_class() or "")
+            except Exception:
+                cls = ""
+            if "Entry" in name or cls in ("Entry", "Text", "TEntry", "TCombobox"):
+                return True
+            if name in ("Text", "CTkEntry", "CTkComboBox") or (name == "CTkTextbox" and self._widget_allows_copy(cur)):
+                return True
+            try:
+                cur = cur.master
+            except Exception:
+                return False
+        return False
+
+    def _widget_allows_copy(self, widget) -> bool:
+        try:
+            if str(widget.cget("state") or "") in ("disabled", "readonly"):
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _bind_copy_shortcuts(self) -> None:
+        def on_copy(event, app=self):
+            return app._on_copy_blog_url(event)
+
+        for seq in ("<Control-c>", "<Control-C>", "<Control-Key-c>", "<Control-Key-C>"):
+            try:
+                self.root.unbind_all(seq)
+            except Exception:
+                pass
+            self.root.bind_all(seq, on_copy)
+
+    def _on_copy_blog_url(self, event=None):
+        widget = event.widget if event else None
+        focus = None
+        try:
+            focus = self.root.focus_get()
+        except Exception:
+            focus = widget
+        if self._is_typing_widget(widget) or self._is_typing_widget(focus):
+            return
+        blog_id = str(self.blog_var.get() or "").strip() if hasattr(self, "blog_var") else ""
+        blogs = []
+        if blog_id:
+            found = next((item for item in self._dashboard_blogs() if item.id == blog_id), None)
+            if found is not None:
+                blogs = [found]
+        if not blogs:
+            try:
+                blogs = list(self._checked_blogs())
+            except Exception:
+                blogs = []
+        urls = []
+        for blog in blogs:
+            addr = str(getattr(blog, "address", "") or "").strip()
+            if not addr:
+                addr = str((self._blog_meta.get(getattr(blog, "id", "")) or {}).get("address") or "").strip()
+            if addr and addr not in urls:
+                urls.append(addr)
+        if not urls:
+            if blog_id or blogs:
+                self.log("선택한 블로그에 주소가 없어 복사하지 못했습니다.")
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(urls))
+            self.root.update_idletasks()
+        except Exception:
+            self.log("블로그 주소를 복사하지 못했습니다.")
+            return
+        if len(urls) == 1:
+            self.log("블로그 주소를 복사했습니다.")
+        else:
+            self.log(f"블로그 주소 {len(urls)}개를 복사했습니다.")
+        return "break"
 
     def _naver_logged_account(self) -> str:
         state = getattr(self.naver, "state", None)
@@ -2785,6 +4956,11 @@ class BloggerApp:
         self._apply_state(self.session.state)
 
     def _apply_state(self, state: SessionState):
+        self._apply_gone_ids()
+        gone = getattr(self.session, "_gone_ids", None) or set()
+        if gone:
+            state.blogs = [blog for blog in state.blogs if blog.id not in gone]
+            self.session.state.blogs = state.blogs
         account = (state.account or "").strip()
         self.account_label.configure(text=f"계정: {account or '-'}")
         if state.logged_in and account and self._shown_account and account != self._shown_account:
@@ -2803,8 +4979,36 @@ class BloggerApp:
         self._merge_progress(state.blogs)
         self._merge_blog_meta(state.blogs)
         self._remember_blog_meta(state.blogs)
+        self._remember_program_order(state)
         self._fill_program_records(state.blogs)
         self._schedule_dashboard()
+
+    def _remember_program_order(self, state: SessionState) -> None:
+        """시트 API 'inventory': 로그인 계정의 블로그 목록 순서를 기억해 정렬에 쓴다."""
+        if not state.logged_in or not state.blogs:
+            return
+        email = str(self._logged_google_email() or "").strip().lower()
+        if not email:
+            return
+        home = self.__dict__.setdefault("_home_state", {"email_order": [], "program_order": {}, "program_order_time": {}, "events": []})
+        hosts = []
+        for blog in state.blogs:
+            address = str(blog.address or "").strip()
+            if not address:
+                continue
+            host = hr.match_domain(address)
+            if host:
+                hosts.append(host)
+        if not hosts:
+            return
+        orders = home.setdefault("program_order", {})
+        if orders.get(email) == hosts:
+            return
+        orders[email] = hosts
+        home.setdefault("program_order_time", {})[email] = datetime.now().isoformat(timespec="seconds")
+        self._remember_email_order(email)
+        self._schedule_home_save()
+        self._record_fp = None
 
     def _any_busy(self) -> bool:
         return any(
@@ -2820,16 +5024,7 @@ class BloggerApp:
         )
 
     def _schedule_dashboard(self) -> None:
-        if self._dash_after is not None:
-            try:
-                self.root.after_cancel(self._dash_after)
-            except Exception:
-                pass
-        self._dash_after = self.root.after(80, self._flush_dashboard)
-
-    def _flush_dashboard(self) -> None:
-        self._dash_after = None
-        self._refresh_dashboard()
+        self._after_once("dashboard", 80, self._refresh_dashboard)
 
     def _merge_progress(self, blogs: list[BlogInfo]) -> None:
         for blog in blogs:
@@ -2840,21 +5035,10 @@ class BloggerApp:
             widget.grid_columnconfigure(index, minsize=minsize, weight=weight)
 
     def _on_post_query_changed(self, *_args) -> None:
-        after_id = getattr(self, "_post_query_after", None)
-        if after_id is not None:
-            try:
-                self.root.after_cancel(after_id)
-            except Exception:
-                pass
-        self._post_query_after = self.root.after(180, self._render_blog_detail)
+        self._after_once("post_query", 180, self._render_blog_detail)
 
     def _on_blog_query_changed(self, *_args) -> None:
-        if self._query_after is not None:
-            try:
-                self.root.after_cancel(self._query_after)
-            except Exception:
-                pass
-        self._query_after = self.root.after(30, self._apply_blog_visibility)
+        self._after_once("blog_query", 30, self._apply_blog_visibility)
 
     def _set_blog_filter(self, key: str) -> None:
         if self._blog_filter == key:
@@ -2881,18 +5065,26 @@ class BloggerApp:
     def _dashboard_blogs(self) -> list[BlogInfo]:
         if not self.session.state.logged_in:
             return []
+        gone = getattr(self.session, "_gone_ids", None) or set()
         blogs: list[BlogInfo] = []
         for blog in self.session.state.blogs:
+            if blog.id in gone:
+                continue
             meta = self._blog_meta.get(blog.id) or {}
+            if hr.normalize_status(meta.get("confirmed_status") or meta.get("sheet_status")) == "삭제됨":
+                continue
             if not blog.name:
                 blog.name = str(meta.get("name") or blog.address or blog.id[-6:])
             if not (blog.address or "").strip():
                 blog.address = str(meta.get("address") or "")
             blog.done.update(self._progress_map.get(blog.id, []))
-            if not blog.posts:
-                blog.posts = normalize_posts(meta.get("posts") or [])
+            addr = blog.address or str(meta.get("address") or "")
+            if getattr(blog, "posts_live", False):
+                blog.posts = posts_for_address(blog.posts, addr)
+            elif not blog.posts:
+                blog.posts = posts_for_address(meta.get("posts") or [], addr)
             else:
-                blog.posts = normalize_posts(blog.posts)
+                blog.posts = posts_for_address(blog.posts, addr)
             blogs.append(blog)
         blogs.sort(key=self._blog_created_sort_key)
         return blogs
@@ -3048,6 +5240,7 @@ class BloggerApp:
         if not hasattr(self, "_blog_list_inner") or self._refreshing:
             return
         self._fill_missing_post_crawls()
+        self._schedule_record_view_refresh()
         blogs = self._dashboard_blogs()
         visible = self._filter_blogs(blogs)
         fp = self._dashboard_fingerprint(blogs, visible)
@@ -3056,11 +5249,9 @@ class BloggerApp:
                 self._refresh_index_tab()
             return
         tab = getattr(self, "_main_tab", "")
-        self._blog_dirty = tab != "블로그"
-        self._record_dirty = tab != "기록"
-        self._index_dirty = tab != "색인 확인"
-        self._queue_side_lists()
+        self._mark_hidden_tabs_dirty()
         if tab == "기록":
+            self._dashboard_fp = fp
             self._render_record_rows()
             return
         if tab == "색인 확인":
@@ -3074,7 +5265,6 @@ class BloggerApp:
         try:
             self._render_blog_summary(blogs)
             self._render_blogs(blogs, all_blogs=blogs)
-            self._refresh_index_tab()
         finally:
             self._refreshing = False
 
@@ -3111,6 +5301,7 @@ class BloggerApp:
         self._blog_row_frames.clear()
         self._stale_blog_rows = set()
         self._index_labels = []
+        self._blog_index_btns = []
         source = all_blogs if all_blogs is not None else blogs
         self._shown_blog_keys = [
             (
@@ -3185,7 +5376,6 @@ class BloggerApp:
         return True
 
     def _apply_blog_visibility(self) -> None:
-        self._query_after = None
         rows = getattr(self, "_blog_row_frames", None)
         listed = getattr(self, "_listed_blogs", None)
         if not rows or not listed:
@@ -3262,7 +5452,6 @@ class BloggerApp:
             return
         self._update_sel_count()
         self._paint_rows_for(blog_id)
-        self._paint_record_rows()
         self._schedule_write_count()
 
     def _toggle_blog_check(self, blog_id: str) -> None:
@@ -3290,12 +5479,22 @@ class BloggerApp:
         if self._widget_is_check_target(event.widget):
             return
         self._select_blog(blog_id)
+        self._focus_blog_row(blog_id)
 
     def _bind_row_focus(self, widget, blog_id: str) -> None:
         widget.bind("<Button-1>", lambda e, bid=blog_id: self._on_row_click(e, bid))
         widget.bind("<Double-Button-1>", lambda _e, bid=blog_id: self._open_blog_address(bid))
         try:
             widget.configure(cursor="hand2")
+        except Exception:
+            pass
+
+    def _focus_blog_row(self, blog_id: str) -> None:
+        row = (getattr(self, "_blog_row_frames", None) or {}).get(blog_id)
+        if not self._widget_alive(row):
+            return
+        try:
+            row.focus_set()
         except Exception:
             pass
 
@@ -3371,17 +5570,21 @@ class BloggerApp:
             self.root.after(0, self._delete_blogs_done)
 
     def _drop_deleted_blog(self, blog_id: str) -> None:
+        self._remember_gone_id(blog_id)
         self.session.state.blogs = [blog for blog in self.session.state.blogs if blog.id != blog_id]
         self._blog_meta.pop(blog_id, None)
         self._progress_map.pop(blog_id, None)
         self._blog_check_vars.pop(blog_id, None)
         if self.blog_var.get() == blog_id:
             self.blog_var.set("")
+        self._record_fp = None
+        self._record_view_fp = None
         try:
             self._save_blog_meta()
             self._save_progress()
         except Exception:
             pass
+        self._schedule_record_view_refresh()
         self._queue_sheet_sync([blog_id], "블로그 삭제", drop=True)
 
     def _delete_blogs_done(self) -> None:
@@ -3407,6 +5610,8 @@ class BloggerApp:
         if getattr(widget, "_paint_sig", None) == signature:
             return
         mode = getattr(widget, "_paint_mode", None)
+        if mode is None and type(widget) is tk.Frame:
+            mode = "tk-border" if "highlightthickness" in widget.keys() else "tk-fill"
         try:
             if mode == "ctk-border":
                 widget.configure(fg_color=bg, border_color=border, border_width=width)
@@ -3437,46 +5642,36 @@ class BloggerApp:
         widget._paint_sig = signature
 
     def _render_blog_row(self, parent, blog: BlogInfo) -> None:
+        """블로그 한 줄. 줄마다 캔버스를 그리는 CTk 위젯 대신 가벼운 tk 위젯만 쓴다.
+
+        줄이 50개를 넘어도 스크롤이 끊기지 않게 하려면 한 줄의 위젯 수와 무게를 줄이는 것이 핵심이다.
+        """
         bg, border, width = self._row_look(blog.id)
-        if ctk:
-            row = ctk.CTkFrame(
-                parent, fg_color=bg, corner_radius=10,
-                border_width=width, border_color=border,
-            )
-        else:
-            row = tk.Frame(parent, bg=bg, highlightbackground=border, highlightthickness=width)
-        row.pack(fill=tk.X, pady=4, padx=2)
+        row = tk.Frame(parent, bg=bg, highlightbackground=border, highlightthickness=width, takefocus=1)
+        row.pack(fill=tk.X, pady=3, padx=2)
         self._blog_row_frames[blog.id] = row
         self._bind_row_focus(row, blog.id)
+        row.bind("<Control-c>", lambda e: self._on_copy_blog_url(e))
+        row.bind("<Control-C>", lambda e: self._on_copy_blog_url(e))
 
-        top = frame(row, bg)
-        top.pack(fill=tk.X, padx=8, pady=(8, 0))
+        top = tk.Frame(row, bg=bg)
+        top.pack(fill=tk.X, padx=8, pady=(6, 0))
         self._bind_row_focus(top, blog.id)
         check_var = self._ensure_check(blog.id)
-        if ctk:
-            btn = ctk.CTkCheckBox(
-                top, text="", variable=check_var, width=24, height=24,
-                fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
-                command=lambda bid=blog.id: self._on_blog_checked(bid),
-            )
-        else:
-            btn = tk.Checkbutton(
-                top, text="", variable=check_var, bg=bg,
-                command=lambda bid=blog.id: self._on_blog_checked(bid),
-            )
-        btn.pack(side=tk.LEFT)
-        btn._blog_id = blog.id
-        self._mark_check_hit(btn)
-        self._blog_buttons.append(btn)
+        check = tk.Checkbutton(
+            top, text="", variable=check_var, bg=bg, activebackground=bg,
+            highlightthickness=0, bd=0, padx=0, pady=0,
+            command=lambda bid=blog.id: self._on_blog_checked(bid),
+        )
+        check.pack(side=tk.LEFT)
+        check._blog_id = blog.id
+        self._mark_check_hit(check)
+        self._blog_buttons.append(check)
 
-        id_chip = pill(top, blog.id[-6:], "info")
+        id_chip = tk_pill(top, blog.id[-6:], "info", cursor="hand2")
         id_chip.pack(side=tk.LEFT, padx=(4, 0))
         id_chip._blog_id = blog.id
         id_chip._blog_check_hit = True
-        try:
-            id_chip.configure(cursor="hand2")
-        except Exception:
-            pass
         id_chip.bind("<Button-1>", lambda _e, bid=blog.id: self._on_id_chip_click(bid))
         self._hover.bind(id_chip, lambda b=blog: (
             (COLORS["text"], "다중 선택", "body_bold"),
@@ -3484,75 +5679,89 @@ class BloggerApp:
             (COLORS["text"], b.id, "caption"),
         ))
 
+        tools = tk.Frame(top, bg=bg)
+        tools.pack(side=tk.RIGHT)
+        self._bind_row_focus(tools, blog.id)
         setup_done = sum(1 for key in SETUP_KEYS if key in blog.done)
         setup_tone = "ok" if setup_done == len(SETUP_KEYS) else "wait" if setup_done else "off"
-        setup_pill = pill(top, f"설정 {setup_done}/{len(SETUP_KEYS)}", setup_tone)
+        setup_pill = tk_pill(tools, f"설정 {setup_done}/{len(SETUP_KEYS)}", setup_tone)
         setup_pill.pack(side=tk.RIGHT)
         self._hover.bind(setup_pill, lambda b=blog: self._setup_status_hover(b))
         self._bind_row_focus(setup_pill, blog.id)
         folder_path = self._blog_folder_of(blog.id)
         if folder_path:
-            copy_btn = button(
-                top,
-                "폴더 복사",
-                variant="primary",
-                width=88,
-                height=28,
+            flat_button(
+                tools, "폴더 복사", variant="primary",
                 command=lambda target=folder_path: self._copy_folder_path(target),
-            )
-            copy_btn.pack(side=tk.RIGHT, padx=(0, 6))
+            ).pack(side=tk.RIGHT, padx=(0, 6))
+        index_btn = flat_button(
+            tools, "색인확인", variant="ghost",
+            command=lambda bid=blog.id: self.on_blog_row_index_check(bid),
+        )
+        index_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        self._blog_index_btns.append(index_btn)
+        if getattr(self, "_index_busy", False):
+            index_btn.configure(state="disabled")
 
         name = blog.name or blog.address or blog.id
-        name_lbl = label(top, name, "body_bold")
+        name_lbl = tk.Label(top, text=name, font=FONTS["body_bold"], fg=COLORS["text"], bg=bg)
         name_lbl.pack(side=tk.LEFT, padx=(6, 0))
         self._bind_row_focus(name_lbl, blog.id)
         code_name = self._html_code_of(blog.id)
         if code_name:
-            code_pill = pill(top, code_name, "info")
+            code_pill = tk_pill(top, code_name, "info")
             code_pill.pack(side=tk.LEFT, padx=(6, 0))
             self._bind_row_focus(code_pill, blog.id)
 
         host = re.sub(r"^https?://", "", blog.address or "", flags=re.I).rstrip("/")
-        bottom = frame(row, bg)
-        bottom.pack(fill=tk.X, padx=8, pady=(2, 8))
+        bottom = tk.Frame(row, bg=bg)
+        bottom.pack(fill=tk.X, padx=8, pady=(2, 6))
         self._bind_row_focus(bottom, blog.id)
-        addr = host or "주소 없음"
-        addr_lbl = label(bottom, addr, "small", COLORS["accent"] if host else COLORS["text_light"])
+        addr_lbl = tk.Label(
+            bottom, text=host or "주소 없음", font=FONTS["small"],
+            fg=COLORS["accent"] if host else COLORS["text_light"], bg=bg,
+        )
         addr_lbl.pack(side=tk.LEFT)
         self._bind_row_focus(addr_lbl, blog.id)
+        status, tone, extra = self._index_status_view(blog)
+        index_chip = tk_pill(bottom, status, tone, padx=6, pady=1)
+        index_chip.pack(side=tk.LEFT, padx=(8, 0))
+        self._bind_row_focus(index_chip, blog.id)
+        extra_chip = tk.Label(bottom, text=extra, font=FONTS["small"], fg=COLORS["text_muted"], bg=bg)
+        if extra:
+            extra_chip.pack(side=tk.LEFT, padx=(4, 0))
+        self._bind_row_focus(extra_chip, blog.id)
+        row._index_status_pill = index_chip
+        row._index_extra_label = extra_chip
         stored = self._naver_id_of(blog.id)
         collected = "collect" in blog.done or "collect_post" in blog.done
         indexed = stored if collected and stored else ""
         caption = f"색인 {indexed}" if indexed else ""
-        naver_lbl = label(bottom, caption, "small", COLORS["success"] if indexed else COLORS["text_muted"])
+        naver_lbl = tk.Label(
+            bottom, text=caption, font=FONTS["small"],
+            fg=COLORS["success"] if indexed else COLORS["text_muted"], bg=bg,
+        )
         naver_lbl._fallback_index = indexed
         self._bind_row_focus(naver_lbl, blog.id)
         if caption:
             naver_lbl.pack(side=tk.LEFT, padx=(8, 0))
         self._index_labels.append(naver_lbl)
         post_count = len(blog.posts)
-        if "collect_post" in blog.done:
-            post_text, post_tone = f"글 {post_count}", "ok"
-        elif post_count:
-            post_text, post_tone = f"글 {post_count}", "wait"
+        if post_count:
+            post_text, post_tone = f"글 {post_count}", "ok" if "collect_post" in blog.done else "wait"
         else:
             post_text, post_tone = "글 없음", "off"
-        post_pill = pill(bottom, post_text, post_tone)
+        post_pill = tk_pill(bottom, post_text, post_tone)
         post_pill.pack(side=tk.RIGHT)
         self._bind_row_focus(post_pill, blog.id)
         if "collect" in blog.done:
-            crawl_lbl = label(
-                bottom,
-                self._blog_collect_label(blog.id),
-                "small",
-                COLORS["text_muted"],
-                wraplength=280,
-                anchor="e",
-                justify="right",
+            crawl_lbl = tk.Label(
+                bottom, text=self._blog_collect_label(blog.id), font=FONTS["small"],
+                fg=COLORS["text_muted"], bg=bg, wraplength=280, anchor="e", justify="right",
             )
             crawl_lbl.pack(side=tk.RIGHT, padx=(0, 8))
             self._bind_row_focus(crawl_lbl, blog.id)
-        row._paint_parts = [row, top, bottom]
+        row._paint_parts = [row, top, tools, bottom]
 
     def _on_id_chip_click(self, blog_id: str):
         self._toggle_blog_check(blog_id)
@@ -3560,22 +5769,27 @@ class BloggerApp:
 
     def _select_blog(self, blog_id: str) -> None:
         prev = self.blog_var.get()
-        if prev == blog_id:
-            self._paint_record_rows()
-            return
-        self.blog_var.set(blog_id)
-        self._paint_rows_for(prev)
-        self._paint_rows_for(blog_id)
-        self._paint_record_rows()
-        if getattr(self, "_main_tab", "") == "블로그":
-            self._render_blog_detail()
-        else:
-            self._detail_dirty = True
-        self._schedule_write_count()
+        if prev != blog_id:
+            self.blog_var.set(blog_id)
+            self._paint_rows_for(prev)
+            self._paint_rows_for(blog_id)
+            if getattr(self, "_main_tab", "") == "기록":
+                self._paint_record_rows()
+            else:
+                self._record_dirty = True
+            if getattr(self, "_main_tab", "") == "블로그":
+                self._render_blog_detail()
+            else:
+                self._detail_dirty = True
+            self._schedule_write_count()
+        self._focus_blog_row(blog_id)
+        if not getattr(self, "_syncing_record_pick", False):
+            self._reveal_blog_in_record_view(blog_id)
 
     def _on_blog_selected(self) -> None:
         self._paint_rows_for(self.blog_var.get())
-        self._paint_record_rows()
+        if getattr(self, "_main_tab", "") == "기록":
+            self._paint_record_rows()
         if getattr(self, "_main_tab", "") == "블로그":
             self._render_blog_detail()
 
@@ -3625,7 +5839,7 @@ class BloggerApp:
             if part is row:
                 continue
             for child in part.winfo_children():
-                if child is getattr(row, "_status_pill", None):
+                if child is getattr(row, "_status_pill", None) or getattr(child, "_keep_bg", False):
                     continue
                 if not isinstance(child, (tk.Label, tk.Checkbutton)):
                     continue
@@ -3718,68 +5932,38 @@ class BloggerApp:
         return f"수집 {first} · 마지막 {last} · 재수집 {count}"
 
     def _add_post_card(self, parent, index: int, title: str, url: str, blog_id: str) -> None:
-        if ctk:
-            card_row = ctk.CTkFrame(
-                parent, fg_color=COLORS["input_bg"], corner_radius=8,
-                border_width=1, border_color=COLORS["border"],
-            )
-        else:
-            card_row = tk.Frame(parent, bg=COLORS["input_bg"], highlightbackground=COLORS["border"], highlightthickness=1)
+        """글 한 장. 글이 100개여도 가볍게 스크롤되도록 tk 위젯만 쓴다."""
+        bg = COLORS["input_bg"]
+        card_row = tk.Frame(parent, bg=bg, highlightbackground=COLORS["border"], highlightthickness=1)
         card_row.pack(fill=tk.X, pady=2, padx=2)
-        right = frame(card_row, COLORS["input_bg"])
+        right = tk.Frame(card_row, bg=bg)
         right.pack(side=tk.RIGHT, padx=(6, 8), pady=4)
-        label(
-            right,
-            self._post_crawl_label(blog_id, url),
-            "small",
-            COLORS["text_muted"],
-            wraplength=240,
-            anchor="e",
-            justify="right",
+        tk.Label(
+            right, text=self._post_crawl_label(blog_id, url), font=FONTS["small"],
+            fg=COLORS["text_muted"], bg=bg, wraplength=240, anchor="e", justify="right",
         ).pack(anchor="e")
-        actions = frame(right, COLORS["input_bg"])
+        actions = tk.Frame(right, bg=bg)
         actions.pack(anchor="e", pady=(2, 0))
-        button(
-            actions,
-            "이글 수집",
-            variant="primary",
-            width=84,
-            height=28,
+        flat_button(
+            actions, "이글 수집", variant="primary",
             command=lambda target=url, blog=blog_id: self.on_collect_one_post(blog, target, False),
         ).pack(side=tk.LEFT, padx=(0, 4))
-        button(
-            actions,
-            "이글 재수집",
-            variant="ghost",
-            width=92,
-            height=28,
+        flat_button(
+            actions, "이글 재수집", variant="ghost",
             command=lambda target=url, blog=blog_id: self.on_collect_one_post(blog, target, True),
         ).pack(side=tk.LEFT, padx=(0, 4))
-        button(
-            actions,
-            "글 삭제",
-            variant="danger",
-            width=72,
-            height=28,
+        flat_button(
+            actions, "글 삭제", variant="danger",
             command=lambda target=url, blog=blog_id, name=title: self.on_delete_post(blog, target, name),
         ).pack(side=tk.LEFT)
-        left = frame(card_row, COLORS["input_bg"])
+        left = tk.Frame(card_row, bg=bg)
         left.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0), pady=4)
-        label(left, f"{index}. {title}", "body_bold").pack(anchor="w")
+        tk.Label(left, text=f"{index}. {title}", font=FONTS["body_bold"], fg=COLORS["text"], bg=bg).pack(anchor="w")
 
         def open_url(_event=None, target=url):
             webbrowser.open(target)
 
-        if ctk:
-            link = ctk.CTkLabel(
-                left, text=url, font=FONTS["small"], text_color=COLORS["accent"],
-                cursor="hand2", anchor="w",
-            )
-        else:
-            link = tk.Label(
-                left, text=url, font=FONTS["small"], fg=COLORS["accent"],
-                bg=COLORS["input_bg"], cursor="hand2", anchor="w",
-            )
+        link = tk.Label(left, text=url, font=FONTS["small"], fg=COLORS["accent"], bg=bg, cursor="hand2", anchor="w")
         link.pack(anchor="w")
         link.bind("<Button-1>", open_url)
 
@@ -3910,6 +6094,7 @@ class BloggerApp:
 
     def _require_sessions(self, title: str, require_naver: bool = True, require_blogger: bool = True) -> bool:
         if self._naver_busy or self._settings_busy or self._create_busy:
+            messagebox.showwarning(title, "다른 작업이 끝나기를 기다려 주세요.")
             return False
         if require_naver:
             if not self.naver.is_alive() or not self.naver.state.logged_in:
@@ -4056,7 +6241,7 @@ class BloggerApp:
         body = frame(win, COLORS["card"])
         body.pack(fill=tk.BOTH, expand=True, padx=18, pady=16)
         label(body, heading, "heading", COLORS["text"]).pack(anchor="w")
-        label(body, "블로그 목록과 기록 시트에 같은 이름으로 표시됩니다.", "small", COLORS["text_muted"]).pack(
+        label(body, "블로그 목록과 기록에 같은 이름으로 표시됩니다.", "small", COLORS["text_muted"]).pack(
             anchor="w", pady=(4, 10)
         )
         var = tk.StringVar(value=initial)
@@ -4243,7 +6428,7 @@ class BloggerApp:
         widget = getattr(self, "html_code_list", None)
         if not self._widget_alive(widget):
             return
-        host = widget if ctk else getattr(widget, "inner", widget)
+        host = getattr(widget, "inner", widget)
         for child in list(host.winfo_children()):
             child.destroy()
         current = int(getattr(self, "_html_code_index", 0) or 0)
@@ -4522,6 +6707,15 @@ class BloggerApp:
             for existing in list(crawls):
                 if str(existing).strip().rstrip("/").lower() == key:
                     crawls.pop(existing, None)
+        for blog in self.session.state.blogs:
+            if blog.id != blog_id:
+                continue
+            blog.posts = [
+                item
+                for item in normalize_posts(blog.posts)
+                if str(item.get("url") or "").strip().rstrip("/").lower() != key
+            ]
+            break
         try:
             self._save_blog_meta()
         except Exception:
@@ -4967,6 +7161,7 @@ class BloggerApp:
             pass
         self._stamp_activity(blog_id, key)
         self._dashboard_fp = None
+        self._schedule_record_view_refresh()
         self._refresh_dashboard()
 
     def _stamp_activity(self, blog_id: str, key: str) -> None:
@@ -4981,8 +7176,18 @@ class BloggerApp:
                 cur["blog_collect_at"] = str(cur.get("last_blog_crawl") or "").strip() or now
             cur["blog_crawl_count"] = count
             cur["last_blog_crawl"] = now
+            self._append_work_event(blog_id, "블로그 수집")
         elif key == "collect_post":
             cur["last_post_crawl"] = now
+            self._append_work_event(blog_id, "글 수집")
+        if key in SETTINGS_APPLY_KEYS:
+            done = set(self._progress_map.get(blog_id) or [])
+            done.add(key)
+            if all(item in done for item in SETTINGS_APPLY_KEYS) and not str(cur.get("settings_applied_at") or "").strip():
+                cur["settings_applied_at"] = now
+                self._append_work_event(blog_id, "설정 적용")
+            elif all(item in done for item in SETTINGS_APPLY_KEYS):
+                cur["settings_applied_at"] = now
         if key in {"collect", "collect_post"}:
             self._remember_naver_id(blog_id)
         try:
@@ -5161,12 +7366,11 @@ class BloggerApp:
 
     def _scroll_blog_list_to_end(self) -> None:
         widget = getattr(self, "blog_list", None)
-        canvas = getattr(widget, "_parent_canvas", None)
-        if canvas is None:
+        if not self._widget_alive(widget) or not hasattr(widget, "scroll_to_end"):
             return
         try:
-            canvas.update_idletasks()
-            canvas.yview_moveto(1.0)
+            widget.update_idletasks()
+            widget.scroll_to_end()
         except Exception:
             pass
 
@@ -5225,17 +7429,7 @@ class BloggerApp:
         return dest
 
     def _schedule_write_count(self) -> None:
-        job = getattr(self, "_write_count_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-        self._write_count_job = self.root.after(200, self._flush_write_count)
-
-    def _flush_write_count(self) -> None:
-        self._write_count_job = None
-        self._refresh_write_count()
+        self._after_once("write_count", 200, self._refresh_write_count)
 
     def _manuscript_file_count(self, folder: str) -> int:
         if not folder or not os.path.isdir(folder):
@@ -5440,6 +7634,7 @@ class BloggerApp:
                 post_url = self.session.publish_manuscript(blog.id, title, body, image_path)
                 if not post_url:
                     raise RuntimeError(f"{name}: 게시는 시도했지만 글 주소를 찾지 못했습니다. 원고는 그대로 둡니다.")
+                self._append_work_event(blog.id, "글 작성")
                 moved = self._move_manuscript_to_success(path, folder)
                 done += 1
                 self.log(f"작성된 글 주소: {post_url}")
@@ -5732,24 +7927,46 @@ class BloggerApp:
                 self.log_box.see(tk.END)
                 self.log_box.configure(state=tk.DISABLED)
 
-    def _clear_input_traces(self) -> None:
-        for name in ("blog_query", "post_query", "index_query"):
-            var = getattr(self, name, None)
-            if var is None:
-                continue
-            try:
-                infos = var.trace_info()
-            except Exception:
-                continue
-            for item in infos:
+    def _release_ctk_traces(self, widget) -> None:
+        """CTkEntry(5.2.2)는 destroy 때 textvariable 추적을 지우지 않는다.
+
+        그대로 두면 화면을 다시 만들 때마다 죽은 위젯을 가리키는 추적이 쌓여 메모 칸 입력이 점점 느려진다.
+        """
+        stack = [widget]
+        while stack:
+            node = stack.pop()
+            var = getattr(node, "_textvariable", None)
+            name = getattr(node, "_textvariable_callback_name", "")
+            if var not in (None, "") and name and hasattr(var, "trace_remove"):
                 try:
-                    var.trace_remove(item[0], item[1])
+                    var.trace_remove("write", name)
                 except Exception:
                     pass
+                try:
+                    node._textvariable_callback_name = ""
+                except Exception:
+                    pass
+            try:
+                stack.extend(node.winfo_children())
+            except Exception:
+                pass
+
+    def _clear_input_traces(self) -> None:
+        ids = self.__dict__.setdefault("_var_trace_ids", [])
+        for var, cbname in ids:
+            try:
+                var.trace_remove("write", cbname)
+            except Exception:
+                pass
+        ids.clear()
 
     def _destroy_ui(self) -> None:
         try:
             self._hover.hide()
+        except Exception:
+            pass
+        try:
+            self._close_record_edit(False)
         except Exception:
             pass
         if self._watch_id is not None:
@@ -5758,55 +7975,22 @@ class BloggerApp:
             except Exception:
                 pass
             self._watch_id = None
-        if self._dash_after is not None:
-            try:
-                self.root.after_cancel(self._dash_after)
-            except Exception:
-                pass
-            self._dash_after = None
+        self._cancel_all_afters()
         self._clear_input_traces()
+        try:
+            self.root.unbind("<Configure>")
+        except Exception:
+            pass
         self._index_row_frames = {}
         self._index_fp = None
+        self._record_fp = None
+        self._record_tree = None
         self._tab_stacked = False
         self._tabs_stacked = False
         self._tab_raise_ready = False
         self._painted_tab = None
-        paint_job = getattr(self, "_tab_paint_job", None)
-        if paint_job is not None:
-            try:
-                self.root.after_cancel(paint_job)
-            except Exception:
-                pass
-            self._tab_paint_job = None
-        job = getattr(self, "_sheet_sync_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-            self._sheet_sync_job = None
-        job = getattr(self, "_tab_refresh_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-            self._tab_refresh_job = None
-        job = getattr(self, "_write_count_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-            self._write_count_job = None
-        job = getattr(self, "_side_list_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-            self._side_list_job = None
         for child in list(self.root.winfo_children()):
+            self._release_ctk_traces(child)
             try:
                 child.destroy()
             except Exception:
@@ -5815,6 +7999,8 @@ class BloggerApp:
         self._blog_row_frames.clear()
         self._blog_filter_btns.clear()
         self._dock_buttons.clear()
+        self._blog_index_btns = []
+        self._index_labels = []
         self._dashboard_fp = None
         self._dock_width = None
         self._tab_width = None
@@ -5832,10 +8018,9 @@ class BloggerApp:
             import importlib
 
             importlib.invalidate_caches()
+            import home_records
             import sheet_sync
             import naver_index_check
-            importlib.reload(sheet_sync)
-            importlib.reload(naver_index_check)
             import blogger_session
             import naver_advisor_session
             import paths
@@ -5844,6 +8029,9 @@ class BloggerApp:
 
             importlib.reload(paths)
             importlib.reload(ui_theme)
+            importlib.reload(home_records)
+            importlib.reload(sheet_sync)
+            importlib.reload(naver_index_check)
             importlib.reload(blogger_session)
             importlib.reload(naver_advisor_session)
             importlib.reload(app_module)
@@ -5870,7 +8058,7 @@ class BloggerApp:
             self.log("코드를 반영했습니다. 프로그램과 로그인은 그대로입니다.")
             self._schedule_text_save()
         except Exception as exc:
-            self._code_reload_pending = True
+            self._code_reload_pending = False
             try:
                 pages = getattr(self, "_main_pages", {})
                 write_ok = self._widget_alive(pages.get("글쓰기")) if hasattr(self, "_widget_alive") else False
@@ -5894,12 +8082,11 @@ class BloggerApp:
         except Exception:
             pass
         if self._watch_id is not None:
-            self.root.after_cancel(self._watch_id)
-        if self._dash_after is not None:
             try:
-                self.root.after_cancel(self._dash_after)
+                self.root.after_cancel(self._watch_id)
             except Exception:
                 pass
+        self._cancel_all_afters()
         self.session.close(kill_chrome=False)
         self.naver.close(kill_chrome=False)
         self.root.destroy()

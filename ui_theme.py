@@ -45,8 +45,25 @@ FONTS = {
     "body": (FONT_FAMILY, 13),
     "body_bold": (FONT_FAMILY, 13, "bold"),
     "small": (FONT_FAMILY, 11),
+    "small_bold": (FONT_FAMILY, 11, "bold"),
     "caption": (FONT_FAMILY, 10),
     "log": ("Consolas", 11),
+}
+
+PILL_TONES = {
+    "ok": ("#047857", "#d1fae5"),
+    "wait": ("#b45309", "#fde68a"),
+    "off": ("#334155", "#e2e8f0"),
+    "info": ("#4f46e5", "#eef2ff"),
+    "danger": ("#b91c1c", "#fee2e2"),
+}
+
+BUTTON_STYLES = {
+    "primary": ("#4f46e5", "#4338ca", "#ffffff"),
+    "danger": ("#ef4444", "#dc2626", "#ffffff"),
+    "success": ("#059669", "#047857", "#ffffff"),
+    "warning": ("#d97706", "#b45309", "#ffffff"),
+    "ghost": ("#e2e8f0", "#cbd5e1", "#0f172a"),
 }
 
 
@@ -57,60 +74,166 @@ def frame(parent, bg=None, **kwargs):
     return tk.Frame(parent, bg=bg)
 
 
-def light_scroll(parent, height: int, bg=None):
-    bg = bg or COLORS["card"]
-    wrap = tk.Frame(parent, bg=bg)
-    canvas = tk.Canvas(wrap, bg=bg, highlightthickness=0, height=height, borderwidth=0)
-    bar = tk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
-    inner = tk.Frame(canvas, bg=bg)
-    inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-    window = canvas.create_window((0, 0), window=inner, anchor="nw")
+class ScrollFrame(tk.Frame):
+    """스크롤 영역. 자식은 `.inner`에 넣는다.
 
-    def _fit(event):
-        canvas.itemconfigure(window, width=max(1, event.width))
+    휠 이벤트는 위젯마다 받지 않고 `install_wheel_dispatch`가 창 전체에서 한 번만 받아
+    마우스 아래의 ScrollFrame으로 넘긴다. 그래서 목록을 아무리 다시 만들어도 핸들러가 쌓이지 않는다.
+    """
 
-    canvas.bind("<Configure>", _fit)
-    canvas.configure(yscrollcommand=bar.set)
-    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    bar.pack(side=tk.RIGHT, fill=tk.Y)
+    def __init__(self, parent, height: int = 200, bg=None, orientation: str = "vertical"):
+        bg = bg or COLORS["card"]
+        super().__init__(parent, bg=bg)
+        self.orientation = orientation
+        self.canvas = tk.Canvas(
+            self, bg=bg, highlightthickness=0, borderwidth=0, height=height,
+            yscrollincrement=30, xscrollincrement=30,
+        )
+        self.inner = tk.Frame(self.canvas, bg=bg)
+        self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        if orientation == "horizontal":
+            self.bar = tk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+            self.canvas.configure(xscrollcommand=self.bar.set)
+            self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+            self.bar.pack(side=tk.BOTTOM, fill=tk.X)
+        else:
+            self.bar = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+            self.canvas.configure(yscrollcommand=self.bar.set)
+            self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            self.bar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.inner.bind("<Configure>", self._on_inner_resize)
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+        # 휠 디스패처가 위로 올라오며 찾는 표식
+        self._scroll_target = self
+        self.canvas._scroll_target = self
+        self.inner._scroll_target = self
 
-    def _wheel(event, target=wrap, view=canvas):
-        node = target.winfo_containing(event.x_root, event.y_root)
-        while node is not None:
-            if node is target:
-                view.yview_scroll(int(-event.delta / 120), "units")
+    def _on_inner_resize(self, _event=None) -> None:
+        bbox = self.canvas.bbox("all")
+        if bbox:
+            self.canvas.configure(scrollregion=bbox)
+
+    def _on_canvas_resize(self, event) -> None:
+        if self.orientation == "horizontal":
+            self.canvas.itemconfigure(self._window, height=max(1, event.height))
+        else:
+            self.canvas.itemconfigure(self._window, width=max(1, event.width))
+
+    def scroll(self, units: int, horizontal: bool = False) -> None:
+        if not units:
+            return
+        try:
+            if horizontal or self.orientation == "horizontal":
+                self.canvas.xview_scroll(units * 3, "units")
+            else:
+                self.canvas.yview_scroll(units * 3, "units")
+        except tk.TclError:
+            pass
+
+    def scroll_to_end(self) -> None:
+        try:
+            if self.orientation == "horizontal":
+                self.canvas.xview_moveto(1.0)
+            else:
+                self.canvas.yview_moveto(1.0)
+        except tk.TclError:
+            pass
+
+    def scroll_to_widget(self, widget) -> None:
+        if widget is None:
+            return
+        try:
+            self.update_idletasks()
+            bbox = self.canvas.bbox("all")
+            if bbox:
+                self.canvas.configure(scrollregion=bbox)
+            else:
+                bbox = (0, 0, 0, max(1, int(self.inner.winfo_reqheight() or 1)))
+            scroll_h = max(1, int(bbox[3] - bbox[1]))
+            view_h = max(1, int(self.canvas.winfo_height()))
+            if scroll_h <= view_h:
+                self.canvas.yview_moveto(0)
+                return
+            top = int(widget.winfo_rooty()) - int(self.inner.winfo_rooty())
+            row_h = max(1, int(widget.winfo_height()))
+            y = top + (row_h / 2) - (view_h / 2)
+            y = max(0.0, min(float(scroll_h - view_h), y))
+            self.canvas.yview_moveto(y / float(scroll_h))
+        except Exception:
+            pass
+
+
+# 자기 휠을 직접 처리하는 위젯. 이 위에서는 디스패처가 손대지 않는다.
+_NATIVE_WHEEL_CLASSES = {"Treeview", "Text", "Listbox", "TCombobox", "Spinbox", "TSpinbox"}
+
+
+def install_wheel_dispatch(root, on_wheel=None) -> None:
+    """창 전체 휠 핸들러를 하나만 설치한다. 다시 불러도 이전 것은 지우고 새로 하나만 둔다."""
+    for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        try:
+            root.unbind_all(sequence)
+        except tk.TclError:
+            pass
+    for funcid in getattr(root, "_wheel_funcids", None) or []:
+        try:
+            root.deletecommand(funcid)
+        except Exception:
+            pass
+
+    def _dispatch(event):
+        try:
+            node = root.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            # 파이썬이 모르는 Tk 창(콤보박스 펼침 목록 등) 위에서는 손대지 않는다.
+            return
+        if on_wheel is not None:
+            try:
+                on_wheel()
+            except Exception:
+                pass
+        if getattr(event, "num", 0) == 4:
+            units = -1
+        elif getattr(event, "num", 0) == 5:
+            units = 1
+        else:
+            delta = int(getattr(event, "delta", 0) or 0)
+            if not delta:
+                return
+            units = -1 if delta > 0 else 1
+        horizontal = bool(int(getattr(event, "state", 0) or 0) & 0x0001)
+        depth = 0
+        while node is not None and depth < 40:
+            target = getattr(node, "_scroll_target", None)
+            if target is not None:
+                target.scroll(units, horizontal)
+                return
+            try:
+                if node.winfo_class() in _NATIVE_WHEEL_CLASSES:
+                    return
+            except Exception:
                 return
             node = getattr(node, "master", None)
+            depth += 1
 
-    wrap.bind_all("<MouseWheel>", _wheel, add="+")
-    wrap.inner = inner
-    return wrap
+    ids = []
+    for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        try:
+            ids.append(root.bind_all(sequence, _dispatch))
+        except tk.TclError:
+            pass
+    root._wheel_funcids = ids
 
 
-def scrollable(parent, height: int, bg=None):
-    bg = bg or COLORS["card"]
-    if ctk:
-        return ctk.CTkScrollableFrame(
-            parent,
-            fg_color=bg,
-            height=height,
-            corner_radius=0,
-            border_width=0,
-        )
-    wrap = tk.Frame(parent, bg=bg)
-    canvas = tk.Canvas(wrap, bg=bg, highlightthickness=0, height=height)
-    bar = tk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
-    inner = tk.Frame(canvas, bg=bg)
-    inner.bind(
-        "<Configure>",
-        lambda _e: canvas.configure(scrollregion=canvas.bbox("all")),
-    )
-    canvas.create_window((0, 0), window=inner, anchor="nw")
-    canvas.configure(yscrollcommand=bar.set)
-    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    bar.pack(side=tk.RIGHT, fill=tk.Y)
-    wrap.inner = inner
-    return wrap
+def sheet_scroll(parent, height: int, bg=None):
+    return ScrollFrame(parent, height=height, bg=bg)
+
+
+def light_scroll(parent, height: int, bg=None):
+    return ScrollFrame(parent, height=height, bg=bg)
+
+
+def scrollable(parent, height: int, bg=None, orientation: str = "vertical"):
+    return ScrollFrame(parent, height=height, bg=bg, orientation=orientation)
 
 
 def card(parent):
@@ -153,6 +276,60 @@ def label(parent, text, font_key="body", color=None, **kwargs):
         fg=color,
         **kwargs,
     )
+
+
+def tk_pill(parent, text, tone="off", **kwargs):
+    """가벼운 알약 라벨. 목록 줄처럼 많이 그리는 곳에서 쓴다. 줄 색을 칠할 때 바탕색을 건드리지 않는다."""
+    fg, bg = PILL_TONES.get(tone, PILL_TONES["off"])
+    kwargs.setdefault("padx", 8)
+    kwargs.setdefault("pady", 2)
+    widget = tk.Label(parent, text=text, font=FONTS["small"], fg=fg, bg=bg, **kwargs)
+    widget._keep_bg = True
+    widget._pill_tone = tone
+    return widget
+
+
+def set_pill_tone(widget, text=None, tone=None) -> None:
+    try:
+        if tone is not None:
+            fg, bg = PILL_TONES.get(tone, PILL_TONES["off"])
+            widget.configure(fg=fg, bg=bg)
+            widget._pill_tone = tone
+        if text is not None:
+            widget.configure(text=text)
+    except tk.TclError:
+        pass
+
+
+def flat_button(parent, text, variant="ghost", command=None, font_key="small_bold", padx=10, pady=4, **kwargs):
+    """캔버스 없는 가벼운 버튼. 목록 줄마다 넣어도 스크롤이 무거워지지 않는다."""
+    base, hover, fg = BUTTON_STYLES.get(variant, BUTTON_STYLES["ghost"])
+    widget = tk.Label(
+        parent, text=text, font=FONTS.get(font_key, FONTS["small_bold"]), fg=fg, bg=base,
+        padx=padx, pady=pady, cursor="hand2", **kwargs,
+    )
+    widget._keep_bg = True
+    widget._base_bg = base
+    widget._hover_bg = hover
+
+    def _enter(_event=None):
+        if str(widget.cget("state")) != "disabled":
+            widget.configure(bg=hover)
+
+    def _leave(_event=None):
+        widget.configure(bg=base)
+
+    def _click(_event=None):
+        if str(widget.cget("state")) == "disabled":
+            return "break"
+        if command is not None:
+            command()
+        return "break"
+
+    widget.bind("<Enter>", _enter)
+    widget.bind("<Leave>", _leave)
+    widget.bind("<Button-1>", _click)
+    return widget
 
 
 def pill(parent, text, tone="off", **kwargs):
@@ -279,14 +456,7 @@ class HoverPopup:
 
 
 def button(parent, text, variant="primary", width=None, height=40, command=None):
-    styles = {
-        "primary": (COLORS["accent"], COLORS["accent_hover"], "#ffffff"),
-        "danger": (COLORS["danger"], COLORS["danger_hover"], "#ffffff"),
-        "success": (COLORS["success"], COLORS["success_hover"], "#ffffff"),
-        "warning": (COLORS["warning"], COLORS["warning_hover"], "#ffffff"),
-        "ghost": ("#e2e8f0", "#cbd5e1", "#0f172a"),
-    }
-    fg, hover, tc = styles.get(variant, styles["primary"])
+    fg, hover, tc = BUTTON_STYLES.get(variant, BUTTON_STYLES["primary"])
     if ctk:
         kw = {
             "text": text,

@@ -28,6 +28,7 @@
     "update_ui.py",
     "sheet_sync.py",
     "naver_index_check.py",
+    "home_records.py",
     "deploy.json",
     "assets",
     "README.md",

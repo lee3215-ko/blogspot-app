@@ -502,12 +502,11 @@ class NaverAdvisorSession:
             self._mark_done(blog_id, "naver_robots")
 
         self._report(4, total, "sitemap.xml 제출")
-        sitemap_url = f"{site.rstrip('/')}/sitemap.xml"
-        sm = self.submit_text_request(self._sitemap_page(site), sitemap_url)
+        sm = self._submit_sitemap(site)
         if sm.get("ok") and blog_id:
             self._mark_done(blog_id, "sitemap")
         elif not sm.get("ok"):
-            self.log(f"사이트맵 제출 실패: {sm.get('reason') or 'unknown'}")
+            self.log(f"사이트맵은 건너뛰고 다음 수집을 진행합니다: {sm.get('reason') or 'unknown'}")
 
         self._report(5, total, "블로그 주소 수집")
         crawl = self.request_blog_crawl(site)
@@ -708,6 +707,35 @@ class NaverAdvisorSession:
 
     def _sitemap_page(self, site: str) -> str:
         return f"https://searchadvisor.naver.com/console/site/request/sitemap?site={quote(site, safe='')}"
+
+    def _sitemap_candidates(self, site: str) -> list[str]:
+        base = (site or "").rstrip("/")
+        if not base:
+            return []
+        return [
+            f"{base}/sitemap.xml",
+            f"{base}/atom.xml",
+            f"{base}/feeds/posts/default?alt=rss",
+        ]
+
+    def _submit_sitemap(self, site: str) -> dict:
+        last = {"ok": False, "reason": "사이트맵 주소 없음", "value": ""}
+        page = self._sitemap_page(site)
+        for candidate in self._sitemap_candidates(site):
+            try:
+                last = self.submit_text_request(page, candidate)
+            except UnexpectedAlertPresentException:
+                last = {"ok": False, "reason": self._accept_alerts() or "사이트맵 안내 창", "value": candidate}
+            except Exception as exc:
+                self._accept_alerts()
+                last = {"ok": False, "reason": str(exc), "value": candidate}
+            if last.get("ok"):
+                return last
+            reason = str(last.get("reason") or "")
+            self.log(f"사이트맵 제출 실패: {candidate} · {reason or 'unknown'}")
+            if reason and not re.search(r"형식|올바르지|sitemap|rss", reason, re.I):
+                break
+        return last
 
     def _crawl_page(self, site: str) -> str:
         return f"https://searchadvisor.naver.com/console/site/request/crawl?site={quote(site, safe='')}"
@@ -916,7 +944,8 @@ class NaverAdvisorSession:
         found = self._wait_form_input(18)
         if not found.get("ok"):
             return {"ok": False, "reason": found.get("reason") or "input 없음", "value": ""}
-        submitted = self.driver.execute_script(
+        try:
+            submitted = self.driver.execute_script(
             """
             const targetUrl = arguments[0];
             const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="url"], input:not([type]), textarea'));
@@ -969,27 +998,34 @@ class NaverAdvisorSession:
             """,
             value,
         ) or {"ok": False, "reason": "unknown"}
-        self._tick(1.2)
-        if submitted.get("vue"):
-            alert = self.driver.execute_script(
-                """
-                const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="url"], textarea'));
-                for (const input of inputs) {
-                  let node = input;
-                  while (node) {
-                    const vm = node.__vue__;
-                    if (vm && vm.$options && vm.$options.name === "SiteBaseInput") {
-                      if (vm.showAlert && vm.alertMessageText) return String(vm.alertMessageText);
-                      return "";
+        except UnexpectedAlertPresentException:
+            return {"ok": False, "reason": self._accept_alerts() or "안내 창", "value": value}
+        self._tick(0.4)
+        msg = self._accept_alerts()
+        vue_alert = ""
+        try:
+            if submitted.get("vue") and not msg:
+                vue_alert = self.driver.execute_script(
+                    """
+                    const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="url"], textarea'));
+                    for (const input of inputs) {
+                      let node = input;
+                      while (node) {
+                        const vm = node.__vue__;
+                        if (vm && vm.$options && vm.$options.name === "SiteBaseInput") {
+                          if (vm.showAlert && vm.alertMessageText) return String(vm.alertMessageText);
+                          return "";
+                        }
+                        node = node.parentElement;
+                      }
                     }
-                    node = node.parentElement;
-                  }
-                }
-                return "";
-                """
-            ) or ""
-            if alert:
-                submitted = {"ok": False, "reason": str(alert), "value": value}
+                    return "";
+                    """
+                ) or ""
+        except UnexpectedAlertPresentException:
+            msg = self._accept_alerts() or msg
+        if msg or vue_alert:
+            submitted = {"ok": False, "reason": str(msg or vue_alert), "value": value}
         self._drain_alerts()
         self._click_modal_confirm()
         self._drain_alerts()
@@ -1283,25 +1319,28 @@ class NaverAdvisorSession:
             self._click_modal_confirm()
             time.sleep(0.2)
 
-    def _accept_alerts(self) -> None:
+    def _accept_alerts(self) -> str:
+        last = ""
         for _ in range(6):
             try:
                 alert = self.driver.switch_to.alert
                 msg = (alert.text or "").strip()
                 alert.accept()
                 if msg:
+                    last = msg
                     self.log(f"안내 창: {msg[:80]}")
                 time.sleep(0.2)
             except NoAlertPresentException:
-                return
+                return last
             except UnexpectedAlertPresentException:
                 try:
                     self.driver.switch_to.alert.accept()
                 except Exception:
-                    return
+                    return last
                 time.sleep(0.2)
             except Exception:
-                return
+                return last
+        return last
 
     def _on_advisor_console(self) -> bool:
         url = self._url()

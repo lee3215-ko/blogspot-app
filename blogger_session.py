@@ -158,9 +158,17 @@ return (function() {
       address: "",
     });
   }
-  const m = location.href.match(/\\/blog\\/(?:posts|post\\/edit|settings)\\/(\\d{10,})/);
-  if (m && !seen.has(m[1])) {
-    blogs.push({id: m[1], name: document.title.replace(/^Blogger:\\s*/, ""), selected: true, address: ""});
+  const urlId = (location.href.match(/\\/blog\\/(?:posts|post\\/edit|settings)\\/(\\d{10,})/) || [])[1] || "";
+  const deletedPage = !!(
+    document.querySelector('[jsname="lIt8ce"]')
+    || document.querySelector('img[src*="blogger-trash"]')
+  );
+  if (urlId && !seen.has(urlId) && !deletedPage) {
+    blogs.push({id: urlId, name: document.title.replace(/^Blogger:\\s*/, ""), selected: true, address: ""});
+  }
+  if (deletedPage && urlId) {
+    const idx = blogs.findIndex((b) => b.id === urlId);
+    if (idx >= 0) blogs.splice(idx, 1);
   }
   const addrEl = document.querySelector('[jscontroller="vo4Jme"] [jsname="bUNG7d"]');
   const address = (addrEl?.textContent || "").trim();
@@ -184,7 +192,10 @@ return (function() {
       posts.push({url: href, title: (titleEl?.textContent || "").trim()});
     }
     const hit = blogs.find((b) => b.id === postsId);
-    if (hit) hit.posts = posts;
+    if (hit) {
+      hit.posts = posts;
+      hit.postsKnown = true;
+    }
   }
   let viewHost = "";
   for (const a of document.querySelectorAll('a[href*="blogspot.com"]')) {
@@ -216,6 +227,7 @@ return (function() {
     address: address || viewHost,
     posts,
     postsId,
+    deletedId: deletedPage && urlId ? urlId : "",
   };
 })();
 """
@@ -321,6 +333,20 @@ def merge_posts(*groups) -> list[dict]:
 def host_from_post_url(url: str) -> str:
     match = re.search(r"https?://([^/\s]+\.blogspot\.com)", url or "", flags=re.I)
     return match.group(1).lower() if match else ""
+
+
+def posts_for_address(posts, address: str = "") -> list[dict]:
+    cleaned = normalize_posts(posts)
+    host = normalize_blog_address(address)
+    if not host:
+        return cleaned
+    out = []
+    for item in cleaned:
+        item_host = host_from_post_url(str(item.get("url") or ""))
+        if item_host and item_host != host:
+            continue
+        out.append(item)
+    return out
 
 
 def normalize_blog_address(value: str) -> str:
@@ -706,24 +732,104 @@ return {ok: true, text: norm(target)};
 
 
 _CONFIRM_BLOG_DELETE_JS = """
-const norm = (el) => (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
+const name = String(arguments[0] || "");
+const want = String(arguments[1] || "delete");
 const visible = (el) => {
-  const rect = el.getBoundingClientRect();
-  const style = window.getComputedStyle(el);
-  return rect.width > 2 && rect.height > 2 && style.visibility !== "hidden" && style.display !== "none";
+  if (!el) return false;
+  const r = el.getBoundingClientRect();
+  if (r.width < 4 || r.height < 4) return false;
+  const style = getComputedStyle(el);
+  return style.visibility !== "hidden" && style.display !== "none" && style.opacity !== "0";
 };
-const spans = [...document.querySelectorAll("span.RveJvd.snByac, span.RveJvd, span.snByac")];
-let span = spans.find((el) => visible(el) && norm(el) === "영구적으로 삭제");
-if (!span) {
-  span = [...document.querySelectorAll("span, button, [role='button']")].find(
-    (el) => visible(el) && norm(el) === "영구적으로 삭제"
-  );
+const visit = (root, sink, selector) => {
+  if (!root || !root.querySelectorAll) return;
+  try { sink.push(...root.querySelectorAll(selector)); } catch (e) {}
+  for (const el of root.querySelectorAll("*")) {
+    if (el.shadowRoot) visit(el.shadowRoot, sink, selector);
+  }
+};
+const textOf = (el) => (
+  (el.innerText || el.textContent || el.getAttribute("aria-label") || "") + ""
+).replace(/\\s+/g, " ").trim();
+const pack = (btn, text, kind, labels) => ({ok: true, button: btn, text, kind, labels});
+const labels = [];
+const nodes = [];
+visit(document, nodes, 'button, [role="button"], a, span.RveJvd, span.snByac, [jsname="lIt8ce"]');
+for (const el of nodes) {
+  const t = textOf(el);
+  if (t && t.length < 40 && visible(el) && labels.length < 16 && !labels.includes(t)) labels.push(t);
 }
-if (!span) return false;
-const target = span.closest("button, [role='button']") || span;
-target.scrollIntoView({block: "center"});
-target.click();
-return true;
+
+if (want === "permanent") {
+  const marked = [];
+  visit(document, marked, '[jsname="lIt8ce"]');
+  for (const el of marked) {
+    const btn = el.closest("[role='button'], button") || el;
+    if (!visible(btn)) continue;
+    if ((btn.getAttribute("aria-disabled") || "") === "true") continue;
+    return pack(btn, textOf(btn) || "영구적으로 삭제", "permanent", labels);
+  }
+}
+
+if (want === "forever") {
+  const dialogs = [];
+  visit(document, dialogs, '[role="dialog"], [role="alertdialog"]');
+  const dialog = dialogs.find((el) => visible(el) && /완전히 삭제|영구적으로 삭제|delete permanently/i.test(textOf(el))) || null;
+  const roots = dialog ? [dialog] : [];
+  for (const root of roots) {
+    const buttons = [];
+    visit(root, buttons, 'button, [role="button"], span.RveJvd, span.snByac');
+    for (const el of buttons) {
+      const t = textOf(el);
+      if (t !== "영구적으로 삭제" && t !== "영구 삭제" && t.toLowerCase() !== "delete permanently") continue;
+      if (/삭제 취소/.test(t)) continue;
+      const btn = el.closest("button, [role='button']") || el;
+      if (!visible(btn)) continue;
+      if ((btn.getAttribute("aria-disabled") || "") === "true") continue;
+      return pack(btn, t, "forever", labels);
+    }
+  }
+  return {ok: false, button: null, text: "", kind: "", labels, dialog: !!dialog};
+}
+
+const dialogs = [];
+visit(document, dialogs, '[role="dialog"], [role="alertdialog"]');
+const dialog = dialogs.find((el) => {
+  if (!visible(el)) return false;
+  const t = textOf(el);
+  return /완전히 삭제|영구적으로 삭제|블로그 삭제|delete/i.test(t);
+}) || null;
+
+if (want === "delete") {
+  if (!dialog) return {ok: false, button: null, text: "", kind: "", labels};
+  const buttons = [];
+  visit(dialog, buttons, 'button, [role="button"], span.RveJvd, span.snByac');
+  for (const el of buttons) {
+    const t = textOf(el);
+    if (t !== "삭제" && t.toLowerCase() !== "delete") continue;
+    const btn = el.closest("button, [role='button']") || el;
+    if (!visible(btn)) continue;
+    if ((btn.getAttribute("aria-disabled") || "") === "true") continue;
+    return pack(btn, t, "delete", labels);
+  }
+  return {ok: false, button: null, text: "", kind: "", labels, dialog: true};
+}
+
+const roots = dialog ? [dialog, document] : [document];
+for (const root of roots) {
+  const buttons = [];
+  visit(root, buttons, 'button, [role="button"], a, span.RveJvd, span.snByac, [jsname="lIt8ce"]');
+  for (const el of buttons) {
+    const t = textOf(el);
+    if (t !== "영구적으로 삭제" && t !== "영구 삭제" && t.toLowerCase() !== "delete permanently") continue;
+    if (/삭제 취소/.test(t)) continue;
+    const btn = el.getAttribute("jsname") === "lIt8ce" ? el : (el.closest("[role='button'], button, [jsname='lIt8ce']") || el);
+    if (!visible(btn)) continue;
+    if ((btn.getAttribute("aria-disabled") || "") === "true") continue;
+    return pack(btn, t, "permanent", labels);
+  }
+}
+return {ok: false, button: null, text: "", kind: "", labels, dialog: !!dialog};
 """
 
 
@@ -968,7 +1074,13 @@ class BloggerSession:
             except RuntimeError:
                 pass
         previous = {blog.id: blog for blog in self.state.blogs}
-        gone = getattr(self, "_gone_ids", None) or set()
+        gone = getattr(self, "_gone_ids", None)
+        if gone is None:
+            self._gone_ids = set()
+            gone = self._gone_ids
+        deleted_id = str((raw or {}).get("deletedId") or "").strip()
+        if deleted_id:
+            gone.add(deleted_id)
         blogs = []
         seen = set()
         for item in (raw or {}).get("blogs") or []:
@@ -990,26 +1102,35 @@ class BloggerSession:
                 page_posts = normalize_posts(
                     [{"url": item.get("postUrl"), "title": item.get("postTitle")}]
                 )
-            if page_posts:
+            known = bool(item.get("postsKnown"))
+            if known:
                 posts = page_posts
+                posts_live = True
+            elif page_posts:
+                posts = page_posts
+                posts_live = True
             elif old:
                 posts = list(old.posts)
+                posts_live = bool(getattr(old, "posts_live", False))
             else:
                 posts = []
+                posts_live = False
             if posts and not address:
                 address = host_from_post_url(str(posts[0].get("url") or ""))
-            blogs.append(
-                BlogInfo(
-                    id=blog_id,
-                    name=name,
-                    selected=bool(item.get("selected")),
-                    address=address,
-                    posts=posts,
-                    done=set(old.done) if old else set(),
-                )
+            posts = posts_for_address(posts, address)
+            blog = BlogInfo(
+                id=blog_id,
+                name=name,
+                selected=bool(item.get("selected")),
+                address=address,
+                posts=posts,
+                done=set(old.done) if old else set(),
             )
+            blog.posts_live = posts_live
+            blogs.append(blog)
         if not blogs and previous and not fresh:
             blogs = [blog for blog in previous.values() if blog.id not in gone]
+        blogs = [blog for blog in blogs if blog.id not in gone]
         state = SessionState(
             account=str((raw or {}).get("account") or ""),
             blogs=blogs,
@@ -1226,10 +1347,10 @@ class BloggerSession:
             for blog in self.state.blogs:
                 if blog.id != current:
                     continue
-                if posts:
-                    blog.posts = posts
-                    if not blog.address:
-                        blog.address = host_from_post_url(str(posts[0].get("url") or ""))
+                blog.posts = posts_for_address(posts, blog.address)
+                blog.posts_live = True
+                if blog.posts and not blog.address:
+                    blog.address = host_from_post_url(str(blog.posts[0].get("url") or ""))
                 break
         return posts
 
@@ -1253,7 +1374,9 @@ class BloggerSession:
             post_url,
         )
         if button is None:
-            raise RuntimeError("글 목록에서 삭제할 글을 찾지 못했습니다.")
+            self.log("블로그스팟 글 목록에 없어 프로그램에만 남아 있던 글을 뺍니다.")
+            self._drop_post_from_state(blog_id, post_url)
+            return
         self.log("글을 휴지통으로 옮깁니다.")
         self._click_jsaction(button)
         confirm = self._wait(8).until(
@@ -1301,6 +1424,20 @@ class BloggerSession:
         self.read_published_posts(blog_id)
         self.log("글을 휴지통으로 옮겼습니다.")
 
+    def _drop_post_from_state(self, blog_id: str, post_url: str) -> None:
+        key = (post_url or "").strip().rstrip("/").lower()
+        if not key:
+            return
+        for blog in self.state.blogs:
+            if blog.id != blog_id:
+                continue
+            blog.posts = [
+                item
+                for item in (blog.posts or [])
+                if str(item.get("url") or "").strip().rstrip("/").lower() != key
+            ]
+            break
+
     def read_published_post(self, blog_id: str = "") -> dict:
         posts = self.read_published_posts(blog_id)
         if not posts:
@@ -1340,9 +1477,9 @@ class BloggerSession:
             return url
         self.click_new_post()
         self._wait_compose_editor()
-        self._switch_post_html_view()
         if (image_path or "").strip():
             self._upload_post_image(image_path)
+        self._switch_post_html_view()
         if (html_body or "").strip():
             self._append_post_html(html_body)
         self._set_post_title(title)
@@ -1548,6 +1685,74 @@ class BloggerSession:
             )
         )
 
+    def _find_image_insert_button(self):
+        script = """
+        const wanted = ["이미지 삽입", "Insert image", "이미지 추가", "Insert Image", "사진 삽입"];
+        const visible = (el) => {
+          if (!el) return false;
+          const r = el.getBoundingClientRect();
+          if (r.width < 8 || r.height < 8) return false;
+          const style = getComputedStyle(el);
+          return style.visibility !== "hidden" && style.display !== "none";
+        };
+        const visit = (root, out) => {
+          if (!root || !root.querySelectorAll) return;
+          out.push(...root.querySelectorAll('[aria-label], [data-tooltip], [role="button"], button'));
+          for (const el of root.querySelectorAll("*")) {
+            if (el.shadowRoot) visit(el.shadowRoot, out);
+          }
+        };
+        const nodes = [];
+        visit(document, nodes);
+        for (const el of nodes) {
+          const label = (el.getAttribute("aria-label") || el.getAttribute("data-tooltip") || "").trim();
+          const text = (el.innerText || "").replace(/\\s+/g, " ").trim();
+          if (!wanted.includes(label) && !wanted.includes(text) && !label.includes("이미지 삽입")) continue;
+          if ((el.getAttribute("aria-disabled") || "") === "true") continue;
+          if (visible(el)) return el;
+        }
+        return null;
+        """
+        return self.driver.execute_script(script)
+
+    def _open_compose_overflow(self) -> None:
+        button = self.driver.execute_script(
+            """
+            const labels = ["더보기", "More", "더 보기"];
+            const nodes = [...document.querySelectorAll('[aria-label], [data-tooltip], [role="button"]')];
+            return nodes.find(el => {
+              const label = (el.getAttribute("aria-label") || el.getAttribute("data-tooltip") || "").trim();
+              if (!labels.includes(label)) return false;
+              const r = el.getBoundingClientRect();
+              return r.width > 8 && r.height > 8 && (el.getAttribute("aria-disabled") || "") !== "true";
+            }) || null;
+            """
+        )
+        if button is None:
+            return
+        self._click_jsaction(button)
+        self._tick(0.25)
+
+    def _post_has_image(self) -> bool:
+        html = (self._post_editor_value() or "").lower()
+        if "<img" in html:
+            return True
+        try:
+            return bool(
+                self.driver.execute_script(
+                    """
+                    const roots = [...document.querySelectorAll('[contenteditable="true"]')];
+                    return roots.some(el => {
+                      const r = el.getBoundingClientRect();
+                      if (r.width < 40 || r.height < 20) return false;
+                      return !!el.querySelector("img");
+                    });
+                    """
+                )
+            )
+        except Exception:
+            return False
+
     def _upload_post_image(self, path: str) -> None:
         path = os.path.abspath(path)
         if not os.path.isfile(path):
@@ -1558,29 +1763,32 @@ class BloggerSession:
         except Exception:
             pass
         try:
-            button = self._wait(8).until(
-                lambda d: d.execute_script(
-                    """
-                    const nodes = [...document.querySelectorAll('[aria-label="이미지 삽입"]')];
-                    return nodes.find(el => {
-                      const r = el.getBoundingClientRect();
-                      return r.width > 8 && r.height > 8 && (el.getAttribute("aria-disabled") || "") !== "true";
-                    }) || null;
-                    """
-                )
-            )
+            self.log("이미지 삽입 버튼을 찾습니다.")
+            button = self._find_image_insert_button()
+            if button is None:
+                self._open_compose_overflow()
+                try:
+                    button = self._wait(8).until(lambda d: self._find_image_insert_button())
+                except Exception:
+                    button = None
+            if button is None:
+                raise RuntimeError("이미지 삽입 버튼을 찾지 못했습니다. 쓰기 화면 툴바를 확인하세요.")
             self._click_jsaction(button)
             self._tick(0.3)
             item = self._wait(6).until(
                 lambda d: d.execute_script(
                     """
+                    const labels = ["컴퓨터에서 업로드", "Upload from computer", "컴퓨터에서 업로드하기"];
                     const nodes = [
-                      ...document.querySelectorAll('[role="menuitem"][aria-label="컴퓨터에서 업로드"]'),
+                      ...document.querySelectorAll('[role="menuitem"]'),
                       ...document.querySelectorAll('[data-command="imageUploadPickerV2"]'),
                     ];
                     return nodes.find(el => {
                       const r = el.getBoundingClientRect();
-                      return r.width > 8 && r.height > 8;
+                      if (r.width < 8 || r.height < 8) return false;
+                      const label = (el.getAttribute("aria-label") || "").trim();
+                      const text = (el.innerText || "").replace(/\\s+/g, " ").trim();
+                      return labels.includes(label) || labels.includes(text) || label.includes("컴퓨터에서 업로드");
                     }) || null;
                     """
                 )
@@ -1621,7 +1829,7 @@ class BloggerSession:
             self.driver.switch_to.default_content()
             self.log(f"이미지 업로드 중: {os.path.basename(path)}")
             self._confirm_image_layout()
-            self._wait(40).until(lambda d: "<img" in (self._post_editor_value() or "").lower())
+            self._wait(40).until(lambda d: self._post_has_image())
             self.log("이미지를 글에 넣었습니다.")
         finally:
             try:
@@ -1788,32 +1996,28 @@ class BloggerSession:
         self.control.checkpoint()
         self.open_settings(blog_id)
         self.control.checkpoint()
-        opened = False
-        sample = ""
-        for _ in range(6):
-            result = self.driver.execute_script(_OPEN_BLOG_DELETE_JS) or {}
-            opened = bool(result.get("ok"))
-            if opened:
-                self.log(f"블로그 삭제를 눌렀습니다: {result.get('text') or '삭제'}")
-                break
-            found = result.get("sample") or []
-            if found:
-                sample = ", ".join(str(item) for item in found[:8])
-            self._tick(0.45)
-        if not opened:
-            extra = f" 화면에 보인 문구: {sample}" if sample else ""
-            raise RuntimeError(f"설정 화면에서 블로그 삭제를 찾지 못했습니다.{extra}")
-        self.log("블로그 삭제 확인 창에서 영구적으로 삭제를 기다립니다.")
-        confirmed = False
-        for _ in range(16):
-            self.control.checkpoint()
-            confirmed = bool(self.driver.execute_script(_CONFIRM_BLOG_DELETE_JS))
-            if confirmed:
-                self.log("영구적으로 삭제를 눌렀습니다.")
-                break
-            self._tick(0.4)
-        if not confirmed:
-            raise RuntimeError("삭제 확인 창에서 영구적으로 삭제를 누르지 못했습니다.")
+        already = self._find_blog_delete_confirm(name, "permanent")
+        if already.get("ok") and already.get("button") is not None:
+            self.log("삭제된 페이지가 이미 열려 있습니다.")
+        else:
+            opened = False
+            sample = ""
+            for _ in range(6):
+                result = self.driver.execute_script(_OPEN_BLOG_DELETE_JS) or {}
+                opened = bool(result.get("ok"))
+                if opened:
+                    self.log(f"블로그 삭제를 눌렀습니다: {result.get('text') or '삭제'}")
+                    break
+                found = result.get("sample") or []
+                if found:
+                    sample = ", ".join(str(item) for item in found[:8])
+                self._tick(0.45)
+            if not opened:
+                extra = f" 화면에 보인 문구: {sample}" if sample else ""
+                raise RuntimeError(f"설정 화면에서 블로그 삭제를 찾지 못했습니다.{extra}")
+            self._click_named_delete_step(name, "delete", "삭제 확인 창의 삭제", 12)
+        self._click_named_delete_step(name, "permanent", "삭제된 페이지의 영구적으로 삭제", 20)
+        self._click_named_delete_step(name, "forever", "완전 삭제 확인 창의 영구적으로 삭제", 12)
         self._tick(1.0)
         gone = getattr(self, "_gone_ids", None)
         if gone is None:
@@ -1822,6 +2026,88 @@ class BloggerSession:
         gone.add(str(blog_id))
         self.state.blogs = [blog for blog in self.state.blogs if blog.id != blog_id]
         self.log(f"블로그 삭제를 눌렀습니다: {name or blog_id}")
+
+    def _click_named_delete_step(self, name: str, want: str, title: str, seconds: float, optional: bool = False) -> bool:
+        self.log(f"{title}를 기다립니다.")
+        seen = ""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            self.control.checkpoint()
+            result = self._find_blog_delete_confirm(name, want)
+            labels = result.get("labels") or []
+            if labels:
+                seen = ", ".join(str(item) for item in labels[:8])
+            button = result.get("button")
+            if result.get("ok") and button is not None:
+                self._click_jsaction(button)
+                self.log(f"{title}를 눌렀습니다: {result.get('text') or want}")
+                try:
+                    self.driver.switch_to.default_content()
+                except Exception:
+                    pass
+                self._tick(0.9)
+                return True
+            self._tick(0.35)
+        extra = f" 화면에 보인 버튼: {seen}" if seen else ""
+        if optional:
+            return False
+        raise RuntimeError(f"{title}를 누르지 못했습니다.{extra}")
+
+    def _find_blog_delete_confirm(self, name: str = "", want: str = "delete") -> dict:
+        """삭제 단계 버튼을 찾는다. 영구 삭제는 jsname=lIt8ce를 우선한다."""
+        empty = {"ok": False, "button": None, "text": "", "kind": "", "labels": []}
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        try:
+            found = self.driver.execute_script(_CONFIRM_BLOG_DELETE_JS, name, want) or empty
+        except Exception:
+            found = empty
+        if found.get("ok") and found.get("button") is not None:
+            return found
+        labels = list(found.get("labels") or [])
+        frames = []
+        try:
+            frames = self.driver.find_elements(By.CSS_SELECTOR, "iframe")
+        except Exception:
+            frames = []
+        for frame in frames:
+            try:
+                self.driver.switch_to.default_content()
+                self.driver.switch_to.frame(frame)
+                result = self.driver.execute_script(_CONFIRM_BLOG_DELETE_JS, name, want) or empty
+                for item in result.get("labels") or []:
+                    if item not in labels:
+                        labels.append(item)
+                if result.get("ok") and result.get("button") is not None:
+                    result["labels"] = labels
+                    return result
+            except Exception:
+                continue
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        if want == "permanent":
+            try:
+                for el in self.driver.find_elements(By.CSS_SELECTOR, '[jsname="lIt8ce"]'):
+                    if not el.is_displayed():
+                        continue
+                    labels.append("영구적으로 삭제")
+                    return {
+                        "ok": True,
+                        "button": el,
+                        "text": (el.text or "").strip() or "영구적으로 삭제",
+                        "kind": "permanent",
+                        "labels": labels,
+                    }
+            except Exception:
+                pass
+        found["labels"] = labels
+        found["ok"] = False
+        found["button"] = None
+        return found
 
     def read_blog_address(self) -> str:
         try:
@@ -1879,7 +2165,7 @@ class BloggerSession:
                 self.log("다른 작업이 시작되어 상세 인식을 멈춥니다.")
                 return self.state
             self.control.checkpoint()
-            if (blog.address or "").strip() and blog.posts:
+            if (blog.address or "").strip() and (blog.posts or getattr(blog, "posts_live", False)):
                 continue
             try:
                 address, posts = self._read_blog_feed(blog.id)
@@ -1889,8 +2175,8 @@ class BloggerSession:
             if address and not (blog.address or "").strip():
                 blog.address = address
                 self.log(f"블로그 주소 인식: {blog.name} → {address}")
-            if posts:
-                blog.posts = merge_posts(blog.posts, posts)
+            if posts and not getattr(blog, "posts_live", False):
+                blog.posts = posts_for_address(merge_posts(blog.posts, posts), blog.address)
                 self.log(f"글 {len(blog.posts)}개 인식: {blog.name}")
         missing = [blog for blog in self.state.blogs if not (blog.address or "").strip()]
         if missing and not (should_abort and should_abort()):
@@ -1952,15 +2238,20 @@ class BloggerSession:
         return "", []
 
     def _merge_catalog(self, catalog: list[dict]) -> None:
+        gone = getattr(self, "_gone_ids", None) or set()
         known = {blog.id: blog for blog in self.state.blogs}
+        page_ids = set(known)
         for item in catalog:
             blog_id = str(item.get("id") or "").strip()
-            if not _BLOG_ID_RE.match(blog_id):
+            if not _BLOG_ID_RE.match(blog_id) or blog_id in gone:
                 continue
             blog = known.get(blog_id)
             address = normalize_blog_address(str(item.get("address") or ""))
             name = str(item.get("name") or "").strip()
             if blog is None:
+                # 화면 목록에 없는 블로그는 피드로 되살리지 않는다. 삭제·휴지통 블로그가 다시 붙는 것을 막는다.
+                if page_ids:
+                    continue
                 blog = BlogInfo(id=blog_id, name=name or blog_id[-6:], address=address)
                 self.state.blogs.append(blog)
                 known[blog_id] = blog
@@ -1969,6 +2260,8 @@ class BloggerSession:
                 blog.name = name
             if address:
                 blog.address = address
+        if gone:
+            self.state.blogs = [blog for blog in self.state.blogs if blog.id not in gone]
 
     def create_blogs(self, titles: list[str], control: RunControl | None = None, on_progress=None) -> list[dict]:
         if control is not None:
@@ -3148,10 +3441,24 @@ class BloggerSession:
             return False
 
     def set_google_description(self, text: str) -> None:
-        self._close_open_dialogs()
-        self._click_setting_row("sHhTg", "설명")
-        self._fill_visible_dialog(text, title_hint="설명")
-        self.log(f"구글,네이버 디스크립션을 입력했습니다: {text}")
+        last_exc = None
+        for attempt in range(3):
+            try:
+                self._close_open_dialogs()
+                self._wait_setting_row_ready("sHhTg", "설명", timeout=8)
+                self._click_setting_row("sHhTg", "설명")
+                self._fill_visible_dialog(text, title_hint="설명")
+                self.log("구글,네이버 디스크립션을 입력했습니다.")
+                return
+            except Exception as exc:
+                last_exc = exc
+                self.log(f"설명 설정 창을 다시 엽니다 ({attempt + 1}/3)")
+                try:
+                    self._close_open_dialogs()
+                except Exception:
+                    pass
+                self._tick(0.4)
+        raise last_exc
 
     def set_search_description(self, text: str) -> None:
         self._wait_setting_unlocked("mM3Kjc")
@@ -3418,8 +3725,8 @@ class BloggerSession:
         if el is None:
             raise RuntimeError(f"설정 항목을 찾지 못했습니다: {label}")
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        self._tick()
-        self._trusted_click(el)
+        self._tick(0.15)
+        self._click_jsaction(el)
 
     def _is_page_chrome_dialog(self, dialog) -> bool:
         try:
@@ -3473,14 +3780,24 @@ class BloggerSession:
         if dialog is None:
             return
         try:
-            self._click_named_button(dialog, "취소", wait_enabled=False)
-            self._wait_dialog_closed(dialog)
+            cancel = None
+            for button in dialog.find_elements(By.CSS_SELECTOR, '[role="button"]'):
+                if "취소" not in (button.text or ""):
+                    continue
+                if button.is_displayed():
+                    cancel = button
+                    break
+            if cancel is not None:
+                self._click_jsaction(cancel)
+                self._wait_dialog_closed(dialog)
+                return
         except Exception:
-            try:
-                self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-            except Exception:
-                pass
-            self._tick()
+            pass
+        try:
+            self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+        self._tick(0.2)
 
     def _fill_visible_dialog(self, text: str, title_hint: str | None = None) -> None:
         dialog = self._wait_dialog(title_hint)

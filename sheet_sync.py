@@ -244,83 +244,111 @@ def _same_record_values(left: list[list[str]], right: list[list[str]]) -> bool:
     return True
 
 
+def _pad_record_row(row: list[str]) -> list[str]:
+    padded = list(row) + [""] * (len(HEADERS) - len(row))
+    return [_cell(cell) for cell in padded[: len(HEADERS)]]
+
+
+def _remap_named_row(row: list[str], sheet_header: list[str]) -> list[str]:
+    sheet_index = {name: pos for pos, name in enumerate(sheet_header)}
+    kept = [""] * len(HEADERS)
+    for pos, name in enumerate(HEADERS):
+        src = sheet_index.get(name)
+        if src is not None and src < len(row):
+            kept[pos] = _cell(row[src])
+    return kept
+
+
+def _apply_program_over_sheet(program: list[str], sheet: list[str] | None) -> list[str]:
+    row = _pad_record_row(program)
+    if not sheet:
+        return row
+    for name in SHEET_WINS_IF_LOCAL_EMPTY:
+        pos = HEADERS.index(name)
+        if row[pos]:
+            continue
+        filled = _cell(sheet[pos] if pos < len(sheet) else "")
+        if filled:
+            row[pos] = filled
+    return row
+
+
 def _reorder_existing_rows(sheet_rows: list[list[str]]) -> list[list[str]]:
     if not sheet_rows or not _record_header(sheet_rows[0]):
         return [list(HEADERS)]
-    header = sheet_rows[0]
     ordered = [list(HEADERS)]
     for row in sheet_rows[1:]:
-        item = []
-        for name in HEADERS:
-            if name in header:
-                pos = header.index(name)
-                item.append(_cell(row[pos] if pos < len(row) else ""))
-            else:
-                item.append("")
-        ordered.append(item)
+        remapped = _remap_named_row(row, sheet_rows[0])
+        if any(remapped):
+            ordered.append(remapped)
     return ordered
 
 
 def merge_rows(program_rows: list[list[str]], sheet_rows: list[list[str]]) -> list[list[str]]:
+    """시트에 있는 줄 순서는 유지하고, 프로그램 값은 그 자리에만 덮어쓴다. 새 줄은 맨 아래에 붙인다."""
     header = list(HEADERS)
-    index = {name: pos for pos, name in enumerate(header)}
-    sheet_header = sheet_rows[0] if sheet_rows else []
-    sheet_index = {name: pos for pos, name in enumerate(sheet_header)}
-    body = sheet_rows[1:] if _record_header(sheet_header) else sheet_rows
+    id_col = HEADERS.index("블로그ID")
+    addr_col = HEADERS.index("주소")
+    programs = [_pad_record_row(row) for row in program_rows]
     by_id: dict[str, list[str]] = {}
     by_address: dict[str, list[str]] = {}
-    used: set[int] = set()
-    id_pos = sheet_index.get("블로그ID", -1)
-    address_pos = sheet_index.get("주소", -1)
-    for row_index, row in enumerate(body):
-        blog_id = str(row[id_pos]).strip() if id_pos >= 0 and id_pos < len(row) else ""
-        address = str(row[address_pos]).strip().rstrip("/").lower() if 0 <= address_pos < len(row) else ""
+    for row in programs:
+        blog_id = str(row[id_col]).strip()
+        address = str(row[addr_col]).strip().rstrip("/").lower()
         if blog_id:
             by_id[blog_id] = row
-        elif address:
+        if address:
             by_address[address] = row
-        else:
-            used.add(row_index)
+
+    if not sheet_rows:
+        return [header] + programs
+
+    sheet_header = sheet_rows[0]
+    has_record = _record_header(sheet_header)
+    if not has_record:
+        nonempty = [row for row in sheet_rows if any(_cell(cell) for cell in row)]
+        if len(nonempty) <= 1:
+            return [header] + programs
+        body = sheet_rows
+        remap = _pad_record_row
+    else:
+        body = sheet_rows[1:]
+        remap = lambda row, _header=sheet_header: _remap_named_row(row, _header)
 
     merged = [header]
-    seen: set[str] = set()
-    for program in program_rows:
-        row = list(program) + [""] * (len(header) - len(program))
-        row = row[: len(header)]
-        blog_id = row[index["블로그ID"]]
-        address = row[index["주소"]].strip().rstrip("/").lower()
-        sheet = by_id.get(blog_id) if blog_id else None
-        if sheet is None and address:
-            sheet = by_address.get(address)
-        if sheet:
-            if blog_id and blog_id in by_id:
-                seen.add(blog_id)
-            for name in SHEET_WINS_IF_LOCAL_EMPTY:
-                pos = index[name]
-                if row[pos]:
-                    continue
-                src = sheet_index.get(name)
-                if src is None or src >= len(sheet):
-                    continue
-                filled = _cell(sheet[src])
-                if filled:
-                    row[pos] = filled
-        merged.append(row)
+    seen_ids: set[str] = set()
+    seen_addr: set[str] = set()
+    for raw in body:
+        existing = remap(raw)
+        if not any(existing):
+            continue
+        blog_id = str(existing[id_col]).strip()
+        address = str(existing[addr_col]).strip().rstrip("/").lower()
+        program = by_id.get(blog_id) if blog_id else None
+        if program is None and address:
+            program = by_address.get(address)
+        if program is not None:
+            existing = _apply_program_over_sheet(program, existing)
+            blog_id = str(existing[id_col]).strip() or blog_id
+            address = str(existing[addr_col]).strip().rstrip("/").lower() or address
+        if blog_id:
+            seen_ids.add(blog_id)
+        if address:
+            seen_addr.add(address)
+        merged.append(existing)
 
-    if _record_header(sheet_header):
-        for row in body:
-            blog_id = str(row[id_pos]).strip() if 0 <= id_pos < len(row) else ""
-            if blog_id and blog_id in seen:
-                continue
-            if blog_id and any(item[index["블로그ID"]] == blog_id for item in merged[1:]):
-                continue
-            kept = [""] * len(header)
-            for name, pos in index.items():
-                src = sheet_index.get(name)
-                if src is not None and src < len(row):
-                    kept[pos] = _cell(row[src])
-            if any(kept):
-                merged.append(kept)
+    for row in programs:
+        blog_id = str(row[id_col]).strip()
+        address = str(row[addr_col]).strip().rstrip("/").lower()
+        if blog_id and blog_id in seen_ids:
+            continue
+        if address and address in seen_addr:
+            continue
+        merged.append(row)
+        if blog_id:
+            seen_ids.add(blog_id)
+        if address:
+            seen_addr.add(address)
     return merged
 
 
@@ -864,7 +892,29 @@ def _self_check() -> None:
         new_ids={"77"},
     )
     assert added is not None
-    assert any(row[HEADERS.index("블로그ID")] == "77" for row in added[1:])
+    assert added[1][HEADERS.index("블로그ID")] == "10"
+    assert added[-1][HEADERS.index("블로그ID")] == "77"
+    other = program_row({
+        "id": "b1",
+        "title": "현재계정",
+        "google_email": "b@gmail.com",
+        "address": "https://b.blogspot.com/",
+        "index_status": "미색인",
+    })
+    previous = program_row({
+        "id": "a1",
+        "title": "이전계정",
+        "google_email": "a@gmail.com",
+        "address": "https://a2.blogspot.com/",
+    })
+    mixed = [HEADERS, previous, program_row({"id": "b1", "title": "현재계정", "google_email": "b@gmail.com", "address": "https://b.blogspot.com/"})]
+    kept_order = merge_rows([other], mixed)
+    assert [row[HEADERS.index("블로그ID")] for row in kept_order[1:]] == ["a1", "b1"]
+    assert kept_order[1][HEADERS.index("블로그제목")] == "이전계정"
+    assert kept_order[2][HEADERS.index("색인상태")] == "미색인"
+    planned_order = plan_sheet_update([other], mixed)
+    assert planned_order is not None
+    assert [row[HEADERS.index("블로그ID")] for row in planned_order[1:]] == ["a1", "b1"]
     removed = plan_sheet_update([], live, drop_ids={"10"})
     assert removed is not None and len(removed) == 1
     print("ok", len(merged))
