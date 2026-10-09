@@ -349,6 +349,29 @@ def posts_for_address(posts, address: str = "") -> list[dict]:
     return out
 
 
+def compact_blog_host(value: str) -> str:
+    host = re.sub(r"^https?://", "", (value or "").strip(), flags=re.I)
+    host = host.split("/")[0].split("?")[0].strip().strip(".")
+    if host.lower().startswith("www."):
+        host = host[4:]
+    return host.lower()
+
+
+def same_blog_host(left: str, right: str) -> bool:
+    a, b = compact_blog_host(left), compact_blog_host(right)
+    return bool(a) and a == b
+
+
+def live_blog_address(value: str) -> str:
+    blogspot = normalize_blog_address(value)
+    if blogspot:
+        return blogspot
+    host = compact_blog_host(value)
+    if host and "." in host:
+        return host
+    return ""
+
+
 def normalize_blog_address(value: str) -> str:
     host = re.sub(r"^https?://", "", (value or "").strip(), flags=re.I).rstrip("/")
     host = re.sub(r"/.*$", "", host)
@@ -2152,7 +2175,24 @@ class BloggerSession:
                 self.log(f"블로그 주소 읽기 실패 ({blog.name}): {exc}")
         self.fetch_published_post_urls(force=force)
 
-    def refresh_blog_details(self, should_abort=None) -> SessionState:
+    def _adopt_address(self, blog, address: str, silent: bool = False) -> bool:
+        address = live_blog_address(address) or (address or "").strip()
+        if not address:
+            return False
+        prev = (blog.address or "").strip()
+        if not prev:
+            blog.address = address
+            if not silent:
+                self.log(f"블로그 주소 인식: {blog.name} → {address}")
+            return True
+        if same_blog_host(prev, address):
+            return False
+        blog.address = address
+        if not silent:
+            self.log(f"블로그 주소 변경: {blog.name} → {address}")
+        return True
+
+    def refresh_blog_details(self, should_abort=None, refresh_address: bool = False) -> SessionState:
         self.detect()
         if should_abort and should_abort():
             return self.state
@@ -2165,16 +2205,17 @@ class BloggerSession:
                 self.log("다른 작업이 시작되어 상세 인식을 멈춥니다.")
                 return self.state
             self.control.checkpoint()
-            if (blog.address or "").strip() and (blog.posts or getattr(blog, "posts_live", False)):
+            have_addr = bool((blog.address or "").strip())
+            have_posts = bool(blog.posts or getattr(blog, "posts_live", False))
+            if have_addr and have_posts and not refresh_address:
                 continue
             try:
                 address, posts = self._read_blog_feed(blog.id)
             except Exception as exc:
                 self.log(f"피드 인식 실패 ({blog.name}): {exc}")
                 continue
-            if address and not (blog.address or "").strip():
-                blog.address = address
-                self.log(f"블로그 주소 인식: {blog.name} → {address}")
+            if address:
+                self._adopt_address(blog, address)
             if posts and not getattr(blog, "posts_live", False):
                 blog.posts = posts_for_address(merge_posts(blog.posts, posts), blog.address)
                 self.log(f"글 {len(blog.posts)}개 인식: {blog.name}")
@@ -2246,7 +2287,7 @@ class BloggerSession:
             if not _BLOG_ID_RE.match(blog_id) or blog_id in gone:
                 continue
             blog = known.get(blog_id)
-            address = normalize_blog_address(str(item.get("address") or ""))
+            address = live_blog_address(str(item.get("address") or ""))
             name = str(item.get("name") or "").strip()
             if blog is None:
                 # 화면 목록에 없는 블로그는 피드로 되살리지 않는다. 삭제·휴지통 블로그가 다시 붙는 것을 막는다.
@@ -2259,7 +2300,7 @@ class BloggerSession:
             if name and not blog.name:
                 blog.name = name
             if address:
-                blog.address = address
+                self._adopt_address(blog, address, silent=True)
         if gone:
             self.state.blogs = [blog for blog in self.state.blogs if blog.id not in gone]
 
@@ -3402,10 +3443,9 @@ class BloggerSession:
             self.set_google_description(description)
             self._mark_done(blog_id, "description")
         self._report(3, total, "검색 설명")
-        self.enable_search_description()
-        if description:
-            self.set_search_description(description)
-            self._mark_done(blog_id, "search_desc")
+        if self._try_setting_step("검색 설명 사용 설정", self.enable_search_description):
+            if description and self._try_setting_step("검색 설명", lambda: self.set_search_description(description)):
+                self._mark_done(blog_id, "search_desc")
         self._report(4, total, "파비콘")
         if favicon_path:
             self.set_favicon(favicon_path)
@@ -3461,11 +3501,24 @@ class BloggerSession:
         raise last_exc
 
     def set_search_description(self, text: str) -> None:
-        self._wait_setting_unlocked("mM3Kjc")
-        self._close_open_dialogs()
-        self._click_setting_row("mM3Kjc", "검색 설명")
-        self._fill_visible_dialog(text, title_hint="검색 설명")
-        self.log(f"검색 설명을 입력했습니다: {text}")
+        last_exc = None
+        for attempt in range(3):
+            try:
+                self._close_open_dialogs()
+                self._wait_setting_row_ready("mM3Kjc", "검색 설명", timeout=12)
+                self._click_setting_row("mM3Kjc", "검색 설명")
+                self._fill_visible_dialog(text, title_hint=("검색 설명", "Search description"))
+                self.log("검색 설명을 입력했습니다.")
+                return
+            except Exception as exc:
+                last_exc = exc
+                self.log(f"검색 설명 창을 다시 엽니다 ({attempt + 1}/3)")
+                try:
+                    self._close_open_dialogs()
+                except Exception:
+                    pass
+                self._tick(0.4)
+        raise last_exc
 
     def set_favicon(self, image_path: str) -> None:
         path = os.path.abspath(image_path)
@@ -3573,7 +3626,30 @@ class BloggerSession:
         self.log("시간대를 서울로 변경하고 저장했습니다.")
 
     def enable_search_description(self) -> None:
-        self._enable_aria_checkbox("검색 설명 사용 설정")
+        last_exc = None
+        for attempt in range(3):
+            try:
+                self._close_open_dialogs()
+                box = self._wait_setting_toggle(
+                    ("검색 설명 사용 설정", "Enable search description", "Use search description"),
+                    timeout=14,
+                )
+                self._set_toggle(
+                    box,
+                    True,
+                    labels=("검색 설명 사용 설정", "Enable search description", "Use search description"),
+                )
+                self.log("검색 설명 사용 설정을 켰습니다.")
+                return
+            except Exception as exc:
+                last_exc = exc
+                self.log(f"검색 설명 사용 설정을 다시 찾습니다 ({attempt + 1}/3)")
+                try:
+                    self._close_open_dialogs()
+                except Exception:
+                    pass
+                self._tick(0.4)
+        raise last_exc
 
     def apply_robots_settings(self, address: str) -> None:
         self._enable_aria_checkbox("맞춤 robots.txt 사용 설정")
@@ -3652,36 +3728,114 @@ class BloggerSession:
     def _set_aria_checkbox(self, aria_label: str, on: bool, scope=None) -> None:
         if scope is None:
             self._close_open_dialogs()
+            box = self._wait_setting_toggle((aria_label,), timeout=14)
+            self._set_toggle(box, on, labels=(aria_label,))
+            return
         selector = f'[aria-label="{aria_label}"][role="checkbox"]'
-        root = scope if scope is not None else self.driver
+        root = scope
         box = self._wait(10).until(
             lambda d: _displayed(root.find_elements(By.CSS_SELECTOR, selector))
         )
-        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", box)
-        self._tick()
-        checked = (box.get_attribute("aria-checked") or "").lower() == "true"
-        if checked == on:
-            return
-        try:
-            box.click()
-        except Exception:
-            self.driver.execute_script("arguments[0].click();", box)
-        expect = "true" if on else "false"
-        self._wait(6).until(
-            lambda d: (
-                (_displayed(root.find_elements(By.CSS_SELECTOR, selector))
-                 or box).get_attribute("aria-checked")
-                or ""
-            ).lower()
-            == expect
-        )
+        self._set_toggle(box, on, selector=selector, root=root)
 
     def _enable_aria_checkbox(self, aria_label: str, scope=None) -> None:
         self._set_aria_checkbox(aria_label, True, scope=scope)
         self.log(f"{aria_label}을(를) 켰습니다.")
 
+    def _setting_label_aliases(self, label: str) -> tuple[str, ...]:
+        aliases = {
+            "검색 설명": ("검색 설명", "Search description"),
+            "검색 설명 사용 설정": ("검색 설명 사용 설정", "Enable search description", "Use search description"),
+            "설명": ("설명", "Description"),
+        }
+        return aliases.get(label, (label,))
+
+    def _scroll_settings_for(self, hint: str) -> None:
+        try:
+            self.driver.execute_script(
+                """
+                const hint = String(arguments[0] || "").replace(/\\s+/g, "").toLowerCase();
+                const norm = (s) => String(s || "").replace(/\\s+/g, "").toLowerCase();
+                const hit = [...document.querySelectorAll('[role="checkbox"], [role="switch"], .EDnCLe, [jscontroller]')]
+                  .find((el) => {
+                    const t = norm(el.getAttribute("aria-label") || el.textContent);
+                    return hint && t.includes(hint.slice(0, Math.min(hint.length, 6)));
+                  });
+                let scroller = document.scrollingElement || document.documentElement;
+                for (const el of document.querySelectorAll("div, [role='main']")) {
+                  const st = getComputedStyle(el);
+                  if ((st.overflowY === "auto" || st.overflowY === "scroll") && el.scrollHeight > el.clientHeight + 40) {
+                    scroller = el;
+                    break;
+                  }
+                }
+                if (hit) {
+                  hit.scrollIntoView({block: "center"});
+                  return;
+                }
+                const bottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 8;
+                if (bottom) scroller.scrollTop = 0;
+                else scroller.scrollBy(0, Math.max(280, (scroller.clientHeight || 400) * 0.65));
+                """,
+                hint,
+            )
+        except Exception:
+            pass
+
+    def _find_setting_toggle(self, labels) -> object | None:
+        names = [str(item) for item in (labels or ()) if str(item).strip()]
+        if not names:
+            return None
+        return self.driver.execute_script(
+            """
+            const labels = arguments[0].map((s) => String(s || "").replace(/\\s+/g, "").toLowerCase()).filter(Boolean);
+            const norm = (s) => String(s || "").replace(/\\s+/g, "").toLowerCase();
+            const nodes = [...document.querySelectorAll('[role="checkbox"], [role="switch"]')];
+            return nodes.find((el) => {
+              const aria = norm(el.getAttribute("aria-label"));
+              return labels.some((label) => aria === label || aria.includes(label));
+            }) || null;
+            """,
+            names,
+        )
+
+    def _wait_setting_toggle(self, labels, timeout: float = 14):
+        hint = str((labels or ("설정",))[0])
+        def found(_driver):
+            self._scroll_settings_for(hint)
+            return self._find_setting_toggle(labels)
+
+        return self._wait(timeout).until(found)
+
+    def _set_toggle(self, box, on: bool, selector: str = "", root=None, labels=None) -> None:
+        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", box)
+        self._tick(0.15)
+        current = (box.get_attribute("aria-checked") or "").lower() == "true"
+        if current == on:
+            return
+        try:
+            self._click_jsaction(box)
+        except Exception:
+            try:
+                box.click()
+            except Exception:
+                self.driver.execute_script("arguments[0].click();", box)
+        expect = "true" if on else "false"
+
+        def checked(_driver):
+            el = box
+            if selector:
+                scope = root if root is not None else self.driver
+                el = _displayed(scope.find_elements(By.CSS_SELECTOR, selector)) or box
+            elif labels:
+                el = self._find_setting_toggle(labels) or box
+            return (el.get_attribute("aria-checked") or "").lower() == expect
+
+        self._wait(6).until(checked)
+
     def _wait_setting_unlocked(self, controller: str, timeout: float = 10) -> None:
         def unlocked(driver):
+            self._scroll_settings_for(controller)
             els = driver.find_elements(By.CSS_SELECTOR, f'[jscontroller="{controller}"]')
             if not els:
                 return False
@@ -3692,6 +3846,7 @@ class BloggerSession:
 
     def _wait_setting_row_ready(self, controller: str, label: str, timeout: float = 10) -> None:
         def ready(_driver):
+            self._scroll_settings_for(label)
             el = self._find_setting_row(controller, label)
             if el is None:
                 return False
@@ -3710,14 +3865,15 @@ class BloggerSession:
             return el
         return self.driver.execute_script(
             """
-            const label = arguments[0];
+            const labels = arguments[0].map((s) => String(s || "").replace(/\\s+/g, "").toLowerCase());
             const rows = [...document.querySelectorAll('.cI5zJb')];
             return rows.find((row) => {
               const first = row.querySelector('.EDnCLe');
-              return first && first.textContent.trim() === label;
+              const text = String((first && first.textContent) || "").replace(/\\s+/g, "").toLowerCase();
+              return text && labels.some((label) => text === label || text.includes(label));
             }) || null;
             """,
-            label,
+            list(self._setting_label_aliases(label)),
         )
 
     def _click_setting_row(self, controller: str, label: str) -> None:
@@ -3756,8 +3912,11 @@ class BloggerSession:
                 try:
                     if not dialog.is_displayed() or self._is_page_chrome_dialog(dialog):
                         continue
-                    if title_hint and title_hint not in (dialog.text or ""):
-                        continue
+                    if title_hint:
+                        hints = title_hint if isinstance(title_hint, (list, tuple)) else (title_hint,)
+                        text = dialog.text or ""
+                        if not any(str(hint) in text for hint in hints if str(hint).strip()):
+                            continue
                     return dialog
                 except Exception:
                     continue

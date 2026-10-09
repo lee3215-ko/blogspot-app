@@ -1,4 +1,6 @@
 """블로그스팟 글 작성 프로그램 실행 진입점."""
+import tkinter as tk
+
 from paths import APP_NAME, APP_VERSION, get_icon_path, get_update_version_url, init_runtime_paths
 
 init_runtime_paths()
@@ -18,12 +20,15 @@ from app import BloggerApp
 
 try:
     import customtkinter as ctk
+
+    ctk.set_appearance_mode("light")
 except ImportError:
     ctk = None
 
 
 if __name__ == "__main__":
-    root = ctk.CTk() if ctk else __import__("tkinter").Tk()
+    root = tk.Tk()
+    root.configure(bg="#e8eef6")
     icon = get_icon_path()
     if icon:
         try:

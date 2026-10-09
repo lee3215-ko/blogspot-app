@@ -67,98 +67,233 @@ BUTTON_STYLES = {
 }
 
 
+RESIZE_FROZEN = False
+
+
+def set_resize_frozen(value: bool) -> None:
+    global RESIZE_FROZEN
+    RESIZE_FROZEN = bool(value)
+
+
 def frame(parent, bg=None, **kwargs):
     bg = bg or COLORS["bg"]
-    if ctk:
-        return ctk.CTkFrame(parent, fg_color=bg, corner_radius=0, **kwargs)
-    return tk.Frame(parent, bg=bg)
+    kwargs.pop("fg_color", None)
+    kwargs.pop("corner_radius", None)
+    return tk.Frame(parent, bg=bg, **kwargs)
 
 
 class ScrollFrame(tk.Frame):
     """스크롤 영역. 자식은 `.inner`에 넣는다.
 
-    휠 이벤트는 위젯마다 받지 않고 `install_wheel_dispatch`가 창 전체에서 한 번만 받아
-    마우스 아래의 ScrollFrame으로 넘긴다. 그래서 목록을 아무리 다시 만들어도 핸들러가 쌓이지 않는다.
+    창 크기가 바뀌는 동안에는 안쪽 너비를 바로 맞추지 않는다.
+    손 뗀 뒤에 한 번만 재서 맞추면, 줄마다 Configure가 이어지지 않는다.
     """
 
     def __init__(self, parent, height: int = 200, bg=None, orientation: str = "vertical"):
         bg = bg or COLORS["card"]
-        super().__init__(parent, bg=bg)
+        super().__init__(parent, bg=bg, height=height)
         self.orientation = orientation
-        self.canvas = tk.Canvas(
-            self, bg=bg, highlightthickness=0, borderwidth=0, height=height,
-            yscrollincrement=30, xscrollincrement=30,
-        )
-        self.inner = tk.Frame(self.canvas, bg=bg)
-        self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self._offset = 0.0
+        self._applying = False
+        self._content = 1
+        self._view = 1
+        self._span = 1
+        self._resize_after = None
+        self._measure_after = None
+        self._span_ready = False
+        self._host = tk.Frame(self, bg=bg, highlightthickness=0, bd=0)
         if orientation == "horizontal":
-            self.bar = tk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
-            self.canvas.configure(xscrollcommand=self.bar.set)
-            self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+            self.bar = tk.Scrollbar(self, orient="horizontal", command=self._on_bar)
+            self._host.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
             self.bar.pack(side=tk.BOTTOM, fill=tk.X)
         else:
-            self.bar = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-            self.canvas.configure(yscrollcommand=self.bar.set)
-            self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            self.bar = tk.Scrollbar(self, orient="vertical", command=self._on_bar)
+            self._host.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             self.bar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.inner.bind("<Configure>", self._on_inner_resize)
-        self.canvas.bind("<Configure>", self._on_canvas_resize)
-        # 휠 디스패처가 위로 올라오며 찾는 표식
+        self.inner = tk.Frame(self._host, bg=bg)
+        self.inner.place(x=0, y=0)
+        try:
+            self.pack_propagate(False)
+        except Exception:
+            pass
+        try:
+            self._host.pack_propagate(False)
+        except Exception:
+            pass
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self._host.bind("<Configure>", self._on_host_configure)
         self._scroll_target = self
-        self.canvas._scroll_target = self
+        self._host._scroll_target = self
         self.inner._scroll_target = self
+        self.after(1, self._commit_span)
 
-    def _on_inner_resize(self, _event=None) -> None:
-        bbox = self.canvas.bbox("all")
-        if bbox:
-            self.canvas.configure(scrollregion=bbox)
+    def _cancel_after(self, name: str) -> None:
+        job = getattr(self, name, None)
+        if job is None:
+            return
+        setattr(self, name, None)
+        try:
+            self.after_cancel(job)
+        except Exception:
+            pass
 
-    def _on_canvas_resize(self, event) -> None:
+    def _measure_content(self) -> int:
+        try:
+            if self.orientation == "horizontal":
+                value = max(1, int(self.inner.winfo_reqwidth() or 1))
+            else:
+                value = max(1, int(self.inner.winfo_reqheight() or 1))
+        except tk.TclError:
+            value = self._content
+        self._content = value
+        return value
+
+    def _place_offset(self) -> None:
+        try:
+            if self.orientation == "horizontal":
+                self.inner.place_configure(x=int(-self._offset))
+            else:
+                self.inner.place_configure(y=int(-self._offset))
+        except tk.TclError:
+            pass
+
+    def _sync_bar(self) -> None:
+        content = max(1, int(self._content))
+        view = max(1, int(self._view))
+        try:
+            if content <= view:
+                self.bar.set(0, 1)
+            else:
+                self.bar.set(self._offset / content, (self._offset + view) / content)
+        except tk.TclError:
+            pass
+
+    def _apply_offset(self) -> None:
+        if self._applying:
+            return
+        self._applying = True
+        try:
+            content = max(1, int(self._content))
+            view = max(1, int(self._view))
+            max_off = max(0, content - view)
+            self._offset = min(max(0.0, float(self._offset)), float(max_off))
+            self._place_offset()
+            self._sync_bar()
+        finally:
+            self._applying = False
+
+    def _commit_span(self) -> None:
+        self._resize_after = None
+        try:
+            if self.orientation == "horizontal":
+                span = max(1, int(self._host.winfo_height() or 1))
+                view = max(1, int(self._host.winfo_width() or 1))
+                self.inner.place_configure(height=span)
+            else:
+                span = max(1, int(self._host.winfo_width() or 1))
+                view = max(1, int(self._host.winfo_height() or 1))
+                self.inner.place_configure(width=span)
+        except tk.TclError:
+            return
+        self._span = span
+        self._view = view
+        self._span_ready = True
+        self._measure_content()
+        self._apply_offset()
+
+    def _on_host_configure(self, event=None) -> None:
+        if RESIZE_FROZEN:
+            return
+        try:
+            if not self.winfo_ismapped():
+                return
+        except tk.TclError:
+            return
         if self.orientation == "horizontal":
-            self.canvas.itemconfigure(self._window, height=max(1, event.height))
+            view = max(1, int(getattr(event, "width", 0) or self._host.winfo_width() or 1))
+            span = max(1, int(getattr(event, "height", 0) or self._host.winfo_height() or 1))
         else:
-            self.canvas.itemconfigure(self._window, width=max(1, event.width))
+            view = max(1, int(getattr(event, "height", 0) or self._host.winfo_height() or 1))
+            span = max(1, int(getattr(event, "width", 0) or self._host.winfo_width() or 1))
+        self._view = view
+        max_off = max(0, self._content - view)
+        if self._offset > max_off:
+            self._offset = float(max_off)
+            self._place_offset()
+        self._sync_bar()
+        if not self._span_ready:
+            self._commit_span()
+            return
+        if span == self._span:
+            return
+        self._cancel_after("_resize_after")
+        try:
+            self._resize_after = self.after(80, self._commit_span)
+        except Exception:
+            self._commit_span()
+
+    def _on_inner_configure(self, _event=None) -> None:
+        if RESIZE_FROZEN:
+            return
+        if self._measure_after is not None:
+            return
+        try:
+            self._measure_after = self.after_idle(self._measure_from_idle)
+        except Exception:
+            self._measure_from_idle()
+
+    def _measure_from_idle(self) -> None:
+        self._measure_after = None
+        self._measure_content()
+        self._apply_offset()
+
+    def _on_bar(self, *args) -> None:
+        if not args:
+            return
+        content = max(1, int(self._content))
+        view = max(1, int(self._view))
+        if args[0] == "moveto":
+            try:
+                self._offset = float(args[1]) * content
+            except (TypeError, ValueError):
+                return
+        elif args[0] == "scroll":
+            try:
+                amount = int(float(args[1]))
+            except (TypeError, ValueError):
+                return
+            unit = args[2] if len(args) > 2 else "units"
+            self._offset += amount * (30 if unit == "units" else view)
+        else:
+            return
+        self._apply_offset()
 
     def scroll(self, units: int, horizontal: bool = False) -> None:
         if not units:
             return
-        try:
-            if horizontal or self.orientation == "horizontal":
-                self.canvas.xview_scroll(units * 3, "units")
-            else:
-                self.canvas.yview_scroll(units * 3, "units")
-        except tk.TclError:
-            pass
+        self._offset += units * 90
+        self._apply_offset()
 
     def scroll_to_end(self) -> None:
-        try:
-            if self.orientation == "horizontal":
-                self.canvas.xview_moveto(1.0)
-            else:
-                self.canvas.yview_moveto(1.0)
-        except tk.TclError:
-            pass
+        self._measure_content()
+        self._offset = float(self._content)
+        self._apply_offset()
 
     def scroll_to_widget(self, widget) -> None:
         if widget is None:
             return
         try:
             self.update_idletasks()
-            bbox = self.canvas.bbox("all")
-            if bbox:
-                self.canvas.configure(scrollregion=bbox)
-            else:
-                bbox = (0, 0, 0, max(1, int(self.inner.winfo_reqheight() or 1)))
-            scroll_h = max(1, int(bbox[3] - bbox[1]))
-            view_h = max(1, int(self.canvas.winfo_height()))
-            if scroll_h <= view_h:
-                self.canvas.yview_moveto(0)
+            self._measure_content()
+            view = max(1, int(self._view))
+            if self._content <= view:
+                self._offset = 0
+                self._apply_offset()
                 return
             top = int(widget.winfo_rooty()) - int(self.inner.winfo_rooty())
             row_h = max(1, int(widget.winfo_height()))
-            y = top + (row_h / 2) - (view_h / 2)
-            y = max(0.0, min(float(scroll_h - view_h), y))
-            self.canvas.yview_moveto(y / float(scroll_h))
+            self._offset = top + (row_h / 2) - (view / 2)
+            self._apply_offset()
         except Exception:
             pass
 
@@ -237,14 +372,6 @@ def scrollable(parent, height: int, bg=None, orientation: str = "vertical"):
 
 
 def card(parent):
-    if ctk:
-        return ctk.CTkFrame(
-            parent,
-            fg_color=COLORS["card"],
-            corner_radius=14,
-            border_width=1,
-            border_color=COLORS["card_border"],
-        )
     return tk.Frame(
         parent,
         bg=COLORS["card"],
@@ -262,12 +389,79 @@ def _parent_bg(parent):
         return COLORS["card"]
 
 
+def text_entry(parent, textvariable=None, **kwargs):
+    """창 너비를 따라가는 입력칸. CTkEntry 캔버스는 리사이즈마다 다시 그린다."""
+    kwargs.pop("height", None)
+    kwargs.pop("fg_color", None)
+    kwargs.pop("border_color", None)
+    kwargs.pop("text_color", None)
+    kwargs.pop("placeholder_text", None)
+    kwargs.pop("corner_radius", None)
+    font = kwargs.pop("font", FONTS["body"])
+    return tk.Entry(
+        parent,
+        textvariable=textvariable,
+        font=font,
+        bg=COLORS["input_bg"],
+        fg=COLORS["text"],
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground=COLORS["border"],
+        highlightcolor=COLORS["accent"],
+        insertbackground=COLORS["text"],
+        **kwargs,
+    )
+
+
+def install_ctk_resize_guard() -> None:
+    """CTk 위젯은 크기가 1px만 바뀌어도 캔버스를 다시 그린다. 손 뗀 뒤에 한 번만 그린다."""
+    if ctk is None:
+        return
+    try:
+        from customtkinter.windows.widgets.core_widget_classes.ctk_base_class import CTkBaseClass
+    except Exception:
+        return
+
+    def _flush(self) -> None:
+        self._blogspot_draw_job = None
+        try:
+            if self.winfo_exists():
+                self._draw(no_color_updates=True)
+        except Exception:
+            pass
+
+    def _update_dimensions_event(self, event) -> None:
+        new_w = self._reverse_widget_scaling(event.width)
+        new_h = self._reverse_widget_scaling(event.height)
+        if round(self._current_width) == round(new_w) and round(self._current_height) == round(new_h):
+            return
+        self._current_width = new_w
+        self._current_height = new_h
+        job = getattr(self, "_blogspot_draw_job", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+        try:
+            self._blogspot_draw_job = self.after(80, self._blogspot_flush_draw)
+        except Exception:
+            try:
+                self._draw(no_color_updates=True)
+            except Exception:
+                pass
+
+    CTkBaseClass._blogspot_flush_draw = _flush
+    CTkBaseClass._update_dimensions_event = _update_dimensions_event
+
+
+install_ctk_resize_guard()
+
+
 def label(parent, text, font_key="body", color=None, **kwargs):
     color = color or COLORS["text"]
-    if ctk:
-        return ctk.CTkLabel(
-            parent, text=text, font=FONTS[font_key], text_color=color, **kwargs
-        )
+    kwargs.pop("text_color", None)
+    kwargs.pop("fg_color", None)
     return tk.Label(
         parent,
         text=text,
@@ -333,34 +527,9 @@ def flat_button(parent, text, variant="ghost", command=None, font_key="small_bol
 
 
 def pill(parent, text, tone="off", **kwargs):
-    tones = {
-        "ok": (COLORS["success"], COLORS["ok_bg"]),
-        "wait": ("#b45309", COLORS["wait_bg"]),
-        "off": (COLORS["text_muted"], COLORS["chip_bg"]),
-        "info": (COLORS["accent"], COLORS["accent_light"]),
-    }
-    fg, bg = tones.get(tone, tones["off"])
-    if ctk:
-        return ctk.CTkLabel(
-            parent,
-            text=text,
-            font=FONTS["small"],
-            text_color=fg,
-            fg_color=bg,
-            corner_radius=8,
-            height=24,
-            **kwargs,
-        )
-    return tk.Label(
-        parent,
-        text=text,
-        font=FONTS["small"],
-        fg=fg,
-        bg=bg,
-        padx=8,
-        pady=3,
-        **kwargs,
-    )
+    kwargs.setdefault("padx", 8)
+    kwargs.setdefault("pady", 3)
+    return tk_pill(parent, text, tone, **kwargs)
 
 
 class HoverPopup:
@@ -455,29 +624,114 @@ class HoverPopup:
         self._win = win
 
 
+class LightButton(tk.Frame):
+    """픽셀 크기의 버튼. 캔버스가 없어서 창 크기 조절 때 다시 그리지 않는다."""
+
+    def __init__(self, parent, text, variant="primary", width=120, height=40, command=None):
+        fg, hover, tc = BUTTON_STYLES.get(variant, BUTTON_STYLES["primary"])
+        self._pixel_width = int(width or 120)
+        self._pixel_height = int(height or 40)
+        super().__init__(
+            parent,
+            bg=fg,
+            width=self._pixel_width,
+            height=self._pixel_height,
+            highlightthickness=0,
+            bd=0,
+        )
+        try:
+            self.pack_propagate(False)
+        except Exception:
+            pass
+        self._command = command
+        self._fg = fg
+        self._hover = hover
+        self._tc = tc
+        self._state = "normal"
+        self._inside = False
+        self._label = tk.Label(
+            self,
+            text=text,
+            bg=fg,
+            fg=tc,
+            font=FONTS["body_bold"],
+            cursor="hand2",
+        )
+        self._label.pack(fill=tk.BOTH, expand=True)
+        for widget in (self, self._label):
+            widget.bind("<Enter>", self._on_enter)
+            widget.bind("<Leave>", self._on_leave)
+            widget.bind("<Button-1>", self._on_click)
+
+    def cget(self, key):
+        if key == "width":
+            return self._pixel_width
+        if key == "height":
+            return self._pixel_height
+        if key == "text":
+            return self._label.cget("text")
+        if key == "state":
+            return self._state
+        return tk.Frame.cget(self, key)
+
+    def configure(self, **kwargs):
+        if "text" in kwargs:
+            self._label.configure(text=kwargs.pop("text"))
+        if "state" in kwargs:
+            self._state = str(kwargs.pop("state") or "normal")
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if "width" in kwargs:
+            self._pixel_width = int(kwargs.pop("width"))
+            tk.Frame.configure(self, width=self._pixel_width)
+        if "height" in kwargs:
+            self._pixel_height = int(kwargs.pop("height"))
+            tk.Frame.configure(self, height=self._pixel_height)
+        if "fg_color" in kwargs:
+            self._fg = kwargs.pop("fg_color")
+        elif "bg" in kwargs:
+            self._fg = kwargs.pop("bg")
+        if "hover_color" in kwargs:
+            self._hover = kwargs.pop("hover_color")
+        if "text_color" in kwargs:
+            self._tc = kwargs.pop("text_color")
+        elif "fg" in kwargs:
+            self._tc = kwargs.pop("fg")
+        kwargs.pop("font", None)
+        kwargs.pop("corner_radius", None)
+        kwargs.pop("border_width", None)
+        kwargs.pop("border_color", None)
+        if kwargs:
+            tk.Frame.configure(self, **kwargs)
+        self._paint()
+
+    config = configure
+
+    def _paint(self) -> None:
+        disabled = self._state == "disabled"
+        if disabled:
+            bg, fg, cursor = "#cbd5e1", "#64748b", "arrow"
+        elif self._inside:
+            bg, fg, cursor = self._hover, self._tc, "hand2"
+        else:
+            bg, fg, cursor = self._fg, self._tc, "hand2"
+        tk.Frame.configure(self, bg=bg)
+        self._label.configure(bg=bg, fg=fg, cursor=cursor)
+
+    def _on_enter(self, _event=None):
+        self._inside = True
+        self._paint()
+
+    def _on_leave(self, _event=None):
+        self._inside = False
+        self._paint()
+
+    def _on_click(self, _event=None):
+        if self._state == "disabled" or self._command is None:
+            return "break"
+        self._command()
+        return "break"
+
+
 def button(parent, text, variant="primary", width=None, height=40, command=None):
-    fg, hover, tc = BUTTON_STYLES.get(variant, BUTTON_STYLES["primary"])
-    if ctk:
-        kw = {
-            "text": text,
-            "height": height,
-            "font": FONTS["body_bold"],
-            "fg_color": fg,
-            "hover_color": hover,
-            "text_color": tc,
-            "corner_radius": 10,
-            "command": command,
-        }
-        if width:
-            kw["width"] = width
-        return ctk.CTkButton(parent, **kw)
-    return tk.Button(
-        parent,
-        text=text,
-        bg=fg,
-        fg=tc,
-        activebackground=hover,
-        font=FONTS["body_bold"],
-        relief=tk.FLAT,
-        command=command,
-    )
+    return LightButton(parent, text, variant=variant, width=width or 120, height=height or 40, command=command)

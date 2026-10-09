@@ -1,13 +1,10 @@
 {
-    "version":  "1.2.16",
-    "url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/615080440",
-    "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.16/BloggerSpot.zip",
-    "notes":  "작업 기록 목록 연동과 주소 복사, 삭제된 블로그 기록 숨김, 글 작성 이미지 순서, 노출 선택과 실행 로그, 없는 글 표시 수정",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/615080440",
-    "asset_id":  615080440,
+    "version":  "1.2.17",
+    "url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.17/BloggerSpot.zip",
+    "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.17/BloggerSpot.zip",
+    "notes":  "블로그 로그(날짜별 접기·요약), 설정 적용 검색설명 재탐색, 생성·설정·최초코드 등 작업 기록",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/615080440",
-                          "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.16/BloggerSpot.zip",
+                          "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.17/BloggerSpot.zip",
                           "https://github.com/lee3215-ko/blogspot-app/releases/latest/download/BloggerSpot.zip"
                       ]
 }
