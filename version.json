@@ -1,13 +1,10 @@
 {
-    "version":  "1.2.17",
-    "url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/624328825",
-    "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.17/BloggerSpot.zip",
-    "notes":  "블로그 로그(날짜별 접기·요약), 설정 적용 검색설명 재탐색, 생성·설정·최초코드 등 작업 기록",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/624328825",
-    "asset_id":  624328825,
+    "version":  "1.2.18",
+    "url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.18/BloggerSpot.zip",
+    "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.18/BloggerSpot.zip",
+    "notes":  "크롬 버전에 맞는 ChromeDriver를 다시 받아 연결 실패를 고침",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/624328825",
-                          "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.17/BloggerSpot.zip",
+                          "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.18/BloggerSpot.zip",
                           "https://github.com/lee3215-ko/blogspot-app/releases/latest/download/BloggerSpot.zip"
                       ]
 }

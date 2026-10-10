@@ -596,7 +596,45 @@ class RunControl:
             raise StopRequested("중지되었습니다.")
 
 
-def _find_cached_chromedriver() -> str:
+def _run_hidden(cmd: list[str]) -> str:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        return subprocess.check_output(
+            cmd, timeout=8, stderr=subprocess.STDOUT, creationflags=flags
+        ).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _chrome_major_version() -> int:
+    chrome = _find_chrome()
+    if not chrome:
+        return 0
+    folder = os.path.dirname(chrome)
+    majors: list[int] = []
+    try:
+        for name in os.listdir(folder):
+            if re.match(r"^\d+\.\d+", name) and os.path.isdir(os.path.join(folder, name)):
+                try:
+                    majors.append(int(name.split(".")[0]))
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    if majors:
+        return max(majors)
+    match = re.search(r"\b(\d+)\.\d+\.\d+", _run_hidden([chrome, "--version"]))
+    return int(match.group(1)) if match else 0
+
+
+def _chromedriver_major_version(path: str) -> int:
+    if not path or not os.path.isfile(path):
+        return 0
+    match = re.search(r"ChromeDriver\s+(\d+)", _run_hidden([path, "--version"]), re.I)
+    return int(match.group(1)) if match else 0
+
+
+def _find_cached_chromedriver(need_major: int = 0) -> str:
     roots = [
         os.path.join(os.path.expanduser("~"), ".wdm", "drivers", "chromedriver"),
         os.path.join(get_data_dir(), "chromedriver"),
@@ -610,18 +648,25 @@ def _find_cached_chromedriver() -> str:
                 found.append(os.path.join(dirpath, "chromedriver.exe"))
     if not found:
         return ""
+    if need_major:
+        found = [path for path in found if _chromedriver_major_version(path) == need_major]
+        if not found:
+            return ""
     found.sort(key=lambda path: (0 if os.path.basename(os.path.dirname(path)) != "chromedriver-win64" else 1, -os.path.getmtime(path)))
     return found[0]
 
 
 def _chrome_driver_service() -> Service:
-    cached = _find_cached_chromedriver()
+    need = _chrome_major_version()
+    cached = _find_cached_chromedriver(need)
     if cached:
         return Service(cached)
     try:
         path = ChromeDriverManager().install()
         if path and os.path.isfile(path):
-            return Service(path)
+            have = _chromedriver_major_version(path)
+            if not need or not have or have == need:
+                return Service(path)
     except Exception:
         pass
     return Service()
