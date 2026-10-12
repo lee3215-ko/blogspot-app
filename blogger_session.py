@@ -948,6 +948,7 @@ class BloggerSession:
         self._chrome_user_dir: str | None = None
         self._gone_ids: set[str] = set()
         self._page_blog_ids: set[str] = set()
+        self._known_blog_ids: set[str] = set()
 
     def profile_dir(self) -> str:
         path = os.path.join(get_data_dir(), "chrome-blogger-session")
@@ -955,13 +956,14 @@ class BloggerSession:
         return path
 
     def chrome_running(self) -> bool:
-        try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{BLOGGER_DEBUG_PORT}/json/version", timeout=0.15
-            ) as resp:
-                return resp.status == 200
-        except Exception:
-            return False
+        url = f"http://127.0.0.1:{BLOGGER_DEBUG_PORT}/json/version"
+        for _ in range(2):
+            try:
+                with urllib.request.urlopen(url, timeout=0.8) as resp:
+                    return resp.status == 200
+            except Exception:
+                time.sleep(0.05)
+        return False
 
     def is_alive(self) -> bool:
         return self.driver is not None and self.chrome_running()
@@ -1121,7 +1123,9 @@ class BloggerSession:
             time.sleep(0.45)
             state = self.detect(fresh=True)
         if state.logged_in:
-            self.log(f"블로그스팟 계정을 인식했습니다: {state.account or '-'}")
+            self._expand_account_blogs()
+            state = self.state
+            self.log(f"블로그스팟 계정을 인식했습니다: {state.account or '-'} · 블로그 {len(state.blogs)}개")
         else:
             self.state = SessionState(url=state.url, title=state.title)
             state = self.state
@@ -1206,6 +1210,14 @@ class BloggerSession:
         account_changed = bool(
             previous_account and new_account and previous_account.casefold() != new_account.casefold()
         )
+        known = getattr(self, "_known_blog_ids", None)
+        if not isinstance(known, set):
+            known = set()
+        if account_changed:
+            self._known_blog_ids = set(seen)
+        else:
+            known.update(seen)
+            self._known_blog_ids = known
         # 글/설정 페이지는 드롭다운이 닫혀 블로그 1개만 읽힌다. 이미 가진 목록을 그 한 개로 덮지 않는다.
         if previous_list and not account_changed:
             found = {blog.id: blog for blog in blogs}
@@ -1583,7 +1595,15 @@ class BloggerSession:
         posts = self.read_published_posts(blog_id)
         return str(posts[0].get("url") or "") if posts else ""
 
-    def publish_manuscript(self, blog_id: str, title: str, html_body: str, image_path: str) -> str:
+    def publish_manuscript(
+        self,
+        blog_id: str,
+        title: str,
+        html_body: str,
+        image_path: str,
+        search_description: str = "",
+        labels: list[str] | str = "",
+    ) -> str:
         self._tick()
         self.open_blog_posts(blog_id)
         before_posts = self.read_published_posts(blog_id)
@@ -1606,6 +1626,10 @@ class BloggerSession:
         if (html_body or "").strip():
             self._append_post_html(html_body)
         self._set_post_title(title)
+        if labels:
+            self._set_post_labels(labels)
+        if (search_description or "").strip():
+            self._set_post_search_description(search_description.strip())
         self._click_post_publish()
         deadline = time.time() + 25
         refreshed = False
@@ -2032,6 +2056,285 @@ class BloggerSession:
         self._set_text(field, title)
         self.log(f"제목을 넣었습니다: {title}")
 
+    def _fill_google_textarea(self, field, value: str) -> str:
+        try:
+            filled = self.driver.execute_script(
+                """
+                const el = arguments[0];
+                const value = String(arguments[1] || "");
+                const wrap = el.closest(".edhGSc") || el.closest('[jsname="eBlZAd"]')
+                  || el.closest('[jsname="Ufn6O"]') || el.parentElement;
+                try { wrap && wrap.scrollIntoView({block: "center"}); } catch (e) {}
+                try { wrap && wrap.click(); } catch (e) {}
+                el.focus();
+                const proto = el.tagName === "TEXTAREA"
+                  ? window.HTMLTextAreaElement.prototype
+                  : window.HTMLInputElement.prototype;
+                const desc = Object.getOwnPropertyDescriptor(proto, "value");
+                if (desc && desc.set) desc.set.call(el, value);
+                else el.value = value;
+                el.setAttribute("data-initial-value", value);
+                try {
+                  el.dispatchEvent(new InputEvent("input", {
+                    bubbles: true, cancelable: true, inputType: "insertFromPaste", data: value
+                  }));
+                } catch (e) {
+                  el.dispatchEvent(new Event("input", {bubbles: true}));
+                }
+                el.dispatchEvent(new Event("change", {bubbles: true}));
+                el.dispatchEvent(new KeyboardEvent("keyup", {bubbles: true, key: "Process"}));
+                return el.value || "";
+                """,
+                field,
+                value,
+            )
+            return str(filled or "").strip()
+        except Exception:
+            return ""
+
+    def _set_post_labels(self, labels) -> None:
+        if isinstance(labels, str):
+            parts = [item.strip() for item in labels.split(",") if item.strip()]
+        else:
+            parts = [str(item).strip() for item in (labels or []) if str(item).strip()]
+        parts = parts[:4]
+        text = ", ".join(parts)
+        if not text:
+            return
+        for attempt in range(5):
+            try:
+                self._open_post_labels_panel()
+                self._tick(0.25)
+                field = self._find_post_labels_field()
+                if field is None:
+                    continue
+                got = self._fill_google_textarea(field, text)
+                if text[:12] not in got and parts[0][:8] not in got:
+                    self._set_text(field, text)
+                    try:
+                        got = (field.get_attribute("value") or "").strip()
+                    except Exception:
+                        got = ""
+                if text[:12] in got or parts[0][:8] in got:
+                    self.log("글 라벨을 넣었습니다.")
+                    return
+            except Exception as extra:
+                self.log(f"글 라벨 입력 재시도 ({attempt + 1}/5): {_exc_text(exc)}")
+            self._tick(0.35)
+        self.log("글 라벨 칸을 찾지 못해 건너뜁니다.")
+
+    def _find_post_labels_field(self):
+        try:
+            return self.driver.execute_script(
+                """
+                const visit = (root, sink, selector) => {
+                  if (!root || !root.querySelectorAll) return;
+                  sink.push(...root.querySelectorAll(selector));
+                  for (const el of root.querySelectorAll("*")) {
+                    if (el.shadowRoot) visit(el.shadowRoot, sink, selector);
+                  }
+                };
+                const all = (selector) => {
+                  const out = [];
+                  visit(document, out, selector);
+                  return out;
+                };
+                const norm = (s) => String(s || "").replace(/\\s+/g, "").toLowerCase();
+                const hit = (s) => {
+                  const t = norm(s);
+                  return t.includes("쉼표로라벨") || t.includes("라벨을구분")
+                    || t.includes("separatelabels") || t.includes("commaseparat");
+                };
+                const fields = all("textarea");
+                const labeled = fields.find((el) => hit(el.getAttribute("aria-label")));
+                if (labeled) return labeled;
+                const section = document.querySelector('[jsname="RhrOO"]');
+                if (section) {
+                  const ta = section.querySelector("textarea");
+                  if (ta) return ta;
+                }
+                return null;
+                """
+            )
+        except Exception:
+            return None
+
+    def _open_post_labels_panel(self) -> None:
+        try:
+            self.driver.execute_script(
+                """
+                const norm = (s) => String(s || "").replace(/\\s+/g, "").toLowerCase();
+                const click = (el) => {
+                  if (!el) return false;
+                  try { el.scrollIntoView({block: "center"}); } catch (e) {}
+                  try { el.click(); return true; } catch (e) {}
+                  return false;
+                };
+                const panel = document.querySelector('[jsname="qwU8Me"]');
+                if (panel && (panel.getAttribute("aria-hidden") === "true" || panel.getAttribute("aria-expanded") === "false")) {
+                  const opener = [...document.querySelectorAll('[role="button"], button')].find((el) => {
+                    const t = norm(el.getAttribute("aria-label"));
+                    if (t === "닫기" || t === "close") return false;
+                    return t === "글설정" || t === "postsettings" || t === "settings";
+                  });
+                  click(opener);
+                }
+                const section = document.querySelector('[jsname="RhrOO"]');
+                let header = section ? section.querySelector('[jsname="HSrbLb"]') : null;
+                if (!header) {
+                  header = [...document.querySelectorAll('[jsname="HSrbLb"][role="button"]')].find((el) => {
+                    const title = el.querySelector(".q6mdaf") || el;
+                    const t = norm(title.textContent);
+                    return t === "라벨" || t === "labels";
+                  });
+                }
+                if (header && header.getAttribute("aria-expanded") !== "true") click(header);
+                const wrap = section && section.querySelector('[jsname="Ufn6O"], .edhGSc');
+                if (wrap) {
+                  try { wrap.click(); } catch (e) {}
+                }
+                return header ? header.getAttribute("aria-expanded") : "none";
+                """
+            )
+        except Exception:
+            pass
+
+    def _set_post_search_description(self, text: str) -> None:
+        wanted = (text or "").strip()[:150]
+        if not wanted:
+            return
+        for attempt in range(5):
+            try:
+                self._open_post_search_description_panel()
+                self._tick(0.25)
+                field = self._find_post_search_description_field()
+                if field is None:
+                    continue
+                filled = self.driver.execute_script(
+                    """
+                    const el = arguments[0];
+                    const value = String(arguments[1] || "").slice(0, 150);
+                    const wrap = el.closest('[jsname="eBlZAd"]') || el.closest(".edhGSc") || el.parentElement;
+                    try { wrap && wrap.scrollIntoView({block: "center"}); } catch (e) {}
+                    try { wrap && wrap.click(); } catch (e) {}
+                    el.focus();
+                    const proto = el.tagName === "TEXTAREA"
+                      ? window.HTMLTextAreaElement.prototype
+                      : window.HTMLInputElement.prototype;
+                    const desc = Object.getOwnPropertyDescriptor(proto, "value");
+                    if (desc && desc.set) desc.set.call(el, value);
+                    else el.value = value;
+                    el.setAttribute("data-initial-value", value);
+                    try {
+                      el.dispatchEvent(new InputEvent("input", {
+                        bubbles: true, cancelable: true, inputType: "insertFromPaste", data: value
+                      }));
+                    } catch (e) {
+                      el.dispatchEvent(new Event("input", {bubbles: true}));
+                    }
+                    el.dispatchEvent(new Event("change", {bubbles: true}));
+                    el.dispatchEvent(new KeyboardEvent("keyup", {bubbles: true, key: "Process"}));
+                    return el.value || "";
+                    """,
+                    field,
+                    wanted,
+                )
+                got = str(filled or "").strip()
+                if got[:20] != wanted[:20] and wanted[:12] not in got:
+                    self._set_text(field, wanted)
+                    try:
+                        got = (field.get_attribute("value") or "").strip()
+                    except Exception:
+                        got = ""
+                if got[:20] == wanted[:20] or wanted[:12] in got:
+                    self.log("글 검색 설명을 옆 칸에 넣었습니다.")
+                    return
+            except Exception as extra:
+                self.log(f"글 검색 설명 입력 재시도 ({attempt + 1}/5): {_exc_text(exc)}")
+            self._tick(0.35)
+        self.log("글 검색 설명 칸을 찾지 못해 본문만 넣고 넘어갑니다.")
+
+    def _find_post_search_description_field(self):
+        try:
+            return self.driver.execute_script(
+                """
+                const visit = (root, sink, selector) => {
+                  if (!root || !root.querySelectorAll) return;
+                  sink.push(...root.querySelectorAll(selector));
+                  for (const el of root.querySelectorAll("*")) {
+                    if (el.shadowRoot) visit(el.shadowRoot, sink, selector);
+                  }
+                };
+                const all = (selector) => {
+                  const out = [];
+                  visit(document, out, selector);
+                  return out;
+                };
+                const norm = (s) => String(s || "").replace(/\\s+/g, "").toLowerCase();
+                const hitLabel = (s) => {
+                  const t = norm(s);
+                  return t === "검색설명입력" || t === "검색설명"
+                    || t === "searchdescription" || t === "entersearchdescription"
+                    || t.includes("검색설명입력");
+                };
+                const fields = all("textarea");
+                const labeled = fields.find((el) => hitLabel(el.getAttribute("aria-label")));
+                if (labeled) return labeled;
+                const section = document.querySelector('[jsname="mMw66b"]')
+                  || all("div").find((el) => {
+                    const title = el.querySelector && el.querySelector(".q6mdaf, [jsname='HSrbLb']");
+                    return title && norm(title.textContent).startsWith("검색설명") && el.querySelector("textarea");
+                  });
+                if (section) {
+                  const ta = section.querySelector('textarea[maxlength="150"], textarea');
+                  if (ta) return ta;
+                }
+                return fields.find((el) => String(el.getAttribute("maxlength") || el.maxLength) === "150") || null;
+                """
+            )
+        except Exception:
+            return None
+
+    def _open_post_search_description_panel(self) -> None:
+        try:
+            self.driver.execute_script(
+                """
+                const norm = (s) => String(s || "").replace(/\\s+/g, "").toLowerCase();
+                const click = (el) => {
+                  if (!el) return false;
+                  try { el.scrollIntoView({block: "center"}); } catch (e) {}
+                  try { el.click(); return true; } catch (e) {}
+                  return false;
+                };
+                const panel = document.querySelector('[jsname="qwU8Me"]');
+                if (panel && (panel.getAttribute("aria-hidden") === "true" || panel.getAttribute("aria-expanded") === "false")) {
+                  const opener = [...document.querySelectorAll('[role="button"], button')].find((el) => {
+                    const t = norm(el.getAttribute("aria-label"));
+                    if (t === "닫기" || t === "close") return false;
+                    return t === "글설정" || t === "postsettings" || t === "settings";
+                  });
+                  click(opener);
+                }
+                const section = document.querySelector('[jsname="mMw66b"]');
+                let header = section ? section.querySelector('[jsname="HSrbLb"]') : null;
+                if (!header) {
+                  header = [...document.querySelectorAll('[jsname="HSrbLb"][role="button"]')].find((el) => {
+                    const title = el.querySelector(".q6mdaf") || el;
+                    const t = norm(title.textContent);
+                    return t === "검색설명" || t.startsWith("검색설명");
+                  });
+                }
+                if (header && header.getAttribute("aria-expanded") !== "true") click(header);
+                const wrap = document.querySelector('[jsname="eBlZAd"]');
+                if (wrap) {
+                  try { wrap.click(); } catch (e) {}
+                }
+                return header ? header.getAttribute("aria-expanded") : "none";
+                """
+            )
+        except Exception:
+            pass
+
     def _click_post_publish(self) -> None:
         button = self._wait(8).until(
             lambda d: d.execute_script(
@@ -2296,10 +2599,12 @@ class BloggerSession:
         self.detect()
         if should_abort and should_abort():
             return self.state
+        if len(self.state.blogs) <= 2:
+            self._expand_account_blogs()
         catalog = self._read_blogs_catalog()
         if catalog:
             self._merge_catalog(catalog)
-            self.log(f"계정 피드에서 블로그 주소 {sum(1 for item in catalog if item.get('address'))}개를 읽었습니다.")
+            self.log(f"계정 피드에서 블로그 {len(catalog)}개를 읽었습니다. 목록 {len(self.state.blogs)}개")
         for blog in list(self.state.blogs):
             if should_abort and should_abort():
                 self.log("다른 작업이 시작되어 상세 인식을 멈춥니다.")
@@ -2381,7 +2686,6 @@ class BloggerSession:
     def _merge_catalog(self, catalog: list[dict]) -> None:
         gone = getattr(self, "_gone_ids", None) or set()
         known = {blog.id: blog for blog in self.state.blogs}
-        page_ids = set(known)
         for item in catalog:
             blog_id = str(item.get("id") or "").strip()
             if not _BLOG_ID_RE.match(blog_id) or blog_id in gone:
@@ -2390,12 +2694,12 @@ class BloggerSession:
             address = live_blog_address(str(item.get("address") or ""))
             name = str(item.get("name") or "").strip()
             if blog is None:
-                # 화면 목록에 없는 블로그는 피드로 되살리지 않는다. 삭제·휴지통 블로그가 다시 붙는 것을 막는다.
-                if page_ids:
-                    continue
                 blog = BlogInfo(id=blog_id, name=name or blog_id[-6:], address=address)
                 self.state.blogs.append(blog)
                 known[blog_id] = blog
+                ids = getattr(self, "_known_blog_ids", None)
+                if isinstance(ids, set):
+                    ids.add(blog_id)
                 continue
             if name and not blog.name:
                 blog.name = name
@@ -2517,6 +2821,26 @@ class BloggerSession:
                 """
             )
         )
+
+    def _expand_account_blogs(self) -> None:
+        """닫힌 드롭다운은 블로그 1개만 보여서, 선택 목록을 열어 이 계정 전체를 읽는다."""
+        if self.driver is None:
+            return
+        before = len(self.state.blogs)
+        try:
+            self._open_blog_menu()
+            self.detect()
+        except Exception:
+            pass
+        try:
+            if self._blog_menu_open():
+                self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+                self._tick(0.1)
+        except Exception:
+            pass
+        after = len(self.state.blogs)
+        if after > before:
+            self.log(f"블로그 선택 목록에서 {after}개를 읽었습니다.")
 
     def _blog_menu_open(self) -> bool:
         try:
@@ -3522,6 +3846,7 @@ class BloggerSession:
         control: RunControl | None = None,
         on_progress=None,
         on_item_done=None,
+        search_description: str = "",
     ) -> str:
         self.control = control or RunControl()
         self._on_progress = on_progress
@@ -3543,9 +3868,12 @@ class BloggerSession:
             self.set_google_description(description)
             self._mark_done(blog_id, "description")
         self._report(3, total, "검색 설명")
+        search_desc = (search_description or "").strip()
         if self._try_setting_step("검색 설명 사용 설정", self.enable_search_description):
-            if description and self._try_setting_step("검색 설명", lambda: self.set_search_description(description)):
+            if search_desc and self._try_setting_step("검색 설명", lambda: self.set_search_description(search_desc)):
                 self._mark_done(blog_id, "search_desc")
+            elif not search_desc:
+                self.log("검색 설명에 쓸 블로그 이름이 없어 건너뜁니다.")
         self._report(4, total, "파비콘")
         if favicon_path:
             self.set_favicon(favicon_path)
@@ -3890,10 +4218,12 @@ class BloggerSession:
             """
             const labels = arguments[0].map((s) => String(s || "").replace(/\\s+/g, "").toLowerCase()).filter(Boolean);
             const norm = (s) => String(s || "").replace(/\\s+/g, "").toLowerCase();
-            const nodes = [...document.querySelectorAll('[role="checkbox"], [role="switch"]')];
+            const nodes = [...document.querySelectorAll('[role="checkbox"], [role="switch"], input[type="checkbox"]')];
+            const exact = nodes.find((el) => labels.some((label) => norm(el.getAttribute("aria-label")) === label));
+            if (exact) return exact;
             return nodes.find((el) => {
               const aria = norm(el.getAttribute("aria-label"));
-              return labels.some((label) => aria === label || aria.includes(label));
+              return labels.some((label) => aria.includes(label));
             }) || null;
             """,
             names,
@@ -3907,31 +4237,82 @@ class BloggerSession:
 
         return self._wait(timeout).until(found)
 
-    def _set_toggle(self, box, on: bool, selector: str = "", root=None, labels=None) -> None:
-        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", box)
-        self._tick(0.15)
-        current = (box.get_attribute("aria-checked") or "").lower() == "true"
-        if current == on:
-            return
+    def _toggle_is_on(self, el) -> bool:
+        if el is None:
+            return False
         try:
-            self._click_jsaction(box)
+            return bool(
+                self.driver.execute_script(
+                    """
+                    const el = arguments[0];
+                    if (!el) return false;
+                    const read = (node) => {
+                      if (!node) return "";
+                      return String(
+                        node.getAttribute("aria-checked")
+                        || node.getAttribute("aria-pressed")
+                        || (node.checked === true ? "true" : node.checked === false ? "false" : "")
+                        || ""
+                      ).toLowerCase();
+                    };
+                    const hits = [el, el.querySelector && el.querySelector('[aria-checked], [aria-pressed], input[type="checkbox"]')];
+                    if (el.closest) hits.push(el.closest('[role="checkbox"], [role="switch"]'));
+                    for (const node of hits) {
+                      const v = read(node);
+                      if (v === "true") return true;
+                      if (v === "false") return false;
+                    }
+                    return false;
+                    """,
+                    el,
+                )
+            )
         except Exception:
-            try:
-                box.click()
-            except Exception:
-                self.driver.execute_script("arguments[0].click();", box)
-        expect = "true" if on else "false"
+            return (getattr(el, "get_attribute", lambda *_: "")("aria-checked") or "").lower() == "true"
 
-        def checked(_driver):
+    def _click_toggle_once(self, el) -> None:
+        self.driver.execute_script(
+            """
+            const el = arguments[0];
+            el.scrollIntoView({block: "center"});
+            try { el.click(); } catch (e) {
+              try { el.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true, view: window})); } catch (e2) {}
+            }
+            """,
+            el,
+        )
+
+    def _set_toggle(self, box, on: bool, selector: str = "", root=None, labels=None) -> None:
+        def resolve():
             el = box
             if selector:
                 scope = root if root is not None else self.driver
                 el = _displayed(scope.find_elements(By.CSS_SELECTOR, selector)) or box
             elif labels:
                 el = self._find_setting_toggle(labels) or box
-            return (el.get_attribute("aria-checked") or "").lower() == expect
+            return el
 
-        self._wait(6).until(checked)
+        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", box)
+        self._tick(0.15)
+        el = resolve()
+        if self._toggle_is_on(el) == on:
+            return
+        self._click_toggle_once(el)
+        self._tick(0.2)
+
+        def reached(_driver):
+            return self._toggle_is_on(resolve()) == on
+
+        try:
+            self._wait(5).until(reached)
+            return
+        except Exception:
+            pass
+        el = resolve()
+        if self._toggle_is_on(el) == on:
+            return
+        self._click_toggle_once(el)
+        self._wait(5).until(reached)
 
     def _wait_setting_unlocked(self, controller: str, timeout: float = 10) -> None:
         def unlocked(driver):
@@ -4224,7 +4605,8 @@ class BloggerSession:
         with self._lock:
             driver = self.driver
             self.driver = None
-            self.state = SessionState()
+            if kill_chrome:
+                self.state = SessionState()
             proc = self._chrome_proc
             self._chrome_proc = None
             self._chrome_user_dir = None

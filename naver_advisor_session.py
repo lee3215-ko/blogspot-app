@@ -88,6 +88,31 @@ return (function() {
 })();
 """
 
+_COUNT_API_JS = """
+const done = arguments[arguments.length - 1];
+(async function() {
+  try {
+    const enc = (window.$nuxt && window.$nuxt.$store && window.$nuxt.$store.state
+      && window.$nuxt.$store.state.authUser && window.$nuxt.$store.state.authUser.enc_id) || "";
+    if (!enc) { done({n: null, how: ""}); return; }
+    const res = await fetch("https://searchadvisor.naver.com/api-board/list/" + encodeURIComponent(enc), {
+      credentials: "include",
+      headers: { "Accept": "application/json, text/plain, */*" }
+    });
+    if (!res.ok) { done({n: null, how: "api-http"}); return; }
+    const data = await res.json();
+    const items = data && Array.isArray(data.items) ? data.items : null;
+    if (data && data.code === 0 && items) {
+      done({n: items.length, how: "api", max: (data.meta && data.meta.max) || 100});
+      return;
+    }
+    done({n: null, how: "api-shape"});
+  } catch (e) {
+    done({n: null, how: "api-error"});
+  }
+})();
+"""
+
 _META_JS = """
 return (function() {
   const decode = (s) => String(s || "")
@@ -366,6 +391,18 @@ class NaverAdvisorSession:
             time.sleep(poll_sec)
         return self.state
 
+    def _read_site_count(self) -> dict:
+        try:
+            got = self.driver.execute_async_script(_COUNT_API_JS) or {}
+            if str(got.get("how") or "") == "api" and got.get("n") is not None:
+                return got
+        except Exception:
+            pass
+        try:
+            return self.driver.execute_script(_COUNT_JS) or {}
+        except Exception:
+            return {}
+
     def count_sites(self, force_reload: bool = False) -> int | None:
         if not self.is_alive():
             return self.state.site_count
@@ -376,24 +413,34 @@ class NaverAdvisorSession:
             on_board = "/console/board" in url
             if not on_board or force_reload:
                 self._goto_board()
-            self._tick(1.2)
-            self._accept_consent()
-            count = 0
+            time.sleep(0.4)
+            try:
+                self._accept_consent()
+            except Exception:
+                pass
+            count = None
             how = ""
-            deadline = time.time() + 12
+            deadline = time.time() + 10
             while time.time() < deadline:
-                got = self.driver.execute_script(_COUNT_JS) or {}
-                count = int(got.get("n") or 0)
+                got = self._read_site_count()
                 how = str(got.get("how") or "")
-                if how in {"label", "table"} or count > 0:
+                if got.get("n") is not None:
+                    count = int(got.get("n"))
+                if how == "api" and count is not None:
                     break
-                time.sleep(0.5)
+                if how in {"label", "table"} and count is not None:
+                    break
+                time.sleep(0.4)
+            if count is None:
+                count = 0
             self.state.site_count = count
             self.state.logged_in = True
             self.state.url = self._url()
             self.read_account()
             self.log(f"등록 사이트 {count}개 ({how or 'unknown'})")
             return count
+        except StopRequested:
+            raise
         except Exception as exc:
             self.log(f"사이트 수 인식 실패: {exc}")
             return self.state.site_count
@@ -1445,7 +1492,9 @@ class NaverAdvisorSession:
         self.state.error = ""
         self.read_account()
         try:
-            self.count_sites(force_reload=False)
+            self.count_sites(force_reload=True)
+        except StopRequested:
+            pass
         except Exception:
             pass
         account = self.state.account or "-"

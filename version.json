@@ -1,13 +1,10 @@
 {
-    "version":  "1.2.19",
-    "url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/632468687",
-    "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.19/BloggerSpot.zip",
-    "notes":  "블로그 목록이 한 개로 줄거나 다른 계정 글이 섞이던 문제, 더블클릭 시 다른 블로그가 열리던 문제를 고침",
-    "api_download_url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/632468687",
-    "asset_id":  632468687,
+    "version":  "1.2.20",
+    "url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.20/BloggerSpot.zip",
+    "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.20/BloggerSpot.zip",
+    "notes":  "HTML 원고 H1을 제목으로 쓰고, 검색 설명·라벨을 글 설정에 넣습니다. 설정 적용 토글이 꺼지던 문제와 최초수집 아이디 갱신을 고칩니다.",
     "download_urls":  [
-                          "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/632468687",
-                          "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.19/BloggerSpot.zip",
+                          "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.20/BloggerSpot.zip",
                           "https://github.com/lee3215-ko/blogspot-app/releases/latest/download/BloggerSpot.zip"
                       ]
 }

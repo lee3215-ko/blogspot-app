@@ -1,6 +1,7 @@
 """네이버 site: 검색으로 색인 여부를 확인합니다. 로그인은 쓰지 않습니다."""
 from __future__ import annotations
 
+import gzip
 import re
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -9,6 +10,16 @@ SEARCH_SSC = "tab.nx.all"
 DEFAULT_DELAY_SEC = 1.5
 
 HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    ),
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://m.search.naver.com/search.naver",
+}
+
+DESKTOP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -72,6 +83,18 @@ def site_search_query(site: str) -> str:
 def build_search_url(query: str, start: int = 1) -> str:
     params = urlencode(
         {
+            "sm": "mtb_hty.top",
+            "where": "m",
+            "query": query,
+            "start": str(start),
+        }
+    )
+    return f"https://m.search.naver.com/search.naver?{params}"
+
+
+def build_desktop_search_url(query: str, start: int = 1) -> str:
+    params = urlencode(
+        {
             "where": "nexearch",
             "sm": "tab_hty.top",
             "query": query,
@@ -82,12 +105,33 @@ def build_search_url(query: str, start: int = 1) -> str:
     return f"https://search.naver.com/search.naver?{params}"
 
 
-def fetch_html(url: str, timeout: float = 20) -> str:
-    request = Request(url, headers=HEADERS)
+def fetch_html(url: str, timeout: float = 20, headers: dict | None = None) -> str:
+    request = Request(url, headers=headers or HEADERS)
     with urlopen(request, timeout=timeout) as response:
         raw = response.read()
+        encoding = (response.headers.get("Content-Encoding") or "").lower()
+        if "gzip" in encoding:
+            raw = gzip.decompress(raw)
         charset = response.headers.get_content_charset() or "utf-8"
     return raw.decode(charset, errors="replace")
+
+
+def fetch_search_html(query: str, start: int = 1) -> str:
+    last_error: Exception | None = None
+    attempts = (
+        (build_search_url(query, start), HEADERS),
+        (build_desktop_search_url(query, start), DESKTOP_HEADERS),
+    )
+    for url, headers in attempts:
+        try:
+            html = fetch_html(url, headers=headers)
+            if html:
+                return html
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("네이버 검색 페이지가 비어 있습니다.")
 
 
 def html_has_no_results(html: str) -> bool:
@@ -317,7 +361,7 @@ def evaluate_search_html(html: str, site_url: str, query: str) -> dict:
 def check_naver_index(site_url: str) -> dict:
     query = site_search_query(site_url)
     try:
-        html = fetch_html(build_search_url(query, 1))
+        html = fetch_search_html(query, 1)
     except Exception as exc:
         return {
             "indexed": None,
@@ -368,6 +412,7 @@ def _self_check() -> None:
     from_json = evaluate_search_html(desk, "https://a.blogspot.com/", query)
     assert from_json["indexed"] is True
     assert site_search_query("a.blogspot.com") == "site:https://a.blogspot.com"
+    assert "m.search.naver.com" in build_search_url("site:https://a.blogspot.com")
 
 
 if __name__ == "__main__":

@@ -83,11 +83,7 @@ def frame(parent, bg=None, **kwargs):
 
 
 class ScrollFrame(tk.Frame):
-    """스크롤 영역. 자식은 `.inner`에 넣는다.
-
-    창 크기가 바뀌는 동안에는 안쪽 너비를 바로 맞추지 않는다.
-    손 뗀 뒤에 한 번만 재서 맞추면, 줄마다 Configure가 이어지지 않는다.
-    """
+    """스크롤 영역. 자식은 `.inner`에 넣는다. Canvas 창으로 줄을 보여 잘리지 않게 한다."""
 
     def __init__(self, parent, height: int = 200, bg=None, orientation: str = "vertical"):
         bg = bg or COLORS["card"]
@@ -101,29 +97,28 @@ class ScrollFrame(tk.Frame):
         self._resize_after = None
         self._measure_after = None
         self._span_ready = False
-        self._host = tk.Frame(self, bg=bg, highlightthickness=0, bd=0)
+        self._canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0, height=height)
+        self._host = self._canvas
         if orientation == "horizontal":
-            self.bar = tk.Scrollbar(self, orient="horizontal", command=self._on_bar)
-            self._host.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+            self.bar = tk.Scrollbar(self, orient="horizontal", command=self._canvas.xview)
+            self._canvas.configure(xscrollcommand=self.bar.set)
+            self._canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
             self.bar.pack(side=tk.BOTTOM, fill=tk.X)
         else:
-            self.bar = tk.Scrollbar(self, orient="vertical", command=self._on_bar)
-            self._host.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            self.bar = tk.Scrollbar(self, orient="vertical", command=self._canvas.yview)
+            self._canvas.configure(yscrollcommand=self.bar.set)
+            self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             self.bar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.inner = tk.Frame(self._host, bg=bg)
-        self.inner.place(x=0, y=0)
+        self.inner = tk.Frame(self._canvas, bg=bg)
+        self._win = self._canvas.create_window((0, 0), window=self.inner, anchor="nw")
         try:
             self.pack_propagate(False)
         except Exception:
             pass
-        try:
-            self._host.pack_propagate(False)
-        except Exception:
-            pass
         self.inner.bind("<Configure>", self._on_inner_configure)
-        self._host.bind("<Configure>", self._on_host_configure)
+        self._canvas.bind("<Configure>", self._on_host_configure)
         self._scroll_target = self
-        self._host._scroll_target = self
+        self._canvas._scroll_target = self
         self.inner._scroll_target = self
         self.after(1, self._commit_span)
 
@@ -137,70 +132,29 @@ class ScrollFrame(tk.Frame):
         except Exception:
             pass
 
-    def _child_req(self, child, horizontal: bool) -> int:
+    def _sync_region(self) -> None:
         try:
-            return int((child.winfo_reqwidth() if horizontal else child.winfo_reqheight()) or 0)
-        except tk.TclError:
-            return 0
-
-    def _kids_span(self) -> int:
-        """place된 inner는 reqheight가 1로 남는 경우가 있어, 자식 크기로 잰다."""
-        try:
-            kids = list(self.inner.winfo_children())
-        except tk.TclError:
-            return 1
-        if not kids:
-            return 1
-        horizontal = self.orientation == "horizontal"
-        if not horizontal and len(kids) == 1:
-            try:
-                grand = list(kids[0].winfo_children())
-            except tk.TclError:
-                grand = []
-            if grand:
-                kids = grand
-        span = 1
-        for child in kids:
-            span += self._child_req(child, horizontal)
-        bottom = 1
-        for child in kids:
-            try:
-                req = self._child_req(child, horizontal)
-                if horizontal:
-                    edge = int(child.winfo_x()) + max(int(child.winfo_width() or 0), req)
-                else:
-                    edge = int(child.winfo_y()) + max(int(child.winfo_height() or 0), req)
-                if edge > bottom:
-                    bottom = edge
-            except tk.TclError:
-                pass
-        return max(1, span, bottom)
-
-    def _measure_content(self) -> int:
-        value = self._kids_span()
-        self._content = value
-        return value
-
-    def _place_offset(self) -> None:
-        try:
-            span = max(1, int(self._span))
-            box = max(int(self._content), int(self._view), 1)
             if self.orientation == "horizontal":
-                self.inner.place_configure(x=int(-self._offset), height=span, width=box)
+                content = max(1, int(self.inner.winfo_reqwidth() or 1))
+                span = max(1, int(self._span or self._canvas.winfo_height() or 1))
+                self._canvas.configure(scrollregion=(0, 0, content, span))
             else:
-                self.inner.place_configure(y=int(-self._offset), width=span, height=box)
+                content = max(1, int(self.inner.winfo_reqheight() or 1))
+                span = max(1, int(self._span or self._canvas.winfo_width() or 1))
+                self._canvas.configure(scrollregion=(0, 0, span, content))
+            self._content = content
         except tk.TclError:
             pass
 
-    def _sync_bar(self) -> None:
-        content = max(1, int(self._content))
-        view = max(1, int(self._view))
+    def _measure_content(self) -> int:
+        self._sync_region()
+        return self._content
+
+    def _read_offset(self) -> None:
         try:
-            if content <= view:
-                self.bar.set(0, 1)
-            else:
-                self.bar.set(self._offset / content, (self._offset + view) / content)
-        except tk.TclError:
+            first = (self._canvas.xview() if self.orientation == "horizontal" else self._canvas.yview())[0]
+            self._offset = float(first) * max(1, int(self._content))
+        except Exception:
             pass
 
     def _apply_offset(self) -> None:
@@ -208,30 +162,44 @@ class ScrollFrame(tk.Frame):
             return
         self._applying = True
         try:
+            self._sync_region()
             content = max(1, int(self._content))
             view = max(1, int(self._view))
             max_off = max(0, content - view)
             self._offset = min(max(0.0, float(self._offset)), float(max_off))
-            self._place_offset()
-            self._sync_bar()
+            frac = 0.0 if content <= 0 else self._offset / content
+            if self.orientation == "horizontal":
+                self._canvas.xview_moveto(frac)
+            else:
+                self._canvas.yview_moveto(frac)
+        except tk.TclError:
+            pass
         finally:
             self._applying = False
 
     def _commit_span(self) -> None:
         self._resize_after = None
         try:
+            self._canvas.coords(self._win, 0, 0)
             if self.orientation == "horizontal":
-                span = max(1, int(self._host.winfo_height() or 1))
-                view = max(1, int(self._host.winfo_width() or 1))
+                span = max(1, int(self._canvas.winfo_height() or 1))
+                view = max(1, int(self._canvas.winfo_width() or 1))
+                req = max(1, int(self.inner.winfo_reqwidth() or 1))
+                self._canvas.itemconfigure(self._win, height=span, width=req)
             else:
-                span = max(1, int(self._host.winfo_width() or 1))
-                view = max(1, int(self._host.winfo_height() or 1))
+                span = max(1, int(self._canvas.winfo_width() or 1))
+                view = max(1, int(self._canvas.winfo_height() or 1))
+                req = max(1, int(self.inner.winfo_reqheight() or 1))
+                kw = {"height": req}
+                if span > 1:
+                    kw["width"] = span
+                self._canvas.itemconfigure(self._win, **kw)
         except tk.TclError:
             return
         self._span = span
         self._view = view
         self._span_ready = True
-        self._measure_content()
+        self._sync_region()
         self._apply_offset()
 
     def _on_host_configure(self, event=None) -> None:
@@ -243,27 +211,21 @@ class ScrollFrame(tk.Frame):
         except tk.TclError:
             return
         if self.orientation == "horizontal":
-            view = max(1, int(getattr(event, "width", 0) or self._host.winfo_width() or 1))
-            span = max(1, int(getattr(event, "height", 0) or self._host.winfo_height() or 1))
+            view = max(1, int(getattr(event, "width", 0) or self._canvas.winfo_width() or 1))
+            span = max(1, int(getattr(event, "height", 0) or self._canvas.winfo_height() or 1))
         else:
-            view = max(1, int(getattr(event, "height", 0) or self._host.winfo_height() or 1))
-            span = max(1, int(getattr(event, "width", 0) or self._host.winfo_width() or 1))
+            view = max(1, int(getattr(event, "height", 0) or self._canvas.winfo_height() or 1))
+            span = max(1, int(getattr(event, "width", 0) or self._canvas.winfo_width() or 1))
+        old_view = self._view
         self._view = view
-        max_off = max(0, self._content - view)
-        if self._offset > max_off:
-            self._offset = float(max_off)
-            self._place_offset()
-        self._sync_bar()
-        if not self._span_ready:
-            self._commit_span()
+        if not self._span_ready or span != self._span or abs(view - old_view) >= 8:
+            self._cancel_after("_resize_after")
+            try:
+                self._resize_after = self.after(80, self._commit_span)
+            except Exception:
+                self._commit_span()
             return
-        if span == self._span:
-            return
-        self._cancel_after("_resize_after")
-        try:
-            self._resize_after = self.after(80, self._commit_span)
-        except Exception:
-            self._commit_span()
+        self._sync_region()
 
     def _on_inner_configure(self, _event=None) -> None:
         if RESIZE_FROZEN:
@@ -277,38 +239,47 @@ class ScrollFrame(tk.Frame):
 
     def _measure_from_idle(self) -> None:
         self._measure_after = None
-        self._measure_content()
+        if self.orientation == "horizontal":
+            self._commit_span()
+        else:
+            self._sync_region()
+        content = max(1, int(self._content))
+        view = max(1, int(self._view))
+        if content <= view + 8:
+            self._offset = 0.0
+            self._apply_offset()
+            return
+        self._read_offset()
         self._apply_offset()
 
     def _on_bar(self, *args) -> None:
         if not args:
             return
-        content = max(1, int(self._content))
-        view = max(1, int(self._view))
-        if args[0] == "moveto":
-            try:
-                self._offset = float(args[1]) * content
-            except (TypeError, ValueError):
-                return
-        elif args[0] == "scroll":
-            try:
-                amount = int(float(args[1]))
-            except (TypeError, ValueError):
-                return
-            unit = args[2] if len(args) > 2 else "units"
-            self._offset += amount * (30 if unit == "units" else view)
-        else:
-            return
-        self._apply_offset()
+        try:
+            if self.orientation == "horizontal":
+                self._canvas.xview(*args)
+            else:
+                self._canvas.yview(*args)
+            self._sync_region()
+            self._read_offset()
+        except tk.TclError:
+            pass
 
     def scroll(self, units: int, horizontal: bool = False) -> None:
         if not units:
             return
-        self._offset += units * 90
-        self._apply_offset()
+        try:
+            if horizontal or self.orientation == "horizontal":
+                self._canvas.xview_scroll(int(units), "units")
+            else:
+                self._canvas.yview_scroll(int(units), "units")
+            self._sync_region()
+            self._read_offset()
+        except tk.TclError:
+            pass
 
     def scroll_to_end(self) -> None:
-        self._measure_content()
+        self._sync_region()
         self._offset = float(self._content)
         self._apply_offset()
 
@@ -317,15 +288,34 @@ class ScrollFrame(tk.Frame):
             return
         try:
             self.update_idletasks()
-            self._measure_content()
+            self._commit_span()
             view = max(1, int(self._view))
             if self._content <= view:
                 self._offset = 0
                 self._apply_offset()
                 return
-            top = int(widget.winfo_rooty()) - int(self.inner.winfo_rooty())
+            if self.orientation == "horizontal":
+                left = max(0, int(widget.winfo_rootx()) - int(self.inner.winfo_rootx()))
+                row_w = max(1, int(widget.winfo_width()))
+                right = left + row_w
+                shown_left = self._offset
+                shown_right = self._offset + view
+                if left >= shown_left and right <= shown_right:
+                    return
+                self._offset = float(left) if left < shown_left else float(max(0, right - view))
+                self._apply_offset()
+                return
+            top = max(0, int(widget.winfo_rooty()) - int(self.inner.winfo_rooty()))
             row_h = max(1, int(widget.winfo_height()))
-            self._offset = top + (row_h / 2) - (view / 2)
+            bottom = top + row_h
+            shown_top = self._offset
+            shown_bottom = self._offset + view
+            if top >= shown_top and bottom <= shown_bottom:
+                return
+            if top < shown_top:
+                self._offset = float(top)
+            else:
+                self._offset = float(max(0, bottom - view))
             self._apply_offset()
         except Exception:
             pass

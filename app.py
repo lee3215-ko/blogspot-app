@@ -541,7 +541,7 @@ class BloggerApp:
         self.blog_list = scrollable(blog_inner, height=420, bg=COLORS["card"])
         self.blog_list.pack(fill=tk.BOTH, expand=True)
         self._blog_list_inner = tk.Frame(self.blog_list.inner, bg=COLORS["card"])
-        self._blog_list_inner.pack(fill=tk.X)
+        self._blog_list_inner.pack(side=tk.TOP, anchor="nw", fill=tk.X)
 
         right_card = card(body)
         right_card.grid(row=0, column=1, sticky="nsew")
@@ -613,7 +613,7 @@ class BloggerApp:
         label(setup_inner, "디스크립션", "heading", COLORS["text"]).pack(anchor="w", padx=16, pady=(18, 0))
         label(
             setup_inner,
-            "블로그마다 따로 적지 않습니다. 문장을 한 줄에 하나씩 모아 두면, 설정 적용 때 그중에서 넣습니다.",
+            "구글,네이버 설명에 넣을 문장을 한 줄에 하나씩 적습니다. 검색 설명은 여기에 적지 않습니다. 설정 적용 때 블로그 이름에 맞춰 SEO 문장을 만들어 넣습니다.",
             "body",
             COLORS["text_muted"],
         ).pack(anchor="w", padx=16, pady=(4, 8))
@@ -641,6 +641,26 @@ class BloggerApp:
         button(
             folder_row, "폴더 선택", variant="primary", width=120, height=40, command=self.on_pick_blog_folder,
         ).pack(side=tk.LEFT, padx=(8, 0))
+
+        label(setup_inner, "이미지 폴더", "heading", COLORS["text"]).pack(anchor="w", padx=16, pady=(18, 0))
+        label(
+            setup_inner,
+            "글 작성 때 이 폴더에서 이미지를 하나 골라 본문 앞에 넣습니다. 폴더를 고르지 않거나 비우면 이미지는 넣지 않습니다.",
+            "body",
+            COLORS["text_muted"],
+        ).pack(anchor="w", padx=16, pady=(4, 8))
+        image_row = frame(setup_inner, COLORS["card"])
+        image_row.pack(fill=tk.X, padx=16, pady=(0, 4))
+        self.post_image_entry = text_entry(image_row, textvariable=self.post_image_var)
+        self.post_image_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.post_image_folder_btn = button(
+            image_row, "폴더 선택", variant="primary", width=120, height=40, command=self.on_pick_post_image_folder,
+        )
+        self.post_image_folder_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.post_image_clear_btn = button(
+            image_row, "비우기", variant="ghost", width=80, height=40, command=self.on_clear_post_image_folder,
+        )
+        self.post_image_clear_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         label(setup_inner, "파비콘", "heading", COLORS["text"]).pack(anchor="w", padx=16, pady=(18, 0))
         label(
@@ -673,16 +693,25 @@ class BloggerApp:
         ).pack(anchor="w", pady=(4, 8))
         code_bar = frame(html_inner, COLORS["card"])
         code_bar.pack(fill=tk.X, pady=(0, 8))
-        self.html_del_btn = button(
-            code_bar, "코드 삭제", variant="danger", width=100, height=36, command=self.on_delete_html_code,
-        )
-        self.html_del_btn.pack(side=tk.RIGHT)
         self.html_add_btn = button(
             code_bar, "코드 추가", variant="primary", width=100, height=36, command=self.on_add_html_code,
         )
-        self.html_add_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.html_code_list = scrollable(code_bar, 44, COLORS["card"], orientation="horizontal")
-        self.html_code_list.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.html_add_btn.pack(side=tk.LEFT)
+        self.html_del_btn = button(
+            code_bar, "코드 삭제", variant="danger", width=100, height=36, command=self.on_delete_html_code,
+        )
+        self.html_del_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.html_code_list = frame(html_inner, COLORS["card"])
+        self.html_code_list.pack(fill=tk.X, pady=(0, 8))
+        try:
+            self.html_code_list.pack_propagate(False)
+        except Exception:
+            pass
+        self.html_code_list.configure(height=40)
+        self.html_code_list.bind(
+            "<Configure>",
+            lambda _e: self._after_once("html_tabs", 40, self._layout_html_code_tabs),
+        )
         if not isinstance(getattr(self, "_html_codes", None), list) or not self._html_codes:
             self._html_codes = [{"name": "A코드", "html": ""}]
             self._html_code_index = 0
@@ -693,6 +722,7 @@ class BloggerApp:
             highlightthickness=1, highlightbackground=COLORS["border"],
         )
         self.theme_html.pack(fill=tk.BOTH, expand=True)
+        self._bind_html_editor()
         self._load_html_editor()
 
         log_page = frame(self.tab_body, COLORS["bg"])
@@ -935,7 +965,7 @@ class BloggerApp:
         self.write_count_entry.pack(side=tk.LEFT, padx=(8, 0))
         label(
             write_inner,
-            "체크한 블로그가 있으면 그 블로그에, 없으면 목록에서 누른 블로그에 글을 씁니다. 위에 적은 개수만큼만 쓰고, 블로그가 여러 개면 고른 순서대로 돌아가며 넣습니다. 제목은 txt 파일 이름입니다. 발행되면 원고 폴더 안의 성공 폴더로 옮깁니다.",
+            "체크한 블로그가 있으면 그 블로그에, 없으면 목록에서 누른 블로그에 글을 씁니다. 위에 적은 개수만큼만 쓰고, 블로그가 여러 개면 고른 순서대로 돌아가며 넣습니다. HTML 원고에 H1이 있으면 그 내용이 제목이고, 없으면 파일 이름입니다. 검색 설명은 원고를 분석해 대표키워드를 앞에 두고 150자로 넣습니다. 라벨은 H1 대표키워드 1개와 본문에서 3개를 뽑아 쉼표로 넣습니다. 원고 안에 디스크립션을 넣지 마세요. 발행되면 원고 폴더 안의 성공 폴더로 옮깁니다.",
             "body",
             COLORS["text_muted"],
             wraplength=720,
@@ -951,18 +981,9 @@ class BloggerApp:
             manuscript_row, "폴더 선택", variant="primary", width=120, height=40, command=self.on_pick_manuscript_folder,
         )
         self.manuscript_folder_btn.pack(side=tk.LEFT, padx=(8, 0))
-        label(write_inner, "이미지 폴더", "subheading", COLORS["text"]).pack(anchor="w")
-        image_row = frame(write_inner, COLORS["card"])
-        image_row.pack(fill=tk.X, pady=(4, 0))
-        self.post_image_entry = text_entry(image_row, textvariable=self.post_image_var)
-        self.post_image_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.post_image_folder_btn = button(
-            image_row, "폴더 선택", variant="primary", width=120, height=40, command=self.on_pick_post_image_folder,
-        )
-        self.post_image_folder_btn.pack(side=tk.LEFT, padx=(8, 0))
         label(
             write_inner,
-            "이미지는 이 폴더에서 글을 쓸 때마다 하나를 골라 본문 앞에 넣습니다. 폴더를 비워 두면 원고만 넣습니다. 글 작성 버튼은 아래 작업 줄에 있습니다.",
+            "이미지는 만들기 탭의 이미지 폴더를 씁니다. 폴더를 비워 두면 원고만 넣습니다. 글 작성 버튼은 아래 작업 줄에 있습니다.",
             "body",
             COLORS["text_muted"],
             wraplength=720,
@@ -1909,7 +1930,15 @@ class BloggerApp:
         path = data_path(HOME_STATE_FILE)
         prev_gone = [str(item).strip() for item in ((self.__dict__.get("_home_state") or {}).get("gone_ids") or []) if str(item).strip()]
         prev_folds = (self.__dict__.get("_home_state") or {}).get("record_folds")
-        state = {"email_order": [], "program_order": {}, "program_order_time": {}, "events": [], "gone_ids": [], "record_folds": {"status": False, "flow": False}}
+        state = {
+            "email_order": [],
+            "program_order": {},
+            "program_order_time": {},
+            "events": [],
+            "gone_ids": [],
+            "record_folds": {"status": False, "flow": False},
+            "account_blogs": {},
+        }
         loaded_folds = False
         if os.path.isfile(path):
             try:
@@ -1931,6 +1960,15 @@ class BloggerApp:
                         "flow": bool(raw["record_folds"].get("flow")),
                     }
                     loaded_folds = True
+                if isinstance(raw.get("account_blogs"), dict):
+                    saved_blogs = {}
+                    for key, items in raw["account_blogs"].items():
+                        if not isinstance(items, list):
+                            continue
+                        ids = [str(item).strip() for item in items if str(item or "").strip().isdigit() and len(str(item).strip()) >= 10]
+                        if ids:
+                            saved_blogs[str(key).strip().casefold()] = ids
+                    state["account_blogs"] = saved_blogs
             except Exception:
                 pass
         if not loaded_folds and isinstance(prev_folds, dict):
@@ -4409,7 +4447,7 @@ class BloggerApp:
                 pass
 
     def _tab_needs_refresh(self, name: str) -> bool:
-        if name == "글쓰기":
+        if name == "글쓰기" or name == "HTML 편집":
             return True
         if name == "블로그":
             return bool(
@@ -4450,7 +4488,9 @@ class BloggerApp:
             self._refresh_write_count()
         elif name == "블로그":
             self._flush_stale_rows("blog")
-            if getattr(self, "_blog_dirty", False):
+            frames = getattr(self, "_blog_row_frames", None) or {}
+            rows_missing = not any(self._widget_alive(row) for row in frames.values())
+            if getattr(self, "_blog_dirty", False) or rows_missing:
                 self._refresh_dashboard()
             if getattr(self, "_detail_dirty", False):
                 self._render_blog_detail()
@@ -4462,6 +4502,8 @@ class BloggerApp:
                 self._refresh_index_tab()
             else:
                 self._flush_stale_rows("index")
+        elif name == "HTML 편집":
+            self._layout_html_code_tabs()
 
     def _paint_main_tabs(self) -> None:
         current = getattr(self, "_main_tab", "")
@@ -4731,8 +4773,10 @@ class BloggerApp:
     def _remember_blog_meta(self, blogs: list[BlogInfo]) -> None:
         changed = False
         gone = self._gone_id_set()
-        page_ids = getattr(self.session, "_page_blog_ids", None) or set()
+        page_ids = set(getattr(self.session, "_page_blog_ids", None) or set())
+        known_ids = set(getattr(self.session, "_known_blog_ids", None) or set())
         email = str(self._logged_google_email() or "").strip()
+        stamp_ids = page_ids | known_ids
         for blog in blogs:
             if blog.id in gone:
                 continue
@@ -4740,7 +4784,7 @@ class BloggerApp:
             if blog.name and cur.get("name") != blog.name:
                 cur["name"] = blog.name
                 changed = True
-            if email and blog.id in page_ids and str(cur.get("google_email") or "").strip().casefold() != email.casefold():
+            if email and blog.id in stamp_ids and str(cur.get("google_email") or "").strip().casefold() != email.casefold():
                 cur["google_email"] = email
                 changed = True
             if blog.address:
@@ -4826,6 +4870,57 @@ class BloggerApp:
     def _description_lines(self) -> list[str]:
         raw = self._current_text("desc", getattr(self, "desc_text", None))
         return [line.strip() for line in raw.splitlines() if line.strip()]
+
+    def _seo_josa(self, word: str, with_batchim: str, without: str) -> str:
+        if not word:
+            return without
+        ch = word[-1]
+        if "가" <= ch <= "힣":
+            return with_batchim if (ord(ch) - 0xAC00) % 28 else without
+        return without
+
+    def _clip_seo_description(self, text: str, limit: int = 150) -> str:
+        text = re.sub(r"\s+", " ", (text or "")).strip()
+        if len(text) <= limit:
+            return text
+        cut = text[:limit].rstrip()
+        for sep in (" ", "·", ",", "."):
+            idx = cut.rfind(sep)
+            if idx >= 60:
+                cut = cut[:idx]
+                break
+        else:
+            cut = cut[: max(1, limit - 1)]
+        return cut.rstrip(" ·,.") + "…"
+
+    def _seo_search_description(self, name: str, keyword: str = "", salt: str = "") -> str:
+        name = re.sub(r"\s+", " ", (name or "")).strip()
+        keyword = re.sub(r"\s+", " ", (keyword or "")).strip()
+        if keyword and name and keyword.casefold() in name.casefold():
+            keyword = ""
+        seed = name or keyword
+        if not seed:
+            return ""
+        idx = sum(ord(ch) for ch in (salt or seed)) % 5
+        eun = self._seo_josa(seed, "은", "는")
+        eul = self._seo_josa(seed, "을", "를")
+        templates = (
+            f"{seed}{eun} 한곳에서 확인하세요. 핵심 정보와 최신 내용을 쉽고 빠르게 정리했습니다.",
+            f"{seed} 핵심 가이드. 지금 필요한 정보와 실전 포인트를 한눈에 확인할 수 있습니다.",
+            f"{seed}{eul} 찾는 분께 맞춰 핵심만 모았습니다. 중요한 내용과 최신 흐름을 바로 확인하세요.",
+            f"{seed} 정보를 쉽고 정확하게 안내합니다. 검색 의도에 맞는 핵심만 골라 확인하세요.",
+            f"궁금했던 {seed} 내용을 한곳에 담았습니다. 핵심 요약과 바로 쓰는 정보를 확인하세요.",
+        )
+        text = templates[idx]
+        if keyword:
+            text = f"{keyword} · {text}"
+        return self._clip_seo_description(text, 150)
+
+    def _blog_seo_name(self, blog) -> str:
+        meta = self._blog_meta.get(getattr(blog, "id", "") or "") or {}
+        return str(
+            getattr(blog, "name", "") or meta.get("name") or meta.get("h1") or ""
+        ).strip()
 
     def _pick_random_image(self, folder: str) -> str:
         files = []
@@ -4998,6 +5093,101 @@ class BloggerApp:
             return
         self.log(f"폴더 주소를 복사했습니다: {text}")
 
+    def _copy_naver_id(self, blog_id: str, widget=None) -> None:
+        text = self._naver_id_of(blog_id)
+        if not text:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+        except Exception:
+            self.log("아이디를 복사하지 못했습니다.")
+            return
+        self._show_copy_done(widget)
+
+    def _show_copy_done(self, widget=None) -> None:
+        old = getattr(self, "_copy_toast", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:
+                pass
+        self._copy_toast = None
+        after_id = getattr(self, "_copy_toast_after", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+            self._copy_toast_after = None
+        try:
+            self._hover.suppress(1.4)
+        except Exception:
+            pass
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        outer = tk.Frame(win, bg=COLORS["accent"], padx=1, pady=1)
+        outer.pack()
+        tk.Label(
+            outer,
+            text="복사완료",
+            font=FONTS["body_bold"],
+            fg="#ffffff",
+            bg=COLORS["accent"],
+            padx=14,
+            pady=8,
+        ).pack()
+        win.update_idletasks()
+        x, y = 80, 80
+        if widget is not None:
+            try:
+                if widget.winfo_exists():
+                    x = widget.winfo_rootx()
+                    y = widget.winfo_rooty() + widget.winfo_height() + 6
+            except Exception:
+                pass
+        ww = win.winfo_reqwidth()
+        hh = win.winfo_reqheight()
+        try:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            if x + ww > sw - 12:
+                x = max(8, sw - ww - 12)
+            if y + hh > sh - 40:
+                above = 8
+                if widget is not None:
+                    try:
+                        above = max(8, widget.winfo_rooty() - hh - 6)
+                    except Exception:
+                        pass
+                y = above
+        except Exception:
+            pass
+        win.geometry(f"+{x}+{y}")
+        self._copy_toast = win
+        self._copy_toast_after = self.root.after(1400, self._hide_copy_done)
+
+    def _hide_copy_done(self) -> None:
+        after_id = getattr(self, "_copy_toast_after", None)
+        self._copy_toast_after = None
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        win = getattr(self, "_copy_toast", None)
+        self._copy_toast = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
     def _schedule_memo_refresh(self) -> None:
         self._after_once("memo", 180, self._apply_memo_parts)
 
@@ -5045,21 +5235,18 @@ class BloggerApp:
                     continue
             except Exception:
                 continue
-            indexed = str(getattr(widget, "_fallback_index", "") or "").strip()
-            caption = f"색인 {indexed}" if indexed else ""
-            color = COLORS["success"] if indexed else COLORS["text_muted"]
-            try:
-                widget.configure(text=caption, fg=color)
-            except Exception:
+            blog_id = str(getattr(widget, "_blog_id", "") or "")
+            indexed = self._naver_id_of(blog_id) if blog_id else str(getattr(widget, "_fallback_index", "") or "").strip()
+            widget._fallback_index = indexed
+            inner = getattr(widget, "_id_label", None)
+            if inner is not None:
                 try:
-                    widget.configure(text=caption, text_color=color)
+                    if inner.winfo_exists():
+                        inner.configure(text=indexed)
                 except Exception:
-                    try:
-                        widget.configure(text=caption)
-                    except Exception:
-                        pass
+                    pass
             try:
-                if caption:
+                if indexed:
                     widget.pack(side=tk.LEFT, padx=(8, 0))
                 else:
                     widget.pack_forget()
@@ -5219,6 +5406,10 @@ class BloggerApp:
             self.post_image_var.set(folder)
             self._save_local_settings()
 
+    def on_clear_post_image_folder(self):
+        self.post_image_var.set("")
+        self._save_local_settings()
+
     def on_login(self):
         if self._login_busy:
             return
@@ -5277,8 +5468,7 @@ class BloggerApp:
         self._blogger_signed_out_noted = False
         self._set_login_button("다시 인식", enabled=True)
         self._apply_state(state)
-        names = ", ".join(blog.name or blog.id for blog in state.blogs) or "(없음)"
-        self.log(f"로그인 확인. 계정={state.account or '-'} / 블로그={names}")
+        self.log(f"로그인 확인. 계정={state.account or '-'} / 블로그 {len(state.blogs)}개")
         self.log("목록은 바로 쓰고, 주소와 글은 페이지를 바꾸지 않고 이어서 인식합니다.")
         self._start_watch()
 
@@ -5322,7 +5512,12 @@ class BloggerApp:
         self._merge_blog_meta(state.blogs)
         self._remember_blog_meta(state.blogs)
         self._remember_program_order(state)
-        self._schedule_dashboard()
+        self._dashboard_fp = None
+        self._blog_dirty = True
+        if getattr(self, "_main_tab", "") == "블로그":
+            self._refresh_dashboard()
+        else:
+            self._schedule_dashboard()
 
     def _remember_program_order(self, state: SessionState) -> None:
         """시트 API 'inventory': 로그인 계정의 블로그 목록 순서를 기억해 정렬에 쓴다."""
@@ -5433,22 +5628,56 @@ class BloggerApp:
     def _blog_account_email(self, blog_id: str) -> str:
         return str((self._blog_meta.get(blog_id) or {}).get("google_email") or "").strip().casefold()
 
-    def _blog_belongs_to_login(self, blog_id: str, email: str = "") -> bool:
+    def _saved_account_blogs(self, email: str) -> set[str]:
+        home = self.__dict__.setdefault("_home_state", {})
+        raw = home.get("account_blogs")
+        if not isinstance(raw, dict):
+            return set()
+        items = raw.get((email or "").strip().casefold())
+        if not isinstance(items, list):
+            return set()
+        return {str(item).strip() for item in items if str(item or "").strip().isdigit() and len(str(item).strip()) >= 10}
+
+    def _remember_account_blogs(self, email: str, ids) -> None:
+        key = (email or "").strip().casefold()
+        if not key:
+            return
+        home = self.__dict__.setdefault("_home_state", {})
+        raw = home.setdefault("account_blogs", {})
+        cur = self._saved_account_blogs(key)
+        nxt = set(cur)
+        nxt.update(str(item).strip() for item in ids if str(item or "").strip().isdigit() and len(str(item).strip()) >= 10)
+        if nxt == cur:
+            return
+        raw[key] = sorted(nxt)
+        self._schedule_home_save()
+
+    def _blog_is_other_account(self, blog_id: str, email: str = "") -> bool:
         email = (email or self._logged_google_email() or "").strip().casefold()
         meta_email = self._blog_account_email(blog_id)
-        if meta_email:
-            return (not email) or meta_email == email
-        page_ids = getattr(self.session, "_page_blog_ids", None) or set()
-        return blog_id in page_ids
+        return bool(email and meta_email and meta_email != email)
 
     def _hydrate_session_blogs(self, state: SessionState | None = None) -> None:
-        """이 계정으로 저장된 블로그만 붙인다. 계정 없는 예전 기록은 지금 화면 목록에 넣지 않는다."""
+        """이 계정 블로그는 유지하고, 다른 계정 기록만 뺀다. 글 페이지를 본다고 목록을 지우지 않는다."""
         state = state or self.session.state
         if not state.logged_in:
             return
         gone = getattr(self.session, "_gone_ids", None) or set()
-        email = (state.account or getattr(self, "_shown_account", "") or "").strip().casefold()
-        known = {blog.id: blog for blog in state.blogs}
+        email = (
+            state.account
+            or getattr(self, "_shown_account", "")
+            or self._logged_google_email()
+            or ""
+        ).strip().casefold()
+        page_ids = set(getattr(self.session, "_page_blog_ids", None) or set())
+        known_ids = set(getattr(self.session, "_known_blog_ids", None) or set())
+        saved_ids = self._saved_account_blogs(email) if email else set()
+        own_ids = page_ids | known_ids | saved_ids
+        if email:
+            known_ids.update(saved_ids)
+            known_ids.update(page_ids)
+            self.session._known_blog_ids = known_ids
+        mapped = {blog.id: blog for blog in state.blogs}
         added: list[BlogInfo] = []
         if email:
             for blog_id, meta in (self._blog_meta or {}).items():
@@ -5457,11 +5686,14 @@ class BloggerApp:
                 blog_id = str(blog_id or "").strip()
                 if not blog_id.isdigit() or len(blog_id) < 10:
                     continue
-                if blog_id in known or blog_id in gone:
+                if blog_id in mapped or blog_id in gone:
                     continue
                 if hr.normalize_status(meta.get("confirmed_status") or meta.get("sheet_status")) == "삭제됨":
                     continue
-                if str(meta.get("google_email") or "").strip().casefold() != email:
+                meta_email = str(meta.get("google_email") or "").strip().casefold()
+                if meta_email and meta_email != email:
+                    continue
+                if meta_email != email and blog_id not in own_ids:
                     continue
                 address = str(meta.get("address") or "").strip()
                 name = str(meta.get("name") or meta.get("h1") or address or blog_id[-6:]).strip()
@@ -5471,7 +5703,7 @@ class BloggerApp:
                     address=address,
                     posts=posts_for_address(meta.get("posts") or [], address),
                 )
-                known[blog_id] = blog
+                mapped[blog_id] = blog
                 added.append(blog)
         kept: list[BlogInfo] = []
         seen: set[str] = set()
@@ -5481,10 +5713,14 @@ class BloggerApp:
             meta = self._blog_meta.get(blog.id) or {}
             if hr.normalize_status(meta.get("confirmed_status") or meta.get("sheet_status")) == "삭제됨":
                 continue
-            if email and not self._blog_belongs_to_login(blog.id, email):
+            if self._blog_is_other_account(blog.id, email):
                 continue
             kept.append(blog)
             seen.add(blog.id)
+        if email:
+            keep_ids = page_ids | known_ids | {blog.id for blog in kept if self._blog_account_email(blog.id) == email}
+            keep_ids.update(page_ids)
+            self._remember_account_blogs(email, keep_ids)
         if [blog.id for blog in state.blogs] != [blog.id for blog in kept]:
             state.blogs = kept
             self.session.state.blogs = list(kept)
@@ -5503,7 +5739,7 @@ class BloggerApp:
         for blog in self.session.state.blogs:
             if blog.id in gone:
                 continue
-            if email and not self._blog_belongs_to_login(blog.id, email):
+            if self._blog_is_other_account(blog.id, email):
                 continue
             meta = self._blog_meta.get(blog.id) or {}
             if hr.normalize_status(meta.get("confirmed_status") or meta.get("sheet_status")) == "삭제됨":
@@ -5616,8 +5852,59 @@ class BloggerApp:
     def _naver_id_of(self, blog_id: str) -> str:
         return str((self._blog_meta.get(blog_id) or {}).get("naver_id") or "").strip()
 
+    def _build_naver_id_box(self, parent, blog_id: str):
+        naver_id = self._naver_id_of(blog_id)
+        box = tk.Frame(
+            parent,
+            bg=COLORS["input_bg"],
+            highlightbackground=COLORS["accent"],
+            highlightthickness=1,
+            cursor="hand2",
+        )
+        box._keep_bg = True
+        box._blog_check_hit = True
+        box._blog_id = blog_id
+        box._fallback_index = naver_id
+        lbl = tk.Label(
+            box,
+            text=naver_id,
+            font=FONTS["small_bold"],
+            fg=COLORS["accent"],
+            bg=COLORS["input_bg"],
+            padx=7,
+            pady=2,
+            cursor="hand2",
+        )
+        lbl._keep_bg = True
+        lbl._blog_check_hit = True
+        lbl._blog_id = blog_id
+        lbl.pack()
+        box._id_label = lbl
+
+        def on_click(_event=None, bid=blog_id, target=box):
+            self._copy_naver_id(bid, target)
+            return "break"
+
+        box.bind("<Button-1>", on_click)
+        lbl.bind("<Button-1>", on_click)
+        hint = (
+            (COLORS["text"], "아이디 복사", "body_bold"),
+            (COLORS["text_muted"], "클릭하면 색인 아이디를 복사합니다.", "small"),
+        )
+        self._hover.bind(box, hint)
+        self._hover.bind(lbl, hint)
+        if naver_id:
+            box.pack(side=tk.LEFT, padx=(8, 0))
+        return box
+
+    def _current_search_advisor_id(self) -> str:
+        state = getattr(getattr(self, "naver", None), "state", None)
+        if state is None:
+            return ""
+        return str(getattr(state, "account", "") or "").strip()
+
     def _remember_naver_id(self, blog_id: str, account: str = "") -> None:
-        registered = (account or self._memo_naver_id()).strip()
+        registered = (account or self._current_search_advisor_id()).strip()
         if not blog_id or not registered:
             return
         cur = self._blog_meta.setdefault(blog_id, {})
@@ -5626,6 +5913,11 @@ class BloggerApp:
         cur["naver_id"] = registered
         try:
             self._save_blog_meta()
+        except Exception:
+            pass
+        self._dashboard_fp = None
+        try:
+            self.root.after(0, self._sync_index_labels)
         except Exception:
             pass
 
@@ -5663,12 +5955,15 @@ class BloggerApp:
         if fp == self._dashboard_fp and not rows_missing:
             if tab == "색인 확인":
                 self._refresh_index_tab()
+            if tab == "블로그":
+                self._commit_blog_list_span()
             return
         self._mark_hidden_tabs_dirty()
         if tab == "색인 확인":
             self._refresh_index_tab()
             return
         if tab != "블로그":
+            self._blog_dirty = True
             return
         self._dashboard_fp = fp
         self._blog_dirty = False
@@ -5809,17 +6104,15 @@ class BloggerApp:
         self._blog_pending_rows = pending
         self._vis_key = None
         self._flush_blog_row_batch()
-        self._order_blog_rows()
+        self._fill_missing_blog_rows()
+        packed = self._order_blog_rows()
         self._sync_blog_row_paints()
-        self._commit_blog_list_span()
+        self._finish_blog_list_layout(keep_scroll=keep_scroll, offset=offset, packed=packed)
         self._update_sel_count()
         self._render_blog_detail()
         if getattr(self, "_scroll_blog_id", ""):
             target = str(self._scroll_blog_id or "")
             self.root.after(80, lambda bid=target: self._scroll_to_blog_row(bid))
-        elif keep_scroll:
-            self._restore_blog_scroll(offset)
-            self.root.after_idle(lambda value=offset: self._restore_blog_scroll(value))
 
     def _flush_blog_row_batch(self) -> None:
         parent = getattr(self, "_blog_list_inner", None)
@@ -5838,7 +6131,11 @@ class BloggerApp:
             if blog.id in (self._blog_row_frames or {}) and self._widget_alive(self._blog_row_frames.get(blog.id)):
                 n += 1
                 continue
-            self._render_blog_row(parent, blog, before=self._next_listed_row(blog.id))
+            try:
+                self._render_blog_row(parent, blog, before=self._next_listed_row(blog.id))
+            except Exception as exc:
+                (getattr(self, "_blog_row_sigs", None) or {}).pop(blog.id, None)
+                self.log(f"블로그 줄 그리기 실패: {str(blog.id)[-6:]} · {exc}")
             n += 1
         self._vis_key = None
         self._apply_blog_visibility()
@@ -5879,6 +6176,52 @@ class BloggerApp:
             return False
         return True
 
+    def _fill_missing_blog_rows(self) -> None:
+        parent = getattr(self, "_blog_list_inner", None)
+        listed = getattr(self, "_listed_blogs", None) or []
+        if parent is None or not listed:
+            return
+        frames = getattr(self, "_blog_row_frames", None) or {}
+        missing = [blog for blog in listed if not self._widget_alive(frames.get(blog.id))]
+        if not missing:
+            return
+        pending = list(getattr(self, "_blog_pending_rows", None) or [])
+        seen = {blog.id for blog in pending}
+        for blog in missing:
+            if blog.id not in seen:
+                pending.append(blog)
+        self._blog_pending_rows = pending
+        guard = 0
+        while self._blog_pending_rows:
+            guard += 1
+            if guard > 80:
+                break
+            before = len(self._blog_pending_rows)
+            self._flush_blog_row_batch()
+            if len(self._blog_pending_rows) >= before:
+                break
+
+    def _finish_blog_list_layout(self, keep_scroll: bool, offset: float, packed: int) -> None:
+        listed = len(getattr(self, "_listed_blogs", None) or [])
+        pending = len(getattr(self, "_blog_pending_rows", None) or [])
+        query = (self.blog_query.get() or "").strip() if hasattr(self, "blog_query") else ""
+        filtered = bool(query) or getattr(self, "_blog_filter", "all") != "all"
+        if packed != listed or listed <= 1 or packed <= 1:
+            self.log(f"블로그 목록 그림: 표시 {packed} / 대상 {listed} / 대기 {pending}")
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        self._commit_blog_list_span()
+        if pending:
+            return
+        if listed > 1 and packed <= 1 and not filtered:
+            keep_scroll = False
+        if keep_scroll and offset > 0:
+            self._restore_blog_scroll(self._clamped_blog_scroll(offset))
+        else:
+            self._restore_blog_scroll(0.0)
+
     def _commit_blog_list_span(self) -> None:
         widget = getattr(self, "blog_list", None)
         if widget is None or not hasattr(widget, "_commit_span"):
@@ -5892,6 +6235,22 @@ class BloggerApp:
         widget = getattr(self, "blog_list", None)
         try:
             return float(getattr(widget, "_offset", 0) or 0)
+        except Exception:
+            return 0.0
+
+    def _clamped_blog_scroll(self, offset: float) -> float:
+        widget = getattr(self, "blog_list", None)
+        if widget is None:
+            return 0.0
+        try:
+            widget._commit_span()
+            content = float(getattr(widget, "_content", 1) or 1)
+            view = float(getattr(widget, "_view", 1) or 1)
+            max_off = max(0.0, content - view)
+            value = min(max(0.0, float(offset or 0)), max_off)
+            if value > 0 and content <= view + 8:
+                return 0.0
+            return value
         except Exception:
             return 0.0
 
@@ -5930,7 +6289,7 @@ class BloggerApp:
             blog._search_text = getattr(blog, "_search_text", None) or self._blog_search_text(blog)
             if self._blog_row_matches(blog, query):
                 try:
-                    row.pack(fill=tk.X, pady=3, padx=2)
+                    row.pack(side=tk.TOP, anchor="nw", fill=tk.X, pady=3, padx=2)
                 except Exception:
                     pass
                 shown += 1
@@ -5953,12 +6312,15 @@ class BloggerApp:
         self._vis_key = key
         shown = self._order_blog_rows()
         empty = getattr(self, "_blog_filter_empty", None)
+        self._commit_blog_list_span()
         if shown or getattr(self, "_blog_pending_rows", None):
             if empty is not None:
                 try:
                     empty.pack_forget()
                 except Exception:
                     pass
+            if not getattr(self, "_blog_pending_rows", None):
+                self._restore_blog_scroll(0.0)
             return
         parent = getattr(self, "_blog_list_inner", None)
         if parent is None:
@@ -6321,26 +6683,15 @@ class BloggerApp:
         index_chip = tk_pill(bottom, status, tone, padx=6, pady=1)
         index_chip.pack(side=tk.LEFT, padx=(8, 0))
         self._bind_row_focus(index_chip, blog.id)
+        naver_box = self._build_naver_id_box(bottom, blog.id)
+        self._index_labels.append(naver_box)
+        row._naver_lbl = naver_box
         extra_chip = tk.Label(bottom, text=extra, font=FONTS["small"], fg=COLORS["text_muted"], bg=bg)
         if extra:
             extra_chip.pack(side=tk.LEFT, padx=(4, 0))
         self._bind_row_focus(extra_chip, blog.id)
         row._index_status_pill = index_chip
         row._index_extra_label = extra_chip
-        stored = self._naver_id_of(blog.id)
-        collected = "collect" in blog.done or "collect_post" in blog.done
-        indexed = stored if collected and stored else ""
-        caption = f"색인 {indexed}" if indexed else ""
-        naver_lbl = tk.Label(
-            bottom, text=caption, font=FONTS["small"],
-            fg=COLORS["success"] if indexed else COLORS["text_muted"], bg=bg,
-        )
-        naver_lbl._fallback_index = indexed
-        self._bind_row_focus(naver_lbl, blog.id)
-        if caption:
-            naver_lbl.pack(side=tk.LEFT, padx=(8, 0))
-        self._index_labels.append(naver_lbl)
-        row._naver_lbl = naver_lbl
         post_count = len(blog.posts)
         if post_count:
             post_text, post_tone = f"글 {post_count}", "ok" if "collect_post" in blog.done else "wait"
@@ -7275,15 +7626,12 @@ class BloggerApp:
 
     def _ask_html_code_name(self, title: str, heading: str, initial: str, taken: set[str]) -> str | None:
         outcome: dict[str, str | None] = {"value": None}
-        win = ctk.CTkToplevel(self.root) if ctk else tk.Toplevel(self.root)
+        win = tk.Toplevel(self.root)
         win.title(title)
         win.withdraw()
         win.transient(self.root)
         win.resizable(False, False)
-        if ctk:
-            win.configure(fg_color=COLORS["card"])
-        else:
-            win.configure(bg=COLORS["card"])
+        win.configure(bg=COLORS["card"])
         body = frame(win, COLORS["card"])
         body.pack(fill=tk.BOTH, expand=True, padx=18, pady=16)
         label(body, heading, "heading", COLORS["text"]).pack(anchor="w")
@@ -7291,14 +7639,12 @@ class BloggerApp:
             anchor="w", pady=(4, 10)
         )
         var = tk.StringVar(value=initial)
-        if ctk:
-            entry = ctk.CTkEntry(
-                body, textvariable=var, width=360, height=36, font=FONTS["body"],
-                fg_color=COLORS["input_bg"], border_color=COLORS["border"], text_color=COLORS["text"],
-            )
-        else:
-            entry = tk.Entry(body, textvariable=var, width=36, font=FONTS["body"])
-        entry.pack(anchor="w")
+        entry = tk.Entry(
+            body, textvariable=var, width=36, font=FONTS["body"],
+            bg=COLORS["input_bg"], fg=COLORS["text"], relief="flat",
+            highlightthickness=1, highlightbackground=COLORS["border"],
+        )
+        entry.pack(anchor="w", ipady=6)
         error = label(body, "", "small", COLORS["danger"])
         error.pack(anchor="w", pady=(6, 0))
         actions = frame(body, COLORS["card"])
@@ -7334,8 +7680,10 @@ class BloggerApp:
         try:
             win.deiconify()
             win.lift()
+            win.attributes("-topmost", True)
             win.grab_set()
             win.focus_force()
+            win.after(250, lambda: win.attributes("-topmost", False))
         except Exception:
             pass
         try:
@@ -7443,6 +7791,25 @@ class BloggerApp:
             used.add(item["name"])
         return codes
 
+    def _bind_html_editor(self) -> None:
+        widget = getattr(self, "theme_html", None)
+        if not self._widget_alive(widget):
+            return
+        target = getattr(widget, "_textbox", widget)
+
+        def on_modified(_event=None, box=target):
+            try:
+                if box.edit_modified():
+                    box.edit_modified(False)
+            except Exception:
+                pass
+            self._flush_html_editor()
+
+        try:
+            target.bind("<<Modified>>", on_modified, add="+")
+        except Exception:
+            pass
+
     def _flush_html_editor(self) -> None:
         codes = getattr(self, "_html_codes", None)
         widget = getattr(self, "theme_html", None)
@@ -7477,6 +7844,7 @@ class BloggerApp:
         host = getattr(widget, "inner", widget)
         for child in list(host.winfo_children()):
             child.destroy()
+        self._html_code_tabs = []
         current = int(getattr(self, "_html_code_index", 0) or 0)
         for index, item in enumerate(getattr(self, "_html_codes", []) or []):
             name = str(item.get("name") or f"{index + 1}코드")
@@ -7488,8 +7856,45 @@ class BloggerApp:
                 height=32,
                 command=lambda pick=index: self._on_html_code_tab(pick),
             )
-            tab.pack(side=tk.LEFT, padx=(0, 6), pady=4)
+            self._html_code_tabs.append(tab)
             self._bind_html_tab_double(tab, index)
+        self._html_tabs_width = 0
+        self._layout_html_code_tabs()
+
+    def _layout_html_code_tabs(self) -> None:
+        host = getattr(self, "html_code_list", None)
+        if not self._widget_alive(host):
+            return
+        width = host.winfo_width()
+        if width < 80:
+            try:
+                host.update_idletasks()
+                width = host.winfo_width()
+            except Exception:
+                width = 0
+        if width < 80:
+            return
+        x = 0
+        y = 0
+        row_h = 0
+        for tab in list(getattr(self, "_html_code_tabs", None) or []):
+            if not self._widget_alive(tab):
+                continue
+            try:
+                req_w = int(tab.cget("width") or 88)
+                req_h = int(tab.cget("height") or 32)
+            except Exception:
+                req_w, req_h = 88, 32
+            if x and x + req_w > width:
+                x = 0
+                y += row_h + 6
+                row_h = 0
+            tab.place(x=x, y=y)
+            x += req_w + 6
+            row_h = max(row_h, req_h)
+        total = max(40, y + max(row_h, 32) + 2)
+        if abs(host.winfo_height() - total) > 2:
+            host.configure(height=total)
 
     def _apply_html_codes(self, raw, index, fallback_html: str = "") -> None:
         self._html_codes = self._normalize_html_codes(raw, fallback_html)
@@ -7541,22 +7946,32 @@ class BloggerApp:
         self._load_html_editor()
 
     def on_add_html_code(self) -> None:
-        self._flush_html_editor()
-        if not isinstance(getattr(self, "_html_codes", None), list):
-            self._html_codes = []
-        taken = {str(item.get("name") or "") for item in self._html_codes}
-        name = self._ask_html_code_name("코드 추가", "새 코드 탭 이름", "", taken)
-        if not name:
-            return
-        self._html_codes.append({"name": name, "html": ""})
-        self._html_code_index = len(self._html_codes) - 1
-        self._render_html_code_buttons()
-        self._load_html_editor()
-        self.log(f"HTML 코드를 추가했습니다: {name}")
         try:
-            self._save_local_settings()
-        except Exception:
-            pass
+            self._flush_html_editor()
+            if not isinstance(getattr(self, "_html_codes", None), list):
+                self._html_codes = []
+            taken = {str(item.get("name") or "") for item in self._html_codes}
+            suggested = self._next_html_code_name(taken)
+            try:
+                name = self._ask_html_code_name("코드 추가", "새 코드 탭 이름", suggested, taken)
+            except Exception as exc:
+                self.log(f"코드 이름 창을 열지 못해 기본 이름으로 추가합니다: {_exc_text(exc)}")
+                name = suggested
+            if not name:
+                return
+            self._html_codes.append({"name": name, "html": ""})
+            self._html_code_index = len(self._html_codes) - 1
+            self._render_html_code_buttons()
+            self._load_html_editor()
+            self.log(f"HTML 코드를 추가했습니다: {name}")
+            try:
+                self._save_local_settings()
+            except Exception:
+                pass
+        except Exception as exc:
+            detail = _exc_text(exc)
+            self.log(f"HTML 코드를 추가하지 못했습니다: {detail}")
+            messagebox.showerror("HTML 편집", f"코드를 추가하지 못했습니다.\n{detail}")
 
     def on_rename_html_code(self, index: int) -> None:
         self._flush_html_editor()
@@ -7834,8 +8249,7 @@ class BloggerApp:
                 name = blog.name if blog else blog_id
                 prefix = f"{index}/{len(plan)} · " if len(plan) > 1 else ""
                 self.log(f"네이버 최초 수집 시작: {name} · {address} · 글 {len(posts)}개")
-                self.naver.read_account()
-                self._remember_naver_id(blog_id)
+                self._remember_naver_id(blog_id, self.naver.read_account())
                 self.session.control = self._run_control
                 try:
                     result = self.naver.apply_first_collect(
@@ -7896,8 +8310,7 @@ class BloggerApp:
                 self._run_control.checkpoint()
                 prefix = f"{index}/{len(jobs)} · " if len(jobs) > 1 else ""
                 self.log(f"{title}: {address}")
-                self.naver.read_account()
-                self._remember_naver_id(blog_id)
+                self._remember_naver_id(blog_id, self.naver.read_account())
                 self.naver.control = self._run_control
                 self.naver._on_progress = self._offset_progress(index - 1, len(jobs), prefix)
                 self.naver._on_item_done = self._on_item_done
@@ -7936,8 +8349,7 @@ class BloggerApp:
                 self._run_control.checkpoint()
                 prefix = f"{index}/{len(jobs)} · " if len(jobs) > 1 else ""
                 self.log(f"{title} {len(posts)}개 · {address}")
-                self.naver.read_account()
-                self._remember_naver_id(blog_id)
+                self._remember_naver_id(blog_id, self.naver.read_account())
                 self.naver.control = self._run_control
                 self.naver._on_progress = self._offset_progress(offset, grand, prefix)
                 self.naver._on_item_done = self._on_item_done
@@ -7986,8 +8398,7 @@ class BloggerApp:
         try:
             self._run_control.checkpoint()
             self.log(f"{title}: {url}")
-            self.naver.read_account()
-            self._remember_naver_id(blog_id)
+            self._remember_naver_id(blog_id, self.naver.read_account())
             self.naver.control = self._run_control
             self.naver._on_progress = lambda step, total, text: self._on_settings_progress(step, 1, f"{title} {text}")
             self.naver._on_item_done = self._on_item_done
@@ -8122,15 +8533,20 @@ class BloggerApp:
         jobs = []
         for blog in blogs:
             description = random.choice(lines) if lines else ""
+            meta = self._blog_meta.get(blog.id) or {}
+            keyword = str(meta.get("keyword") or meta.get("exposed_keyword") or "").strip()
+            search_desc = self._seo_search_description(self._blog_seo_name(blog), keyword, blog.id)
             favicon_path = ""
             if folder:
                 try:
                     favicon_path = self._pick_random_image(folder)
                 except Exception:
                     favicon_path = ""
-            jobs.append((blog.id, description, favicon_path))
+            jobs.append((blog.id, description, search_desc, favicon_path))
             if description:
-                self.log(f"구글,네이버 디스크립션 랜덤 선택: {blog.name or blog.id} · {description}")
+                self.log(f"구글,네이버 디스크립션 랜덤 선택: {blog.name or blog.id}")
+            if search_desc:
+                self.log("검색 설명을 블로그 이름에 맞춰 만들었습니다.")
             if favicon_path:
                 self.log(f"파비콘 랜덤 선택: {blog.name or blog.id} · {os.path.basename(favicon_path)}")
         if jobs and jobs[0][1]:
@@ -8155,11 +8571,11 @@ class BloggerApp:
             daemon=True,
         ).start()
 
-    def _settings_worker(self, jobs: list[tuple[str, str, str]]):
+    def _settings_worker(self, jobs: list[tuple[str, str, str, str]]):
         warnings: list[str] = []
         grand = 8 * len(jobs)
         try:
-            for index, (blog_id, description, favicon_path) in enumerate(jobs, 1):
+            for index, (blog_id, description, search_desc, favicon_path) in enumerate(jobs, 1):
                 self._run_control.checkpoint()
                 blog = next((item for item in self.session.state.blogs if item.id == blog_id), None)
                 name = blog.name if blog else blog_id
@@ -8173,6 +8589,7 @@ class BloggerApp:
                         control=self._run_control,
                         on_progress=self._offset_progress((index - 1) * 8, grand, prefix),
                         on_item_done=self._on_item_done,
+                        search_description=search_desc,
                     )
                     if address and blog:
                         blog.address = address
@@ -8199,7 +8616,7 @@ class BloggerApp:
             self.root.after(0, lambda m=detail: messagebox.showerror("설정 적용", m))
         finally:
             self.root.after(0, self._settings_done)
-            self._queue_sheet_sync([blog_id for blog_id, _description, _favicon in jobs], "설정 적용")
+            self._queue_sheet_sync([blog_id for blog_id, _description, _search, _favicon in jobs], "설정 적용")
 
     def _on_settings_progress(self, step: int, total: int, label_text: str) -> None:
         self.root.after(0, lambda: self._set_progress(step, total, label_text))
@@ -8518,6 +8935,178 @@ class BloggerApp:
                 parts.append("<p><br></p>")
         return "\n".join(parts)
 
+    def _plain_from_html(self, chunk: str) -> str:
+        text = re.sub(r"<br\s*/?>", " ", chunk or "", flags=re.I)
+        text = re.sub(r"</p\s*>", " ", text, flags=re.I)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = html.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _split_manuscript_h1(self, body: str) -> tuple[str, str]:
+        html_body = body or ""
+        match = re.search(r"<h1\b[^>]*>(.*?)</h1>", html_body, flags=re.I | re.S)
+        if not match:
+            return "", html_body
+        title = self._plain_from_html(match.group(1))
+        if not title:
+            return "", html_body
+        stripped = (html_body[:match.start()] + html_body[match.end():]).strip()
+        return title, stripped
+
+    def _manuscript_plain_body(self, html_body: str) -> str:
+        raw = re.sub(r"<h1\b[^>]*>.*?</h1>", " ", html_body or "", flags=re.I | re.S)
+        raw = re.sub(r"<script\b[^>]*>.*?</script>", " ", raw, flags=re.I | re.S)
+        raw = re.sub(r"<style\b[^>]*>.*?</style>", " ", raw, flags=re.I | re.S)
+        return self._plain_from_html(raw)
+
+    def _manuscript_rep_keyword(self, title: str, html_body: str) -> str:
+        title = re.sub(r"\s+", " ", (title or "")).strip()
+        if not title:
+            return ""
+        head = re.split(r"\s*[:：\-–—·|/]\s*", title, maxsplit=1)[0].strip()
+        if len(head) > 22:
+            if " " in head[:22]:
+                head = head[:22].rsplit(" ", 1)[0].strip()
+            else:
+                head = head[:22].strip()
+        body = self._manuscript_plain_body(html_body)
+        if body and head:
+            for size in range(len(head), 3, -1):
+                piece = head[:size].strip()
+                if len(piece) < 4:
+                    break
+                if body.count(piece) >= 2:
+                    return piece
+        return head or title[:22]
+
+    def _fit_search_description_150(self, text: str, keyword: str = "") -> str:
+        text = re.sub(r"\s+", " ", (text or "")).strip()
+        if not text:
+            return ""
+        if len(text) > 150:
+            return text[:150]
+        pads = [
+            f" {keyword} 검색 의도에 맞춰 중요한 내용만 쉽고 정확하게 안내합니다." if keyword else " 검색 의도에 맞춰 중요한 내용만 쉽고 정확하게 안내합니다.",
+            " 지금 바로 확인할 핵심과 주의할 점을 함께 담았습니다.",
+            " 처음 보는 분도 바로 이해하고 활용할 수 있게 정리했습니다.",
+        ]
+        used_keyword = text.count(keyword) if keyword else 0
+        idx = 0
+        while len(text) < 150:
+            piece = pads[idx % len(pads)]
+            idx += 1
+            if keyword and keyword in piece and used_keyword >= 2:
+                piece = " 핵심 정보와 실전 팁을 한눈에 확인할 수 있습니다."
+            need = 150 - len(text)
+            take = piece[:need]
+            text += take
+            if keyword and keyword in take:
+                used_keyword += take.count(keyword)
+        return text[:150]
+
+    def _manuscript_search_description(self, title: str, html_body: str) -> str:
+        title = re.sub(r"\s+", " ", (title or "")).strip()
+        keyword = self._manuscript_rep_keyword(title, html_body)
+        body = self._manuscript_plain_body(html_body)
+        rest = body
+        for prefix in (title, keyword):
+            if prefix and rest.startswith(prefix):
+                rest = rest[len(prefix):].lstrip(" .,·-|/")
+        rest = re.sub(r"\s+", " ", rest).strip()
+        substance = rest[:110].strip()
+        cut_at = -1
+        for mark in ("다.", "요.", "다 ", "요 ", ". "):
+            idx = substance.find(mark)
+            if 20 <= idx <= 100:
+                cut_at = idx + (2 if mark.endswith(".") else 1)
+                break
+        if cut_at > 0:
+            substance = substance[:cut_at].strip()
+        elif len(rest) > 110 and " " in substance:
+            substance = substance.rsplit(" ", 1)[0].strip()
+        eun = self._seo_josa(keyword, "은", "는")
+        if not substance:
+            if keyword:
+                substance = f"{keyword}{eun} 핵심 정보와 실전 포인트를 한곳에 정리한 글입니다."
+            else:
+                substance = "핵심 정보와 실전 포인트를 한곳에 정리한 글입니다."
+        if keyword:
+            if substance.startswith(keyword):
+                text = substance
+            else:
+                text = f"{keyword} {substance}".strip()
+        else:
+            text = substance
+        if keyword and not text.startswith(keyword):
+            text = f"{keyword} {text}".strip()
+        return self._fit_search_description_150(text, keyword)
+
+    def _clean_post_label(self, text: str) -> str:
+        text = re.sub(r"[\s,，]+", " ", (text or "")).strip()
+        text = re.sub(r"[\"'`“”‘’\[\]()<>]", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > 18:
+            text = text[:18].rsplit(" ", 1)[0].strip() if " " in text[:18] else text[:18]
+        if len(text) < 2:
+            return ""
+        stop = {
+            "그리고", "그러나", "하지만", "또는", "및", "등", "것", "수", "때", "곳",
+            "위해", "위한", "대한", "관련", "있는", "없는", "하는", "되는", "되어",
+            "있습니다", "합니다", "입니다", "하세요", "이번", "오늘", "바로", "가장",
+            "많이", "좋은", "쉽게", "함께", "내용", "정보", "정리", "소개", "방법",
+            "통해", "대해", "여기서", "그래서", "또한", "이것", "그것", "확인",
+            "포인트", "핵심", "가이드", "한곳", "한눈에", "실전", "검색", "의도",
+        }
+        if text in stop or text.casefold() in stop:
+            return ""
+        return text
+
+    def _label_dup(self, a: str, b: str) -> bool:
+        x = re.sub(r"\s+", "", a or "").casefold()
+        y = re.sub(r"\s+", "", b or "").casefold()
+        if not x or not y:
+            return True
+        return x == y or x in y or y in x
+
+    def _manuscript_labels(self, title: str, html_body: str) -> list[str]:
+        labels: list[str] = []
+
+        def add(item: str) -> None:
+            item = self._clean_post_label(item)
+            if not item:
+                return
+            if any(self._label_dup(item, old) for old in labels):
+                return
+            labels.append(item)
+
+        add(self._manuscript_rep_keyword(title, html_body) or title)
+        for raw in re.findall(r"<h[2-3]\b[^>]*>(.*?)</h[2-3]>", html_body or "", flags=re.I | re.S):
+            if len(labels) >= 4:
+                break
+            add(self._plain_from_html(raw))
+        for raw in re.findall(r"<(?:strong|b)\b[^>]*>(.*?)</(?:strong|b)>", html_body or "", flags=re.I | re.S):
+            if len(labels) >= 4:
+                break
+            add(self._plain_from_html(raw))
+        body = self._manuscript_plain_body(html_body)
+        counts: dict[str, int] = {}
+        for tok in re.findall(r"[가-힣A-Za-z0-9]{2,16}", body):
+            if tok.isdigit():
+                continue
+            counts[tok] = counts.get(tok, 0) + 1
+        ranked = sorted(counts.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True)
+        for tok, n in ranked:
+            if len(labels) >= 4:
+                break
+            if n < 2 and len(labels) >= 2:
+                continue
+            add(tok)
+        for tok in re.findall(r"[가-힣A-Za-z0-9]{2,16}", title or ""):
+            if len(labels) >= 4:
+                break
+            add(tok)
+        return labels[:4]
+
     def _move_manuscript_to_success(self, path: str, folder: str) -> str:
         dest_dir = os.path.join(folder, "성공")
         os.makedirs(dest_dir, exist_ok=True)
@@ -8727,14 +9316,21 @@ class BloggerApp:
             self.session.control = self._run_control
             for index, (blog, path, folder) in enumerate(jobs, start=1):
                 self._run_control.checkpoint()
-                title = os.path.splitext(os.path.basename(path))[0].strip() or "제목 없음"
                 body = self._manuscript_html(self._read_manuscript(path))
+                h1_title, body = self._split_manuscript_h1(body)
+                title = h1_title or os.path.splitext(os.path.basename(path))[0].strip() or "제목 없음"
+                search_desc = self._manuscript_search_description(title, body)
+                labels = self._manuscript_labels(title, body)
                 image_path = self._pick_random_image(image_folder) if image_folder else ""
                 name = blog.name or blog.id
                 self.root.after(0, lambda i=index, t=total, n=name: self._set_progress(i - 1, t, f"글 작성: {n}"))
                 image_note = os.path.basename(image_path) if image_path else "없음"
                 self.log(f"글 작성 {index}/{total}: [{name}] {title} · 이미지 {image_note}")
-                post_url = self.session.publish_manuscript(blog.id, title, body, image_path)
+                post_url = self.session.publish_manuscript(
+                    blog.id, title, body, image_path,
+                    search_description=search_desc,
+                    labels=labels,
+                )
                 if not post_url:
                     raise RuntimeError(f"{name}: 게시는 시도했지만 글 주소를 찾지 못했습니다. 원고는 그대로 둡니다.")
                 self._append_work_event(blog.id, "글 작성")
@@ -8794,8 +9390,12 @@ class BloggerApp:
                 return
             blogger_up = self.session.driver is not None and self.session.chrome_running()
             if self.session.driver is not None and not blogger_up:
-                self.root.after(0, self._on_browser_closed)
+                hits = int(getattr(self, "_blogger_down_hits", 0) or 0) + 1
+                self._blogger_down_hits = hits
+                if hits >= 3:
+                    self.root.after(0, self._on_browser_closed)
                 return
+            self._blogger_down_hits = 0
             naver_should_probe = self.naver.driver is not None or bool(getattr(self.naver.state, "logged_in", False))
             if naver_should_probe:
                 naver_up = self.naver.chrome_running()
@@ -9068,6 +9668,10 @@ class BloggerApp:
     def _destroy_ui(self) -> None:
         try:
             self._hover.hide()
+        except Exception:
+            pass
+        try:
+            self._hide_copy_done()
         except Exception:
             pass
         try:
