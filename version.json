@@ -1,9 +1,12 @@
 {
     "version":  "1.2.19",
-    "url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.19/BloggerSpot.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/632468687",
     "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.19/BloggerSpot.zip",
     "notes":  "블로그 목록이 한 개로 줄거나 다른 계정 글이 섞이던 문제, 더블클릭 시 다른 블로그가 열리던 문제를 고침",
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/632468687",
+    "asset_id":  632468687,
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/632468687",
                           "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.19/BloggerSpot.zip",
                           "https://github.com/lee3215-ko/blogspot-app/releases/latest/download/BloggerSpot.zip"
                       ]
