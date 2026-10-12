@@ -137,23 +137,58 @@ class ScrollFrame(tk.Frame):
         except Exception:
             pass
 
-    def _measure_content(self) -> int:
+    def _child_req(self, child, horizontal: bool) -> int:
         try:
-            if self.orientation == "horizontal":
-                value = max(1, int(self.inner.winfo_reqwidth() or 1))
-            else:
-                value = max(1, int(self.inner.winfo_reqheight() or 1))
+            return int((child.winfo_reqwidth() if horizontal else child.winfo_reqheight()) or 0)
         except tk.TclError:
-            value = self._content
+            return 0
+
+    def _kids_span(self) -> int:
+        """place된 inner는 reqheight가 1로 남는 경우가 있어, 자식 크기로 잰다."""
+        try:
+            kids = list(self.inner.winfo_children())
+        except tk.TclError:
+            return 1
+        if not kids:
+            return 1
+        horizontal = self.orientation == "horizontal"
+        if not horizontal and len(kids) == 1:
+            try:
+                grand = list(kids[0].winfo_children())
+            except tk.TclError:
+                grand = []
+            if grand:
+                kids = grand
+        span = 1
+        for child in kids:
+            span += self._child_req(child, horizontal)
+        bottom = 1
+        for child in kids:
+            try:
+                req = self._child_req(child, horizontal)
+                if horizontal:
+                    edge = int(child.winfo_x()) + max(int(child.winfo_width() or 0), req)
+                else:
+                    edge = int(child.winfo_y()) + max(int(child.winfo_height() or 0), req)
+                if edge > bottom:
+                    bottom = edge
+            except tk.TclError:
+                pass
+        return max(1, span, bottom)
+
+    def _measure_content(self) -> int:
+        value = self._kids_span()
         self._content = value
         return value
 
     def _place_offset(self) -> None:
         try:
+            span = max(1, int(self._span))
+            box = max(int(self._content), int(self._view), 1)
             if self.orientation == "horizontal":
-                self.inner.place_configure(x=int(-self._offset))
+                self.inner.place_configure(x=int(-self._offset), height=span, width=box)
             else:
-                self.inner.place_configure(y=int(-self._offset))
+                self.inner.place_configure(y=int(-self._offset), width=span, height=box)
         except tk.TclError:
             pass
 
@@ -188,11 +223,9 @@ class ScrollFrame(tk.Frame):
             if self.orientation == "horizontal":
                 span = max(1, int(self._host.winfo_height() or 1))
                 view = max(1, int(self._host.winfo_width() or 1))
-                self.inner.place_configure(height=span)
             else:
                 span = max(1, int(self._host.winfo_width() or 1))
                 view = max(1, int(self._host.winfo_height() or 1))
-                self.inner.place_configure(width=span)
         except tk.TclError:
             return
         self._span = span

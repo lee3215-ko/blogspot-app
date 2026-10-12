@@ -947,6 +947,7 @@ class BloggerSession:
         self._chrome_proc: subprocess.Popen | None = None
         self._chrome_user_dir: str | None = None
         self._gone_ids: set[str] = set()
+        self._page_blog_ids: set[str] = set()
 
     def profile_dir(self) -> str:
         path = os.path.join(get_data_dir(), "chrome-blogger-session")
@@ -1141,7 +1142,9 @@ class BloggerSession:
                 self._lock.release()
             except RuntimeError:
                 pass
-        previous = {blog.id: blog for blog in self.state.blogs}
+        previous_list = list(self.state.blogs)
+        previous = {blog.id: blog for blog in previous_list}
+        previous_account = str(self.state.account or "").strip()
         gone = getattr(self, "_gone_ids", None)
         if gone is None:
             self._gone_ids = set()
@@ -1196,11 +1199,31 @@ class BloggerSession:
             )
             blog.posts_live = posts_live
             blogs.append(blog)
-        if not blogs and previous and not fresh:
-            blogs = [blog for blog in previous.values() if blog.id not in gone]
+        self._page_blog_ids = set(seen)
+        if not blogs and previous_list:
+            blogs = [blog for blog in previous_list if blog.id not in gone]
+        new_account = str((raw or {}).get("account") or "").strip()
+        account_changed = bool(
+            previous_account and new_account and previous_account.casefold() != new_account.casefold()
+        )
+        # 글/설정 페이지는 드롭다운이 닫혀 블로그 1개만 읽힌다. 이미 가진 목록을 그 한 개로 덮지 않는다.
+        if previous_list and not account_changed:
+            found = {blog.id: blog for blog in blogs}
+            merged = []
+            kept = set()
+            for old in previous_list:
+                if old.id in gone:
+                    continue
+                merged.append(found.get(old.id) or old)
+                kept.add(old.id)
+            for blog in blogs:
+                if blog.id in gone or blog.id in kept:
+                    continue
+                merged.append(blog)
+            blogs = merged
         blogs = [blog for blog in blogs if blog.id not in gone]
         state = SessionState(
-            account=str((raw or {}).get("account") or ""),
+            account=new_account or previous_account,
             blogs=blogs,
             url=str((raw or {}).get("url") or ""),
             title=str((raw or {}).get("title") or ""),
@@ -1231,24 +1254,56 @@ class BloggerSession:
         self.read_published_post(blog_id)
 
     def posts_page_url(self, blog_id: str) -> str:
+        blog_id = str(blog_id or "").strip()
         url = self._blogger_page("posts", blog_id)
         if "/u/" not in url:
-            url = f"https://www.blogger.com/u/1/blog/posts/{blog_id}"
+            url = f"https://www.blogger.com/blog/posts/{blog_id}"
         if "hl=" not in url:
-            url += "?hl=ko"
+            url += ("&" if "?" in url else "?") + "hl=ko"
         return url
 
     def open_posts_in_new_tab(self, blog_id: str) -> str:
+        blog_id = str(blog_id or "").strip()
         if not self.is_alive():
             raise RuntimeError("블로그스팟 Chrome이 연결되어 있지 않습니다. 먼저 로그인해 주세요.")
+        if not _BLOG_ID_RE.match(blog_id):
+            raise RuntimeError("열 블로그 아이디가 없습니다.")
         url = self.posts_page_url(blog_id)
         with self._lock:
             self._focus_open_window()
+            before = list(self.driver.window_handles)
             try:
                 self.driver.execute_cdp_cmd("Target.createTarget", {"url": url})
             except Exception:
                 self.driver.execute_script("window.open(arguments[0], '_blank');", url)
-        return url
+            try:
+                WebDriverWait(self.driver, 5).until(lambda d: len(d.window_handles) > len(before))
+            except Exception:
+                pass
+            after = list(self.driver.window_handles)
+            new_handles = [handle for handle in after if handle not in before]
+            target = new_handles[-1] if new_handles else (after[-1] if after else None)
+            if target:
+                try:
+                    self.driver.switch_to.window(target)
+                except Exception:
+                    pass
+            current = ""
+            try:
+                current = self.driver.current_url or ""
+            except Exception:
+                current = ""
+            if blog_id not in current:
+                self.driver.get(url)
+            try:
+                WebDriverWait(self.driver, 8).until(lambda d: blog_id in (d.current_url or ""))
+            except Exception:
+                if blog_id not in (self.driver.current_url or ""):
+                    self.driver.get(url)
+            try:
+                return self.driver.current_url or url
+            except Exception:
+                return url
 
     def click_new_post(self) -> None:
         if not self.is_alive():

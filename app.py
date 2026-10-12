@@ -4731,12 +4731,17 @@ class BloggerApp:
     def _remember_blog_meta(self, blogs: list[BlogInfo]) -> None:
         changed = False
         gone = self._gone_id_set()
+        page_ids = getattr(self.session, "_page_blog_ids", None) or set()
+        email = str(self._logged_google_email() or "").strip()
         for blog in blogs:
             if blog.id in gone:
                 continue
             cur = self._blog_meta.setdefault(blog.id, {})
             if blog.name and cur.get("name") != blog.name:
                 cur["name"] = blog.name
+                changed = True
+            if email and blog.id in page_ids and str(cur.get("google_email") or "").strip().casefold() != email.casefold():
+                cur["google_email"] = email
                 changed = True
             if blog.address:
                 old_address = str(cur.get("address") or "").strip()
@@ -5305,6 +5310,8 @@ class BloggerApp:
         if state.logged_in:
             if account:
                 self._shown_account = account
+            self._hydrate_session_blogs(state)
+            state = self.session.state
             count = len(state.blogs)
             self._set_status(f"로그인됨 · 이 계정 블로그 {count}개", COLORS["success"])
         else:
@@ -5423,13 +5430,80 @@ class BloggerApp:
                     fg="#ffffff" if active else COLORS["text"],
                 )
 
+    def _blog_account_email(self, blog_id: str) -> str:
+        return str((self._blog_meta.get(blog_id) or {}).get("google_email") or "").strip().casefold()
+
+    def _blog_belongs_to_login(self, blog_id: str, email: str = "") -> bool:
+        email = (email or self._logged_google_email() or "").strip().casefold()
+        meta_email = self._blog_account_email(blog_id)
+        if meta_email:
+            return (not email) or meta_email == email
+        page_ids = getattr(self.session, "_page_blog_ids", None) or set()
+        return blog_id in page_ids
+
+    def _hydrate_session_blogs(self, state: SessionState | None = None) -> None:
+        """이 계정으로 저장된 블로그만 붙인다. 계정 없는 예전 기록은 지금 화면 목록에 넣지 않는다."""
+        state = state or self.session.state
+        if not state.logged_in:
+            return
+        gone = getattr(self.session, "_gone_ids", None) or set()
+        email = (state.account or getattr(self, "_shown_account", "") or "").strip().casefold()
+        known = {blog.id: blog for blog in state.blogs}
+        added: list[BlogInfo] = []
+        if email:
+            for blog_id, meta in (self._blog_meta or {}).items():
+                if not isinstance(meta, dict):
+                    continue
+                blog_id = str(blog_id or "").strip()
+                if not blog_id.isdigit() or len(blog_id) < 10:
+                    continue
+                if blog_id in known or blog_id in gone:
+                    continue
+                if hr.normalize_status(meta.get("confirmed_status") or meta.get("sheet_status")) == "삭제됨":
+                    continue
+                if str(meta.get("google_email") or "").strip().casefold() != email:
+                    continue
+                address = str(meta.get("address") or "").strip()
+                name = str(meta.get("name") or meta.get("h1") or address or blog_id[-6:]).strip()
+                blog = BlogInfo(
+                    id=blog_id,
+                    name=name,
+                    address=address,
+                    posts=posts_for_address(meta.get("posts") or [], address),
+                )
+                known[blog_id] = blog
+                added.append(blog)
+        kept: list[BlogInfo] = []
+        seen: set[str] = set()
+        for blog in list(state.blogs) + added:
+            if blog.id in seen or blog.id in gone:
+                continue
+            meta = self._blog_meta.get(blog.id) or {}
+            if hr.normalize_status(meta.get("confirmed_status") or meta.get("sheet_status")) == "삭제됨":
+                continue
+            if email and not self._blog_belongs_to_login(blog.id, email):
+                continue
+            kept.append(blog)
+            seen.add(blog.id)
+        if [blog.id for blog in state.blogs] != [blog.id for blog in kept]:
+            state.blogs = kept
+            self.session.state.blogs = list(kept)
+            self._dashboard_fp = None
+            self._blog_dirty = True
+        elif state is not self.session.state:
+            self.session.state.blogs = list(state.blogs)
+
     def _dashboard_blogs(self) -> list[BlogInfo]:
         if not self.session.state.logged_in:
             return []
+        self._hydrate_session_blogs()
         gone = getattr(self.session, "_gone_ids", None) or set()
+        email = str(self._logged_google_email() or "").strip().casefold()
         blogs: list[BlogInfo] = []
         for blog in self.session.state.blogs:
             if blog.id in gone:
+                continue
+            if email and not self._blog_belongs_to_login(blog.id, email):
                 continue
             meta = self._blog_meta.get(blog.id) or {}
             if hr.normalize_status(meta.get("confirmed_status") or meta.get("sheet_status")) == "삭제됨":
@@ -5558,8 +5632,6 @@ class BloggerApp:
     def _dashboard_fingerprint(self, blogs: list[BlogInfo], visible: list[BlogInfo]) -> tuple:
         return (
             self._blog_filter,
-            str(self.blog_var.get() or ""),
-            str(getattr(self, "_pending_select_id", "") or ""),
             tuple(
                 (
                     blog.id,
@@ -5584,11 +5656,14 @@ class BloggerApp:
         blogs = self._dashboard_blogs()
         visible = self._filter_blogs(blogs)
         fp = self._dashboard_fingerprint(blogs, visible)
-        if fp == self._dashboard_fp:
-            if getattr(self, "_main_tab", "") == "색인 확인":
+        tab = getattr(self, "_main_tab", "")
+        rows_missing = bool(blogs) and not any(
+            self._widget_alive(row) for row in (getattr(self, "_blog_row_frames", None) or {}).values()
+        ) and not getattr(self, "_blog_pending_rows", None)
+        if fp == self._dashboard_fp and not rows_missing:
+            if tab == "색인 확인":
                 self._refresh_index_tab()
             return
-        tab = getattr(self, "_main_tab", "")
         self._mark_hidden_tabs_dirty()
         if tab == "색인 확인":
             self._refresh_index_tab()
@@ -5642,7 +5717,6 @@ class BloggerApp:
             self._blog_folder_of(blog.id),
             status,
             extra,
-            blog.id == str(self.blog_var.get() or ""),
         )
 
     def _drop_blog_row(self, blog_id: str) -> None:
@@ -5737,6 +5811,7 @@ class BloggerApp:
         self._flush_blog_row_batch()
         self._order_blog_rows()
         self._sync_blog_row_paints()
+        self._commit_blog_list_span()
         self._update_sel_count()
         self._render_blog_detail()
         if getattr(self, "_scroll_blog_id", ""):
@@ -5755,6 +5830,7 @@ class BloggerApp:
             self._apply_blog_visibility()
             self._order_blog_rows()
             self._sync_blog_row_paints()
+            self._commit_blog_list_span()
             return
         n = 0
         while pending and n < _BLOG_ROW_BATCH:
@@ -5768,6 +5844,7 @@ class BloggerApp:
         self._apply_blog_visibility()
         self._order_blog_rows()
         self._collect_blog_row_refs()
+        self._commit_blog_list_span()
         if pending:
             self._after_once("blog_rows", 1, self._flush_blog_row_batch)
         else:
@@ -5801,6 +5878,15 @@ class BloggerApp:
         if self._blog_filter == "setup_pending" and not any(key not in blog.done for key in SETUP_KEYS):
             return False
         return True
+
+    def _commit_blog_list_span(self) -> None:
+        widget = getattr(self, "blog_list", None)
+        if widget is None or not hasattr(widget, "_commit_span"):
+            return
+        try:
+            widget._commit_span()
+        except Exception:
+            pass
 
     def _blog_scroll_offset(self) -> float:
         widget = getattr(self, "blog_list", None)
@@ -5943,15 +6029,38 @@ class BloggerApp:
                 return False
         return False
 
+    def _row_blog_id(self, event, fallback: str = "") -> str:
+        cur = getattr(event, "widget", None)
+        for _ in range(16):
+            if cur is None:
+                break
+            bid = str(getattr(cur, "_blog_id", "") or "").strip()
+            if bid:
+                return bid
+            try:
+                cur = cur.master
+            except Exception:
+                break
+        return str(fallback or "").strip()
+
     def _on_row_click(self, event, blog_id: str):
         if self._widget_is_check_target(event.widget):
             return
-        self._select_blog(blog_id)
-        self._focus_blog_row(blog_id)
+        bid = self._row_blog_id(event, blog_id)
+        self._select_blog(bid)
+        self._focus_blog_row(bid)
+
+    def _on_row_double(self, event, blog_id: str):
+        if self._widget_is_check_target(event.widget):
+            return "break"
+        bid = self._row_blog_id(event, blog_id)
+        self._select_blog(bid)
+        return self._open_blog_address(bid)
 
     def _bind_row_focus(self, widget, blog_id: str) -> None:
+        widget._blog_id = blog_id
         widget.bind("<Button-1>", lambda e, bid=blog_id: self._on_row_click(e, bid))
-        widget.bind("<Double-Button-1>", lambda _e, bid=blog_id: self._open_blog_address(bid))
+        widget.bind("<Double-Button-1>", lambda e, bid=blog_id: self._on_row_double(e, bid))
         try:
             widget.configure(cursor="hand2")
         except Exception:
@@ -5967,6 +6076,10 @@ class BloggerApp:
             pass
 
     def _open_blog_address(self, blog_id: str):
+        blog_id = str(blog_id or "").strip()
+        if not blog_id:
+            self.log("열 블로그를 목록에서 다시 눌러 주세요.")
+            return "break"
         if not self.session.is_alive() or not self.session.state.logged_in:
             self.log("블로그스팟에 로그인된 크롬이 없어 글 목록을 열지 못했습니다.")
             return "break"
@@ -5976,7 +6089,8 @@ class BloggerApp:
     def _open_blog_tab_worker(self, blog_id: str) -> None:
         try:
             url = self.session.open_posts_in_new_tab(blog_id)
-            self.log(f"로그인된 크롬 새 탭에서 열었습니다: {url}")
+            host = re.sub(r"^https?://", "", url, flags=re.I).split("/")[0]
+            self.log(f"로그인된 크롬 새 탭에서 열었습니다: {blog_id[-6:]} · {host}")
         except Exception as exc:
             self.log(f"블로그 글 목록을 열지 못했습니다: {_exc_text(exc)}")
 
@@ -7089,8 +7203,11 @@ class BloggerApp:
                 continue
             try:
                 widget._offset = offset if widget is log_list else 0.0
-                widget._measure_content()
-                widget._apply_offset()
+                if hasattr(widget, "_commit_span"):
+                    widget._commit_span()
+                else:
+                    widget._measure_content()
+                    widget._apply_offset()
             except Exception:
                 pass
 
