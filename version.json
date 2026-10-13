@@ -1,9 +1,12 @@
 {
     "version":  "1.2.21",
-    "url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.21/BloggerSpot.zip",
+    "url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/635595124",
     "download_url":  "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.21/BloggerSpot.zip",
     "notes":  "현재 로그인 계정 블로그만 표시. 이전 계정 목록이 섞이던 문제 수정.",
+    "api_download_url":  "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/635595124",
+    "asset_id":  635595124,
     "download_urls":  [
+                          "https://api.github.com/repos/lee3215-ko/blogspot-app/releases/assets/635595124",
                           "https://github.com/lee3215-ko/blogspot-app/releases/download/v1.2.21/BloggerSpot.zip",
                           "https://github.com/lee3215-ko/blogspot-app/releases/latest/download/BloggerSpot.zip"
                       ]
