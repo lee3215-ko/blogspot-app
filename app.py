@@ -4776,7 +4776,8 @@ class BloggerApp:
         page_ids = set(getattr(self.session, "_page_blog_ids", None) or set())
         known_ids = set(getattr(self.session, "_known_blog_ids", None) or set())
         email = str(self._logged_google_email() or "").strip()
-        stamp_ids = page_ids | known_ids
+        live_ids = set(getattr(self.session, "_live_catalog_ids", None) or set())
+        stamp_ids = page_ids | live_ids
         for blog in blogs:
             if blog.id in gone:
                 continue
@@ -4784,7 +4785,8 @@ class BloggerApp:
             if blog.name and cur.get("name") != blog.name:
                 cur["name"] = blog.name
                 changed = True
-            if email and blog.id in stamp_ids and str(cur.get("google_email") or "").strip().casefold() != email.casefold():
+            existing_email = str(cur.get("google_email") or "").strip().casefold()
+            if email and blog.id in stamp_ids and existing_email != email.casefold():
                 cur["google_email"] = email
                 changed = True
             if blog.address:
@@ -5436,7 +5438,7 @@ class BloggerApp:
 
     def _redetect_worker(self):
         try:
-            self.session.detect()
+            self.session.detect(fresh=True)
             self.root.after(0, lambda: self._apply_state(self.session.state))
             self.log("블로그 목록을 다시 읽고 주소·글을 인식합니다.")
             self._catalog_worker(refresh_address=True)
@@ -5468,7 +5470,7 @@ class BloggerApp:
         self._blogger_signed_out_noted = False
         self._set_login_button("다시 인식", enabled=True)
         self._apply_state(state)
-        self.log(f"로그인 확인. 계정={state.account or '-'} / 블로그 {len(state.blogs)}개")
+        self.log(f"로그인 확인. 계정={state.account or '-'} / 블로그 {len(self._dashboard_blogs())}개")
         self.log("목록은 바로 쓰고, 주소와 글은 페이지를 바꾸지 않고 이어서 인식합니다.")
         self._start_watch()
 
@@ -5483,6 +5485,12 @@ class BloggerApp:
         self._shown_account = ""
         self._blogger_signed_out_noted = True
         self._set_login_button("다시 인식", enabled=True)
+        try:
+            url = str(getattr(self.session.state, "url", "") or "")
+            title = str(getattr(self.session.state, "title", "") or "")
+            self.session._clear_blog_scope(url=url, title=title)
+        except Exception:
+            pass
         self._apply_state(self.session.state)
 
     def _apply_state(self, state: SessionState):
@@ -5496,13 +5504,14 @@ class BloggerApp:
         if state.logged_in and account and self._shown_account and account != self._shown_account:
             self._blog_check_vars.clear()
             self.blog_var.set("")
+            self._shown_session_keys = []
             self.log(f"다른 계정으로 로그인했습니다. {account} 블로그만 표시합니다.")
         if state.logged_in:
             if account:
                 self._shown_account = account
             self._hydrate_session_blogs(state)
             state = self.session.state
-            count = len(state.blogs)
+            count = len(self._dashboard_blogs())
             self._set_status(f"로그인됨 · 이 계정 블로그 {count}개", COLORS["success"])
         else:
             self._shown_account = ""
@@ -5644,10 +5653,12 @@ class BloggerApp:
             return
         home = self.__dict__.setdefault("_home_state", {})
         raw = home.setdefault("account_blogs", {})
-        cur = self._saved_account_blogs(key)
-        nxt = set(cur)
-        nxt.update(str(item).strip() for item in ids if str(item or "").strip().isdigit() and len(str(item).strip()) >= 10)
-        if nxt == cur:
+        nxt = {
+            str(item).strip()
+            for item in ids
+            if str(item or "").strip().isdigit() and len(str(item).strip()) >= 10
+        }
+        if nxt == self._saved_account_blogs(key):
             return
         raw[key] = sorted(nxt)
         self._schedule_home_save()
@@ -5658,7 +5669,7 @@ class BloggerApp:
         return bool(email and meta_email and meta_email != email)
 
     def _hydrate_session_blogs(self, state: SessionState | None = None) -> None:
-        """이 계정 블로그는 유지하고, 다른 계정 기록만 뺀다. 글 페이지를 본다고 목록을 지우지 않는다."""
+        """지금 로그인 계정에서 읽은 블로그만 남긴다. 디스크의 다른 계정 기록을 다시 넣지 않는다."""
         state = state or self.session.state
         if not state.logged_in:
             return
@@ -5669,45 +5680,11 @@ class BloggerApp:
             or self._logged_google_email()
             or ""
         ).strip().casefold()
+        live = set(getattr(self.session, "_live_catalog_ids", None) or set())
         page_ids = set(getattr(self.session, "_page_blog_ids", None) or set())
-        known_ids = set(getattr(self.session, "_known_blog_ids", None) or set())
-        saved_ids = self._saved_account_blogs(email) if email else set()
-        own_ids = page_ids | known_ids | saved_ids
-        if email:
-            known_ids.update(saved_ids)
-            known_ids.update(page_ids)
-            self.session._known_blog_ids = known_ids
-        mapped = {blog.id: blog for blog in state.blogs}
-        added: list[BlogInfo] = []
-        if email:
-            for blog_id, meta in (self._blog_meta or {}).items():
-                if not isinstance(meta, dict):
-                    continue
-                blog_id = str(blog_id or "").strip()
-                if not blog_id.isdigit() or len(blog_id) < 10:
-                    continue
-                if blog_id in mapped or blog_id in gone:
-                    continue
-                if hr.normalize_status(meta.get("confirmed_status") or meta.get("sheet_status")) == "삭제됨":
-                    continue
-                meta_email = str(meta.get("google_email") or "").strip().casefold()
-                if meta_email and meta_email != email:
-                    continue
-                if meta_email != email and blog_id not in own_ids:
-                    continue
-                address = str(meta.get("address") or "").strip()
-                name = str(meta.get("name") or meta.get("h1") or address or blog_id[-6:]).strip()
-                blog = BlogInfo(
-                    id=blog_id,
-                    name=name,
-                    address=address,
-                    posts=posts_for_address(meta.get("posts") or [], address),
-                )
-                mapped[blog_id] = blog
-                added.append(blog)
         kept: list[BlogInfo] = []
         seen: set[str] = set()
-        for blog in list(state.blogs) + added:
+        for blog in list(state.blogs):
             if blog.id in seen or blog.id in gone:
                 continue
             meta = self._blog_meta.get(blog.id) or {}
@@ -5715,12 +5692,12 @@ class BloggerApp:
                 continue
             if self._blog_is_other_account(blog.id, email):
                 continue
+            if live and blog.id not in live and blog.id not in page_ids:
+                continue
             kept.append(blog)
             seen.add(blog.id)
-        if email:
-            keep_ids = page_ids | known_ids | {blog.id for blog in kept if self._blog_account_email(blog.id) == email}
-            keep_ids.update(page_ids)
-            self._remember_account_blogs(email, keep_ids)
+        if email and live:
+            self._remember_account_blogs(email, live)
         if [blog.id for blog in state.blogs] != [blog.id for blog in kept]:
             state.blogs = kept
             self.session.state.blogs = list(kept)
@@ -5735,11 +5712,15 @@ class BloggerApp:
         self._hydrate_session_blogs()
         gone = getattr(self.session, "_gone_ids", None) or set()
         email = str(self._logged_google_email() or "").strip().casefold()
+        live = set(getattr(self.session, "_live_catalog_ids", None) or set())
+        page_ids = set(getattr(self.session, "_page_blog_ids", None) or set())
         blogs: list[BlogInfo] = []
         for blog in self.session.state.blogs:
             if blog.id in gone:
                 continue
             if self._blog_is_other_account(blog.id, email):
+                continue
+            if live and blog.id not in live and blog.id not in page_ids:
                 continue
             meta = self._blog_meta.get(blog.id) or {}
             if hr.normalize_status(meta.get("confirmed_status") or meta.get("sheet_status")) == "삭제됨":
@@ -9424,7 +9405,7 @@ class BloggerApp:
             url = state.url or ""
             signed_out = self.session._on_google_login_page(url)
             if signed_out:
-                self.session.state = SessionState(url=url, title=state.title)
+                self.session._clear_blog_scope(url=url, title=state.title)
                 if not getattr(self, "_blogger_signed_out_noted", False):
                     self.root.after(0, self._on_blogger_signed_out)
                 return
@@ -9434,6 +9415,8 @@ class BloggerApp:
             account = (state.account or "").strip()
             if account and account != (self._shown_account or ""):
                 self.root.after(0, lambda found=state: self._apply_state(found))
+                if not self._catalog_abort() and not getattr(self, "_catalog_running", False):
+                    threading.Thread(target=self._catalog_worker, daemon=True).start()
             current = [
                 (
                     blog.id,

@@ -949,6 +949,8 @@ class BloggerSession:
         self._gone_ids: set[str] = set()
         self._page_blog_ids: set[str] = set()
         self._known_blog_ids: set[str] = set()
+        self._live_catalog_ids: set[str] = set()
+        self._account_scope: str = ""
 
     def profile_dir(self) -> str:
         path = os.path.join(get_data_dir(), "chrome-blogger-session")
@@ -1124,13 +1126,23 @@ class BloggerSession:
             state = self.detect(fresh=True)
         if state.logged_in:
             self._expand_account_blogs()
+            catalog = self._read_blogs_catalog()
+            if catalog:
+                self._merge_catalog(catalog)
             state = self.state
             self.log(f"블로그스팟 계정을 인식했습니다: {state.account or '-'} · 블로그 {len(state.blogs)}개")
         else:
-            self.state = SessionState(url=state.url, title=state.title)
+            self._clear_blog_scope(url=state.url, title=state.title)
             state = self.state
             self.log("이 블로그스팟 창에는 로그인된 계정이 없습니다. 창에서 로그인한 뒤 다시 인식을 눌러 주세요.")
         return state
+
+    def _clear_blog_scope(self, url: str = "", title: str = "") -> None:
+        self._page_blog_ids = set()
+        self._known_blog_ids = set()
+        self._live_catalog_ids = set()
+        self._account_scope = ""
+        self.state = SessionState(url=url, title=title)
 
     def detect(self, fresh: bool = False) -> SessionState:
         if self.driver is None or not self.chrome_running():
@@ -1149,6 +1161,13 @@ class BloggerSession:
         previous_list = list(self.state.blogs)
         previous = {blog.id: blog for blog in previous_list}
         previous_account = str(self.state.account or "").strip()
+        if fresh:
+            previous_list = []
+            previous = {}
+            previous_account = ""
+            self._known_blog_ids = set()
+            self._live_catalog_ids = set()
+            self._account_scope = ""
         gone = getattr(self, "_gone_ids", None)
         if gone is None:
             self._gone_ids = set()
@@ -1204,22 +1223,47 @@ class BloggerSession:
             blog.posts_live = posts_live
             blogs.append(blog)
         self._page_blog_ids = set(seen)
-        if not blogs and previous_list:
-            blogs = [blog for blog in previous_list if blog.id not in gone]
         new_account = str((raw or {}).get("account") or "").strip()
+        seen_ids = set(seen)
+        previous_ids = {blog.id for blog in previous_list}
+        scope = str(getattr(self, "_account_scope", "") or "").strip().casefold()
         account_changed = bool(
             previous_account and new_account and previous_account.casefold() != new_account.casefold()
         )
+        if not account_changed and new_account and scope and new_account.casefold() != scope:
+            account_changed = True
+        if not account_changed and seen_ids and previous_ids and seen_ids.isdisjoint(previous_ids):
+            account_changed = True
         known = getattr(self, "_known_blog_ids", None)
         if not isinstance(known, set):
             known = set()
         if account_changed:
             self._known_blog_ids = set(seen)
+            self._live_catalog_ids = set()
+            self._account_scope = new_account.casefold() if new_account else ""
         else:
             known.update(seen)
             self._known_blog_ids = known
-        # 글/설정 페이지는 드롭다운이 닫혀 블로그 1개만 읽힌다. 이미 가진 목록을 그 한 개로 덮지 않는다.
-        if previous_list and not account_changed:
+            if new_account:
+                self._account_scope = new_account.casefold()
+            live = getattr(self, "_live_catalog_ids", None)
+            if isinstance(live, set) and live:
+                live.update(seen)
+        same_account = bool(
+            not account_changed
+            and (
+                (
+                    new_account
+                    and previous_account
+                    and new_account.casefold() == previous_account.casefold()
+                )
+                or (seen_ids and previous_ids and not seen_ids.isdisjoint(previous_ids))
+            )
+        )
+        if not blogs and previous_list and same_account:
+            blogs = [blog for blog in previous_list if blog.id not in gone]
+        # 글/설정 페이지는 드롭다운이 닫혀 블로그 1개만 읽힌다. 같은 계정일 때만 이전 목록을 유지한다.
+        if previous_list and same_account:
             found = {blog.id: blog for blog in blogs}
             merged = []
             kept = set()
@@ -1234,8 +1278,10 @@ class BloggerSession:
                 merged.append(blog)
             blogs = merged
         blogs = [blog for blog in blogs if blog.id not in gone]
+        if account_changed and seen_ids:
+            blogs = [blog for blog in blogs if blog.id in seen_ids]
         state = SessionState(
-            account=new_account or previous_account,
+            account=new_account or ("" if account_changed else previous_account),
             blogs=blogs,
             url=str((raw or {}).get("url") or ""),
             title=str((raw or {}).get("title") or ""),
@@ -2685,28 +2731,36 @@ class BloggerSession:
 
     def _merge_catalog(self, catalog: list[dict]) -> None:
         gone = getattr(self, "_gone_ids", None) or set()
-        known = {blog.id: blog for blog in self.state.blogs}
+        previous = {blog.id: blog for blog in self.state.blogs}
+        live: list[BlogInfo] = []
+        live_ids: set[str] = set()
         for item in catalog:
             blog_id = str(item.get("id") or "").strip()
             if not _BLOG_ID_RE.match(blog_id) or blog_id in gone:
                 continue
-            blog = known.get(blog_id)
-            address = live_blog_address(str(item.get("address") or ""))
-            name = str(item.get("name") or "").strip()
-            if blog is None:
-                blog = BlogInfo(id=blog_id, name=name or blog_id[-6:], address=address)
-                self.state.blogs.append(blog)
-                known[blog_id] = blog
-                ids = getattr(self, "_known_blog_ids", None)
-                if isinstance(ids, set):
-                    ids.add(blog_id)
+            if blog_id in live_ids:
                 continue
-            if name and not blog.name:
-                blog.name = name
+            old = previous.get(blog_id)
+            address = live_blog_address(str(item.get("address") or "")) or (old.address if old else "")
+            name = str(item.get("name") or "").strip() or (old.name if old else "") or blog_id[-6:]
+            blog = old or BlogInfo(id=blog_id, name=name, address=address)
+            blog.name = name or blog.name
             if address:
                 self._adopt_address(blog, address, silent=True)
-        if gone:
-            self.state.blogs = [blog for blog in self.state.blogs if blog.id not in gone]
+            live.append(blog)
+            live_ids.add(blog_id)
+        if not live_ids:
+            return
+        page_ids = set(getattr(self, "_page_blog_ids", None) or set())
+        for blog in self.state.blogs:
+            if blog.id in live_ids or blog.id in gone:
+                continue
+            if blog.id in page_ids:
+                live.append(blog)
+                live_ids.add(blog.id)
+        self._live_catalog_ids = set(live_ids)
+        self._known_blog_ids = set(live_ids)
+        self.state.blogs = live
 
     def create_blogs(self, titles: list[str], control: RunControl | None = None, on_progress=None) -> list[dict]:
         if control is not None:
@@ -4605,8 +4659,7 @@ class BloggerSession:
         with self._lock:
             driver = self.driver
             self.driver = None
-            if kill_chrome:
-                self.state = SessionState()
+            self._clear_blog_scope()
             proc = self._chrome_proc
             self._chrome_proc = None
             self._chrome_user_dir = None
